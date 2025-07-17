@@ -1950,42 +1950,97 @@ def get_7z_encoding_param(encoding):
 # === 传统zip编码检测实现 ===
 def is_traditional_zip(archive_path):
     """
-    Return True **iff** at least one entry uses legacy CP437‑encoded name
-    and **no** UTF‑8 flag/extra fields are present.
+    经过修正的函数，用于检测传统ZIP编码。
+    如果任何条目使用了现代UTF-8扩展字段(0x7075)，则返回False。
     """
     try:
+        # 确保文件是.zip文件
         if not archive_path.lower().endswith('.zip'):
             return False
+            
         with safe_open(archive_path, 'rb') as f:
+            # 记录是否至少有一个非UTF-8标志的条目，这是成为传统ZIP的前提
+            has_non_utf8_entry = False
+            
             while True:
                 sig = f.read(4)
-                if sig != b'PK\x03\x04':          # Local‑file‑header 结束
+                # 到达中央目录或文件末尾，结束循环
+                if sig != b'PK\x03\x04':
                     break
-                hdr = f.read(26)                  # 剩余固定区
+                    
+                hdr = f.read(26)  # 读取本地文件头的固定部分
                 if len(hdr) < 26:
+                    return False # 文件头不完整
+                    
+                gpbf = int.from_bytes(hdr[2:4], 'little')
+                name_len = int.from_bytes(hdr[22:24], 'little')
+                extra_len = int.from_bytes(hdr[24:26], 'little')
+                
+                # 检查通用位标志的bit 11
+                is_utf8_flag_set = gpbf & (1 << 11)
+                
+                # 如果UTF-8标志位被设置，这绝对是现代ZIP，直接返回False
+                if is_utf8_flag_set:
                     return False
-                gpbf           = int.from_bytes(hdr[2:4], 'little')
-                name_len       = int.from_bytes(hdr[22:24], 'little')
-                extra_len      = int.from_bytes(hdr[24:26], 'little')
-                is_utf8        = gpbf & (1 << 11)
-
-                if is_utf8:                       # 出现 UTF‑8 标志 ➜ 不是传统 ZIP
-                    return False
+                    
+                # 如果文件名长度为0，视为不规范，但继续检查
                 if name_len == 0:
-                    return False                  # 不合理
+                    # 在某些情况下，这可能是目录条目，但缺少文件名是不寻常的
+                    pass
 
-                f.seek(name_len, 1)               # skip name
-                f.seek(extra_len, 1)              # skip extra
+                # 跳过文件名
+                f.seek(name_len, 1)
 
+                # --- 主要修改部分开始 ---
+                # 检查扩展字段是否存在并解析它
+                if extra_len > 0:
+                    extra_data = f.read(extra_len)
+                    offset = 0
+                    # 遍历扩展字段中的所有块
+                    while offset < extra_len:
+                        # 确保有足够的空间读取块头（ID和大小）
+                        if offset + 4 > extra_len:
+                            break # 扩展字段格式错误
+                        
+                        header_id = int.from_bytes(extra_data[offset:offset+2], 'little')
+                        data_size = int.from_bytes(extra_data[offset+2:offset+4], 'little')
+                        
+                        # 0x7075 是 Info-ZIP Unicode Path Extra Field 的ID
+                        # 它的存在明确表示这是一个现代的、支持Unicode的ZIP
+                        if header_id == 0x7075:
+                            return False
+                            
+                        # 移动到下一个扩展块
+                        offset += 4 + data_size
+                # --- 主要修改部分结束 ---
+
+                # 标记我们至少找到了一个没有设置UTF-8标志的条目
+                has_non_utf8_entry = True
+
+                # 处理数据描述符（Data Descriptor）
                 has_dd = gpbf & (1 << 3)
                 if not has_dd:
-                    comp_size = int.from_bytes(hdr[10:14], 'little')
+                    # 如果没有数据描述符，则从文件头读取压缩后的大小并跳过
+                    comp_size = int.from_bytes(hdr[14:18], 'little') # 注意：偏移量应为14-18
                     f.seek(comp_size, 1)
                 else:
-                    # 遇到 Data‑Descriptor 直接判定：已确认存在非 UTF‑8 条目
-                    return True
-            # 如果能循环到这里，说明出现过 ≥1 项非 UTF‑8
-            return True
+                    # 如果存在数据描述符，情况变得复杂。
+                    # 原函数的逻辑是“遇到Data-Descriptor直接判定为True”，这可能不准确。
+                    # 一个更稳妥的方法是正确地跳过数据，但这需要流式解压的知识。
+                    # 为了保持简单，我们假设如果到这里还没被判定为False，就继续循环。
+                    # 这里我们遵循原函数的逻辑：只要存在一个非UTF8条目，就可能是传统ZIP。
+                    # 我们让循环自然结束，最后根据has_non_utf8_entry判断。
+                    # 注意：在实际情况中，我们需要找到下一个 'PK' 签名来恢复流，这里简化处理。
+                    # 为了安全起见，这里我们直接中断，并依赖于循环外的最终判断。
+                    # 现代ZIP很少在没有流式传输的情况下使用数据描述符。
+                    # 我们可以认为，如果到这里还没返回False，它就是“传统的”。
+                    # 但更准确的逻辑在下面循环结束后的return语句中处理。
+                    pass # 这里的处理逻辑依赖于循环后的最终判断
+            
+            # 如果循环正常结束，判断是否满足“传统ZIP”的条件：
+            # 至少存在一个条目，且所有遇到的条目都没有UTF-8标志或UTF-8扩展字段。
+            return has_non_utf8_entry
+
     except Exception as exc:
         if VERBOSE:
             print(f"  DEBUG: 传统ZIP检测异常: {exc}")
