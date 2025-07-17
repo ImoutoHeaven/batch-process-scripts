@@ -30,6 +30,28 @@ from typing import List, Dict, Optional, Union, Tuple
 # Global verbose flag
 VERBOSE = False
 
+
+# Global interrupt flag for multi-threaded execution
+_interrupt_flag = threading.Event()
+
+def set_interrupt_flag():
+    """Set the global interrupt flag to signal all threads to stop"""
+    global _interrupt_flag
+    _interrupt_flag.set()
+    if VERBOSE:
+        print("  DEBUG: Global interrupt flag set")
+
+def check_interrupt():
+    """Check if interrupt has been requested and raise KeyboardInterrupt if so"""
+    global _interrupt_flag
+    if _interrupt_flag.is_set():
+        raise KeyboardInterrupt("Interrupt requested")
+
+def reset_interrupt_flag():
+    """Reset the interrupt flag (used at start of main execution)"""
+    global _interrupt_flag
+    _interrupt_flag.clear()
+
 class SFXDetector:
     """Detects if an EXE file is a self-extracting archive by analyzing file headers"""
 
@@ -473,6 +495,9 @@ class ArchiveProcessor:
         """重构后的查找归档文件函数（修正单文件volume处理）"""
         archives = []
 
+        # Check for interrupt at start
+        check_interrupt()
+
         if VERBOSE:
             print(f"  DEBUG: 查找归档文件: {search_path}")
 
@@ -538,6 +563,9 @@ class ArchiveProcessor:
 
         try:
             for root, dirs, files in safe_walk(search_path, VERBOSE):
+                # Check for interrupt during directory traversal
+                check_interrupt()
+                
                 # 计算当前目录相对于搜索路径的深度
                 try:
                     rel_path = os.path.relpath(root, search_path)
@@ -562,6 +590,9 @@ class ArchiveProcessor:
                     print(f"  DEBUG: 处理深度{current_depth}的目录: {root}")
 
                 for file in files:
+                    # Check for interrupt for each file
+                    check_interrupt()
+                    
                     filepath = os.path.join(root, file)
                     
                     # 判断文件类型
@@ -607,6 +638,9 @@ class ArchiveProcessor:
                             if VERBOSE:
                                 print(f"  DEBUG: 找到分卷归档主卷（深度{current_depth}）: {filepath}")
 
+        except KeyboardInterrupt:
+            print(f"\nInterrupted while scanning for archives")
+            raise
         except Exception as e:
             if VERBOSE:
                 print(f"  DEBUG: 遍历目录失败: {e}")
@@ -637,6 +671,9 @@ class ArchiveProcessor:
             print(f"  DEBUG: Encryption type: {encryption_status}")
 
         for i, password in enumerate(password_candidates):
+            # Check for interrupt before testing each password
+            check_interrupt()
+            
             if VERBOSE:
                 print(f"  DEBUG: Testing password {i + 1}/{len(password_candidates)}")
 
@@ -656,6 +693,9 @@ class ArchiveProcessor:
 
     def move_volumes_with_structure(self, volumes, target_base):
         """Move volumes preserving directory structure."""
+        # Check for interrupt at start
+        check_interrupt()
+        
         safe_makedirs(target_base, debug=VERBOSE)
 
         base_path = self.args.path if safe_isdir(self.args.path, VERBOSE) else os.path.dirname(self.args.path)
@@ -666,6 +706,9 @@ class ArchiveProcessor:
                 print(f"  DEBUG: Volume to move: {vol}")
 
         for volume in volumes:
+            # Check for interrupt before each file move
+            check_interrupt()
+            
             try:
                 rel_path = self.get_relative_path(volume, base_path)
                 target_dir = os.path.join(target_base, rel_path) if rel_path else target_base
@@ -674,12 +717,18 @@ class ArchiveProcessor:
                 target_file = os.path.join(target_dir, os.path.basename(volume))
                 safe_move(volume, target_file, VERBOSE)
                 print(f"  Moved: {volume} -> {target_file}")
+            except KeyboardInterrupt:
+                # Re-raise interrupt
+                raise
             except Exception as e:
                 print(f"  Warning: Could not move {volume}: {e}")
 
 
     def process_archive(self, archive_path):
         """Process a single archive following the exact specification."""
+        # Check for interrupt at the start
+        check_interrupt()
+        
         print(f"Processing: {archive_path}")
 
         # 处理传统ZIP策略
@@ -703,6 +752,9 @@ class ArchiveProcessor:
             print(f"  [DRY RUN] Would process: {archive_path}")
             return True
 
+        # Check for interrupt before starting extraction
+        check_interrupt()
+
         # Step 1: Determine if we need to test passwords
         need_password_testing = bool(self.args.password_file)
 
@@ -712,6 +764,7 @@ class ArchiveProcessor:
         # Step 2: Check encryption status
         encryption_status = 'plain'
         if need_password_testing:
+            check_interrupt()  # Check before potentially long operation
             encryption_status = check_encryption(archive_path)
             if encryption_status is None:
                 print(f"  Warning: Cannot determine if {archive_path} is an archive")
@@ -747,6 +800,7 @@ class ArchiveProcessor:
                     print(f"  Warning: Cannot read password file: {e}")
 
             # Test passwords using is_password_correct with encryption status
+            check_interrupt()  # Check before potentially long password testing
             correct_password = self.find_correct_password(archive_path, password_candidates, encryption_status)
             if correct_password is None:
                 print(f"  Error: No correct password found for {archive_path}")
@@ -773,6 +827,9 @@ class ArchiveProcessor:
             print(f"  DEBUG: 创建临时目录: {tmp_dir}")
 
         try:
+            # Check for interrupt before extraction
+            check_interrupt()
+
             # Step 5: Extract using try_extract function
             final_zip_decode = zip_decode_from_policy if zip_decode_from_policy is not None else getattr(self.args, 'zip_decode', None)
             enable_rar = getattr(self.args, 'enable_rar', False)
@@ -783,6 +840,9 @@ class ArchiveProcessor:
                 enable_rar = False
 
             success = try_extract(archive_path, correct_password, tmp_dir, final_zip_decode, enable_rar, self.sfx_detector)
+
+            # Check for interrupt after extraction
+            check_interrupt()
 
             # Step 6: Find all volumes for this archive - 使用新的get_all_volumes方法
             all_volumes = self.get_all_volumes(archive_path)
@@ -806,6 +866,9 @@ class ArchiveProcessor:
                         print(f"  DEBUG: 应用移动成功策略")
                     self.move_volumes_with_structure(all_volumes, self.args.success_to)
 
+                # Check for interrupt before decompress policy
+                check_interrupt()
+
                 # Step 8: Apply decompress policy
                 self.apply_decompress_policy(archive_path, tmp_dir, unique_suffix)
 
@@ -824,12 +887,19 @@ class ArchiveProcessor:
                 self.failed_archives.append(archive_path)
                 return False
 
+        except KeyboardInterrupt:
+            # Re-raise KeyboardInterrupt to propagate to main thread
+            print(f"\n  Interrupted while processing: {archive_path}")
+            raise
         finally:
             # Step 9: Clean up temporary directory
             clean_temp_dir(tmp_dir)
 
     def apply_decompress_policy(self, archive_path, tmp_dir, unique_suffix):
         """Apply the specified decompress policy following exact specification."""
+        # Check for interrupt at start
+        check_interrupt()
+        
         base_path = self.args.path if safe_isdir(self.args.path, VERBOSE) else os.path.dirname(self.args.path)
         rel_path = self.get_relative_path(archive_path, base_path)
 
@@ -848,6 +918,9 @@ class ArchiveProcessor:
             print(f"  DEBUG: 应用解压策略: {self.args.decompress_policy}")
             print(f"  DEBUG: 归档基础名称: {archive_base_name}")
             print(f"  DEBUG: 输出目录: {final_output_dir}")
+
+        # Check interrupt before applying policy
+        check_interrupt()
 
         if self.args.decompress_policy == 'separate':
             self.apply_separate_policy(tmp_dir, final_output_dir, archive_base_name, unique_suffix)
@@ -871,7 +944,6 @@ class ArchiveProcessor:
             # N-collect policy
             threshold = int(self.args.decompress_policy.split('-')[0])
             self.apply_collect_policy(tmp_dir, final_output_dir, archive_base_name, threshold, unique_suffix)
-
 
 
     def apply_separate_policy(self, tmp_dir, output_dir, archive_name, unique_suffix):
@@ -2549,8 +2621,15 @@ def release_lock():
 def signal_handler(signum, frame):
     """信号处理器，用于在程序被中断时清理锁文件"""
     print(f"\n  收到信号 {signum}，正在清理...")
-    release_lock()  # 只有锁的拥有者才会释放锁
-    sys.exit(1)
+    # Set the global interrupt flag for multi-threaded execution
+    set_interrupt_flag()
+    # Only release lock if we own it
+    if lock_owner:
+        release_lock()
+    # Don't exit immediately - let the main thread handle it
+    # This allows proper cleanup of thread pool
+    if threading.current_thread() is threading.main_thread():
+        sys.exit(1)
 
 
 # ==================== 结束锁机制 ====================
@@ -2957,6 +3036,9 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
         sfx_detector: SFXDetector实例，用于检测SFX文件格式
     """
     try:
+        # Check for interrupt before starting
+        check_interrupt()
+        
         if VERBOSE:
             print(f"  DEBUG: 开始解压: {archive_path} -> {tmp_dir}")
 
@@ -2991,6 +3073,10 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
                 print(f"  DEBUG: RAR命令: {' '.join(cmd)}")
                 print(f"  DEBUG: 原始路径: {archive_path}")
                 print(f"  DEBUG: 安全路径: {safe_archive_path}")
+            
+            # Check interrupt before running command
+            check_interrupt()
+            
             cmd = _patch_cmd_paths(cmd)
             result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -3041,8 +3127,15 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
                 print(f"  DEBUG: 7z命令: {' '.join(cmd)}")
                 print(f"  DEBUG: 原始路径: {archive_path}")
                 print(f"  DEBUG: 安全路径: {safe_archive_path}")
+            
+            # Check interrupt before running command
+            check_interrupt()
+            
             cmd = _patch_cmd_paths(cmd)
             result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # Check interrupt after extraction completes
+        check_interrupt()
 
         success = result.returncode == 0
 
@@ -3054,6 +3147,14 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
 
         return success
 
+    except KeyboardInterrupt:
+        # Clean up tmp_dir if it was created before interrupt
+        if safe_exists(tmp_dir, VERBOSE):
+            try:
+                safe_rmtree(tmp_dir, VERBOSE)
+            except:
+                pass
+        raise
     except Exception as e:
         if VERBOSE:
             print(f"  DEBUG: Error extracting: {e}")
@@ -3563,6 +3664,9 @@ def apply_file_content_with_folder_policy(tmp_dir, output_dir, archive_name, uni
 
 def apply_separate_policy_internal(tmp_dir, output_dir, archive_name, unique_suffix):
     """内部separate策略实现，供其他策略回退使用"""
+    # Check for interrupt at start
+    check_interrupt()
+    
     separate_dir = f"separate_{unique_suffix}"
 
     try:
@@ -3576,12 +3680,21 @@ def apply_separate_policy_internal(tmp_dir, output_dir, archive_name, unique_suf
         # Move contents from tmp to archive folder
         try:
             for item in os.listdir(tmp_dir):
+                # Check for interrupt before each item move
+                check_interrupt()
+                
                 src_item = os.path.join(tmp_dir, item)
                 dest_item = os.path.join(archive_folder, item)
                 safe_move(src_item, dest_item, VERBOSE)
+        except KeyboardInterrupt:
+            # Re-raise interrupt
+            raise
         except Exception as e:
             if VERBOSE:
                 print(f"  DEBUG: 移动内容失败: {e}")
+
+        # Check for interrupt before final move
+        check_interrupt()
 
         # Move archive folder to final destination
         final_archive_path = os.path.join(output_dir, archive_name)
@@ -3590,6 +3703,14 @@ def apply_separate_policy_internal(tmp_dir, output_dir, archive_name, unique_suf
 
         print(f"  Extracted to: {final_archive_path}")
 
+    except KeyboardInterrupt:
+        # Clean up temporary directory on interrupt
+        if safe_exists(separate_dir, VERBOSE):
+            try:
+                safe_rmtree(separate_dir, VERBOSE)
+            except:
+                pass
+        raise
     finally:
         if safe_exists(separate_dir, VERBOSE):
             safe_rmtree(separate_dir, VERBOSE)
@@ -4241,37 +4362,87 @@ def main():
         if args.threads == 1:
             # Single-threaded processing
             for archive in archives:
-                processor.process_archive(archive)
+                try:
+                    processor.process_archive(archive)
+                except KeyboardInterrupt:
+                    print("\nProcessing interrupted by user")
+                    raise
         else:
             # Multi-threaded processing
-            with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            executor = ThreadPoolExecutor(max_workers=args.threads)
+            futures = {}
+            
+            try:
+                # Reset interrupt flag at start
+                reset_interrupt_flag()
+                
+                # Submit all tasks
                 futures = {executor.submit(processor.process_archive, archive): archive
-                           for archive in archives}
-
+                          for archive in archives}
+                
+                # Process results
                 for future in as_completed(futures):
                     archive = futures[future]
                     try:
+                        # Check for interrupt before getting result
+                        check_interrupt()
                         future.result()
                     except KeyboardInterrupt:
-                        # 用户中断，立即重新抛出异常以终止程序
-                        print(f"\nKeyboard interrupt detected during processing {archive}")
-                        # 取消所有未完成的任务
-                        for pending_future in futures:
-                            if not pending_future.done():
-                                pending_future.cancel()
-                        raise
-                    except SystemExit:
-                        # 系统退出信号，立即重新抛出
-                        print(f"\nSystem exit signal detected during processing {archive}")
-                        # 取消所有未完成的任务
-                        for pending_future in futures:
-                            if not pending_future.done():
-                                pending_future.cancel()
+                        # Interrupt detected - immediately shutdown executor
+                        print(f"\nKeyboard interrupt detected, stopping all tasks...")
+                        set_interrupt_flag()  # Ensure flag is set
+                        
+                        # Cancel all pending futures
+                        cancelled_count = 0
+                        for f in futures:
+                            if not f.done():
+                                if f.cancel():
+                                    cancelled_count += 1
+                        
+                        if VERBOSE:
+                            print(f"  DEBUG: Cancelled {cancelled_count} pending tasks")
+                        
+                        # Shutdown executor without waiting
+                        executor.shutdown(wait=False)
+                        
+                        # Re-raise to exit
                         raise
                     except Exception as e:
-                        # 普通异常，记录错误并继续处理下一个文件
+                        # Check if this is a wrapped KeyboardInterrupt
+                        if "KeyboardInterrupt" in str(e) or "Interrupt requested" in str(e):
+                            print(f"\nInterrupt detected in worker thread")
+                            set_interrupt_flag()
+                            
+                            # Cancel remaining tasks
+                            for f in futures:
+                                if not f.done():
+                                    f.cancel()
+                            
+                            executor.shutdown(wait=False)
+                            raise KeyboardInterrupt("Worker thread interrupted")
+                        
+                        # Normal exception - log and continue
                         print(f"Error processing {archive}: {e}")
                         processor.failed_archives.append(archive)
+                
+                # Normal completion - shutdown executor
+                executor.shutdown(wait=True)
+                
+            except KeyboardInterrupt:
+                print("\nShutting down due to interrupt...")
+                # Make sure executor is shutdown
+                try:
+                    executor.shutdown(wait=False)
+                except:
+                    pass
+                raise
+            except Exception:
+                # Ensure executor is shutdown on any error
+                try:
+                    executor.shutdown(wait=False)
+                except:
+                    pass
+                raise
 
         # Print summary
         print("\n" + "=" * 50)
