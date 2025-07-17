@@ -2619,17 +2619,13 @@ def release_lock():
 
 
 def signal_handler(signum, frame):
-    """信号处理器，用于在程序被中断时清理锁文件"""
-    print(f"\n  收到信号 {signum}，正在清理...")
+    """信号处理器，用于在程序被中断时设置全局中断标志"""
+    print(f"\n  收到信号 {signum}，正在请求停止所有任务...")
     # Set the global interrupt flag for multi-threaded execution
     set_interrupt_flag()
-    # Only release lock if we own it
-    if lock_owner:
-        release_lock()
-    # Don't exit immediately - let the main thread handle it
-    # This allows proper cleanup of thread pool
-    if threading.current_thread() is threading.main_thread():
-        sys.exit(1)
+    # The main thread will catch the KeyboardInterrupt that follows
+    # and handle cleanup and exiting gracefully.
+    # We do not need to call sys.exit() here.
 
 
 # ==================== 结束锁机制 ====================
