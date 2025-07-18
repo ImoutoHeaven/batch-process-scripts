@@ -2338,25 +2338,18 @@ def safe_path_for_operation(path: str, debug: bool = False) -> str:
         # 先标准化路径
         abs_path = os.path.abspath(os.path.expandvars(path))
         
-        # Windows文件名中不允许的字符（不包括冒号，因为冒号在盘符中是合法的）
-        invalid_chars = '<>"|?*'
+        # 优先尝试获取短路径（8.3格式）
+        short_path = get_short_path_name(abs_path)
         
-        # 检查是否需要使用短路径：
-        # 1. 路径过长（超过Windows传统限制260字符）
-        # 2. 包含文件名不允许的特殊字符
-        needs_short_path = (
-            len(abs_path) > 260 or 
-            any(char in abs_path for char in invalid_chars)
-        )
-        
-        if needs_short_path:
+        # 如果成功获取到短路径且与原路径不同，则使用短路径
+        if short_path != abs_path:
             if debug:
-                reason = "长路径" if len(abs_path) > 260 else "特殊字符"
-                print(f"  DEBUG: 检测到{reason}，使用短路径: {path}")
-            
-            short_path = get_short_path_name(abs_path)
-            return short_path if short_path != abs_path else abs_path
+                print(f"  DEBUG: 使用短路径: {path} -> {short_path}")
+            return short_path
         
+        # 如果无法获取短路径或短路径与原路径相同，则使用原路径
+        if debug:
+            print(f"  DEBUG: 使用原路径: {abs_path}")
         return abs_path
         
     except Exception as e:
