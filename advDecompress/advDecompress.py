@@ -495,6 +495,9 @@ class ArchiveProcessor:
         """重构后的查找归档文件函数（修正单文件volume处理）"""
         archives = []
 
+        # 一开始就绝对化路径
+        search_path = os.path.abspath(search_path)
+
         # Check for interrupt at start
         check_interrupt()
 
@@ -729,6 +732,7 @@ class ArchiveProcessor:
         # Check for interrupt at the start
         check_interrupt()
         
+        archive_path = os.path.abspath(archive_path)
         print(f"Processing: {archive_path}")
 
         # 处理传统ZIP策略
@@ -807,7 +811,8 @@ class ArchiveProcessor:
                 # Apply fail policy before returning - 使用新的get_all_volumes方法
                 all_volumes = self.get_all_volumes(archive_path)
                 if self.args.fail_policy == 'move' and self.args.fail_to:
-                    self.move_volumes_with_structure(all_volumes, self.args.fail_to)
+                    fail_to_abs = os.path.abspath(self.args.fail_to)
+                    self.move_volumes_with_structure(all_volumes, fail_to_abs)
                 self.failed_archives.append(archive_path)
                 return False
         else:
@@ -864,7 +869,7 @@ class ArchiveProcessor:
                 elif self.args.success_policy == 'move' and self.args.success_to:
                     if VERBOSE:
                         print(f"  DEBUG: 应用移动成功策略")
-                    self.move_volumes_with_structure(all_volumes, self.args.success_to)
+                    self.move_volumes_with_structure(all_volumes, os.path.abspath(self.args.success_to))
 
                 # Check for interrupt before decompress policy
                 check_interrupt()
@@ -882,7 +887,7 @@ class ArchiveProcessor:
                 if self.args.fail_policy == 'move' and self.args.fail_to:
                     if VERBOSE:
                         print(f"  DEBUG: 应用失败策略")
-                    self.move_volumes_with_structure(all_volumes, self.args.fail_to)
+                    self.move_volumes_with_structure(all_volumes, os.path.abspath(self.args.fail_to))
 
                 self.failed_archives.append(archive_path)
                 return False
@@ -939,6 +944,11 @@ class ArchiveProcessor:
 
         elif self.args.decompress_policy == 'file-content-with-folder-separate':
             apply_file_content_with_folder_separate_policy(tmp_dir, final_output_dir, archive_base_name, unique_suffix)
+
+        elif self.args.decompress_policy.startswith('file-content-') and self.args.decompress_policy.endswith('-collect'):
+            # file-content-N-collect policy
+            threshold = int(self.args.decompress_policy.split('-')[2])
+            apply_file_content_collect_policy(tmp_dir, final_output_dir, archive_base_name, threshold, unique_suffix)
 
         else:
             # N-collect policy
@@ -1083,9 +1093,10 @@ class ArchiveProcessor:
                     print(f"  DEBUG: 移动传统ZIP文件到: {self.args.traditional_zip_to}")
                 
                 # 移动文件保持目录结构
-                self.move_volumes_with_structure(all_volumes, self.args.traditional_zip_to)
+                traditional_zip_to_abs = os.path.abspath(self.args.traditional_zip_to)
+                self.move_volumes_with_structure(all_volumes, traditional_zip_to_abs)
                 
-                print(f"  Traditional ZIP moved to: {self.args.traditional_zip_to}")
+                print(f"  Traditional ZIP moved to: {traditional_zip_to_abs}")
                 result['should_continue'] = False
                 result['reason'] = '传统ZIP已移动'
                 return result
@@ -3859,7 +3870,7 @@ def apply_file_content_with_folder_separate_policy(tmp_dir, output_dir, archive_
 
 def apply_only_file_content_direct_policy(tmp_dir, output_dir, archive_name, unique_suffix):
     """
-    “only-file-content-direct” 策略：
+    "only-file-content-direct" 策略：
     1. 抽取 file_content（与 only-file-content 相同逻辑）
     2. 若将 file_content 直接合并进 output_dir 时 **任意文件** 会冲突，则回退到 only-file-content 策略
        （文件冲突判定：content_dir 中的文件与 output_dir 中同相对路径已有文件重名）
@@ -3932,6 +3943,174 @@ def apply_only_file_content_direct_policy(tmp_dir, output_dir, archive_name, uni
 
     finally:
         # 清理临时 content_dir
+        if safe_exists(content_dir, VERBOSE):
+            safe_rmtree(content_dir, VERBOSE)
+
+
+def apply_file_content_collect_policy(tmp_dir, output_dir, archive_name, threshold, unique_suffix):
+    """
+    应用file-content-n-collect策略
+    
+    Args:
+        tmp_dir: 临时目录
+        output_dir: 输出目录
+        archive_name: 归档名称
+        threshold: 阈值N
+        unique_suffix: 唯一后缀
+    """
+    if VERBOSE:
+        print(f"  DEBUG: 应用file-content-{threshold}-collect策略")
+
+    # 1. 查找file_content
+    file_content = find_file_content(tmp_dir, VERBOSE)
+
+    if not file_content['found']:
+        if VERBOSE:
+            print(f"  DEBUG: 未找到file_content，回退到{threshold}-collect策略")
+        # 回退到n-collect策略
+        files, dirs = count_items_in_dir(tmp_dir)
+        total_items = files + dirs
+        
+        if total_items >= threshold:
+            # Create archive folder
+            archive_folder = os.path.join(output_dir, archive_name)
+            archive_folder = ensure_unique_name(archive_folder, unique_suffix)
+            safe_makedirs(archive_folder, debug=VERBOSE)
+
+            # Move all items to archive folder
+            for item in os.listdir(tmp_dir):
+                src_item = os.path.join(tmp_dir, item)
+                dest_item = os.path.join(archive_folder, item)
+                safe_move(src_item, dest_item, VERBOSE)
+
+            print(f"  Extracted to: {archive_folder} ({total_items} items >= {threshold})")
+        else:
+            # Extract directly using direct policy logic
+            tmp_items = os.listdir(tmp_dir)
+            conflicts = [item for item in tmp_items if safe_exists(os.path.join(output_dir, item), VERBOSE)]
+
+            if conflicts:
+                # Create archive folder for conflicts
+                archive_folder = os.path.join(output_dir, archive_name)
+                archive_folder = ensure_unique_name(archive_folder, unique_suffix)
+                safe_makedirs(archive_folder, debug=VERBOSE)
+
+                # Move all items to archive folder
+                for item in tmp_items:
+                    src_item = os.path.join(tmp_dir, item)
+                    dest_item = os.path.join(archive_folder, item)
+                    safe_move(src_item, dest_item, VERBOSE)
+
+                print(f"  Extracted to: {archive_folder} (conflicts detected, {total_items} items < {threshold})")
+            else:
+                # Move directly to output directory
+                for item in tmp_items:
+                    src_item = os.path.join(tmp_dir, item)
+                    dest_item = os.path.join(output_dir, item)
+                    safe_move(src_item, dest_item, VERBOSE)
+
+                print(f"  Extracted to: {output_dir} ({total_items} items < {threshold})")
+        return
+
+    # 2. 创建content临时目录
+    content_dir = f"content_{unique_suffix}"
+
+    try:
+        safe_makedirs(content_dir, debug=VERBOSE)
+
+        if VERBOSE:
+            print(f"  DEBUG: 创建content目录: {content_dir}")
+
+        # 3. 移动file_content到content目录
+        for item in file_content['items']:
+            src_path = item['path']
+            dst_path = os.path.join(content_dir, item['name'])
+
+            if VERBOSE:
+                print(f"  DEBUG: 移动file_content项目: {src_path} -> {dst_path}")
+
+            safe_move(src_path, dst_path, VERBOSE)
+
+        # 4. 计算content目录中的项目数量
+        files, dirs = count_items_in_dir(content_dir)
+        total_items = files + dirs
+
+        if VERBOSE:
+            print(f"  DEBUG: content目录统计 - 文件: {files}, 目录: {dirs}, 总计: {total_items}, 阈值: {threshold}")
+
+        # 5. 根据数量决定是否包裹
+        if total_items >= threshold:
+            # 创建归档文件夹包裹
+            archive_folder = os.path.join(output_dir, archive_name)
+            archive_folder = ensure_unique_name(archive_folder, unique_suffix)
+            safe_makedirs(archive_folder, debug=VERBOSE)
+
+            # 移动content到归档文件夹
+            for item in os.listdir(content_dir):
+                src_path = os.path.join(content_dir, item)
+                dst_path = os.path.join(archive_folder, item)
+
+                if VERBOSE:
+                    print(f"  DEBUG: 移动到归档文件夹: {src_path} -> {dst_path}")
+
+                safe_move(src_path, dst_path, VERBOSE)
+
+            print(f"  Extracted using file-content-{threshold}-collect policy to: {archive_folder} ({total_items} items >= {threshold})")
+        else:
+            # 直接移动到输出目录，处理冲突
+            conflict_found = False
+            for root, dirs, files in safe_walk(content_dir, VERBOSE):
+                rel_root = os.path.relpath(root, content_dir)
+                rel_root = '' if rel_root == '.' else rel_root
+                # 只检查文件冲突
+                for f in files:
+                    rel_path = os.path.join(rel_root, f) if rel_root else f
+                    dest_path = os.path.join(output_dir, rel_path)
+                    if safe_isfile(dest_path, VERBOSE):
+                        if VERBOSE:
+                            print(f"  DEBUG: 冲突文件检测到: {dest_path}")
+                        conflict_found = True
+                        break
+                if conflict_found:
+                    break
+
+            if conflict_found:
+                # 有冲突，创建归档文件夹
+                archive_folder = os.path.join(output_dir, archive_name)
+                archive_folder = ensure_unique_name(archive_folder, unique_suffix)
+                safe_makedirs(archive_folder, debug=VERBOSE)
+
+                # 移动content到归档文件夹
+                for item in os.listdir(content_dir):
+                    src_path = os.path.join(content_dir, item)
+                    dst_path = os.path.join(archive_folder, item)
+
+                    if VERBOSE:
+                        print(f"  DEBUG: 移动到归档文件夹（冲突）: {src_path} -> {dst_path}")
+
+                    safe_move(src_path, dst_path, VERBOSE)
+
+                print(f"  Extracted using file-content-{threshold}-collect policy to: {archive_folder} (conflicts detected, {total_items} items < {threshold})")
+            else:
+                # 无冲突，直接移动到输出目录
+                for root, dirs, files in safe_walk(content_dir, VERBOSE):
+                    rel_root = os.path.relpath(root, content_dir)
+                    target_root = output_dir if rel_root == '.' else os.path.join(output_dir, rel_root)
+                    safe_makedirs(target_root, debug=VERBOSE)
+
+                    for d in dirs:
+                        dest_dir = os.path.join(target_root, d)
+                        safe_makedirs(dest_dir, debug=VERBOSE)
+
+                    for f in files:
+                        src_f = os.path.join(root, f)
+                        dest_f = os.path.join(target_root, f)
+                        safe_move(src_f, dest_f, VERBOSE)
+
+                print(f"  Extracted using file-content-{threshold}-collect policy to: {output_dir} ({total_items} items < {threshold})")
+
+    finally:
+        # 6. 清理content目录
         if safe_exists(content_dir, VERBOSE):
             safe_rmtree(content_dir, VERBOSE)
 
@@ -4165,7 +4344,7 @@ def main():
     parser.add_argument(
         '-dp', '--decompress-policy',
         default='2-collect',
-        help='Decompress policy: separate/direct/only-file-content/file-content-with-folder/file-content-with-folder-separate/only-file-content-direct/N-collect (default: 2-collect)'
+        help='Decompress policy: separate/direct/only-file-content/file-content-with-folder/file-content-with-folder-separate/only-file-content-direct/N-collect/file-content-N-collect (default: 2-collect)'
     )
 
     parser.add_argument(
@@ -4371,15 +4550,21 @@ def main():
 
         # Validate decompress policy
         if args.decompress_policy not in ['separate', 'direct', 'only-file-content', 'file-content-with-folder', 'file-content-with-folder-separate', 'only-file-content-direct']:
-            if not re.match(r'^\d+-collect$', args.decompress_policy):
-                print(f"Error: Invalid decompress policy: {args.decompress_policy}")
-                return 1
-            else:
+            if re.match(r'^\d+-collect$', args.decompress_policy):
                 # Validate N-collect threshold
                 threshold = int(args.decompress_policy.split('-')[0])
                 if threshold < 0:
                     print(f"Error: N-collect threshold must be >= 0")
                     return 1
+            elif re.match(r'^file-content-\d+-collect$', args.decompress_policy):
+                # Validate file-content-N-collect threshold
+                threshold = int(args.decompress_policy.split('-')[2])
+                if threshold < 1:
+                    print(f"Error: file-content-N-collect threshold must be >= 1")
+                    return 1
+            else:
+                print(f"Error: Invalid decompress policy: {args.decompress_policy}")
+                return 1
 
         # Validate depth range parameter
         if args.depth_range:
@@ -4407,7 +4592,8 @@ def main():
 
         # Create processor and find archives
         processor = ArchiveProcessor(args)
-        archives = processor.find_archives(args.path)
+        abs_path = os.path.abspath(args.path)
+        archives = processor.find_archives(abs_path)
 
         if not archives:
             print("No archives found to process.")
