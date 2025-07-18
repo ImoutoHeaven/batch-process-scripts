@@ -3389,9 +3389,11 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
 
             cmd = ['rar', 'x', safe_archive_path, safe_tmp_dir]
 
-            # 添加密码参数（如果有）
+            # 添加密码参数（如果有密码则使用，否则使用虚拟密码避免hang住）
             if password:
                 cmd.extend([f'-p{password}'])
+            else:
+                cmd.extend([f'-pDUMMYPASSWORD'])
 
             # 添加其他RAR参数
             cmd.extend(['-y'])  # 自动回答yes
@@ -3416,7 +3418,11 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
             safe_archive_path = safe_path_for_operation(archive_path, VERBOSE)
             safe_tmp_dir = safe_path_for_operation(tmp_dir, VERBOSE)
 
-            cmd = ['7z', 'x', safe_archive_path, f'-o{safe_tmp_dir}', f'-p{password}', '-y']
+            cmd = ['7z', 'x', safe_archive_path, f'-o{safe_tmp_dir}', '-y']
+            if password:
+                cmd.extend([f'-p{password}'])
+            else:
+                cmd.extend([f'-pDUMMYPASSWORD'])
 
             # 如果指定了zip_decode参数且当前文件是ZIP格式，则添加-mcp参数
             if zip_decode is not None and is_zip_format(archive_path):
