@@ -793,7 +793,8 @@ class ArchiveProcessor:
 
             if self.args.password_file:
                 try:
-                    with safe_open(self.args.password_file, 'r', encoding='utf-8') as f:
+                    password_file_abs = os.path.abspath(self.args.password_file)
+                    with safe_open(password_file_abs, 'r', encoding='utf-8') as f:
                         for line in f:
                             password = line.strip()
                             if password and password not in password_candidates:
@@ -1331,13 +1332,14 @@ class ArchiveProcessor:
                 # SFX-RAR文件
                 part_match = re.search(r'\.part\d+$', base_filename_lower)
                 if part_match:
-                    # 检查是否存在对应的.rar分卷文件
+                    # 检查是否存在对应的.exe文件（exe SFX-RAR分卷）
                     base_without_part = base_filename[:part_match.start()]
-                    rar_volumes = safe_glob(os.path.join(dir_path, base_without_part + '.part*.rar'))
-                    if rar_volumes:
+                    exe_pattern = base_without_part + '.part*.exe'
+                    exe_files = safe_glob(os.path.join(dir_path, exe_pattern))
+                    if exe_files:
                         return 'volume'
                     else:
-                        return 'single'  # 虽然有part标识，但没有对应rar分卷
+                        return 'single'  # 虽然有part标识，但没有对应exe分卷
                 else:
                     return 'single'
             else:
@@ -1350,6 +1352,142 @@ class ArchiveProcessor:
                     return 'single'
         
         return 'notarchive'
+
+    def is_archive_single_or_volume_innerLogic(self, file_path):
+        """
+        判断文件是单包还是分卷的内部逻辑
+        
+        Args:
+            file_path: 文件路径
+            
+        Returns:
+            dict: {"is_multi": bool, "type": str}
+        """
+        if not safe_isfile(file_path, VERBOSE):
+            return {"is_multi": False, "type": "unknown"}
+            
+        filename = os.path.basename(file_path)
+        filename_lower = filename.lower()
+        dir_path = os.path.dirname(file_path)
+        
+        if VERBOSE:
+            print(f"  DEBUG: 判断文件单包还是分卷: {file_path}")
+        
+        # 提取文件扩展名
+        if '.' not in filename_lower:
+            return {"is_multi": False, "type": "unknown"}
+            
+        file_ext = filename_lower.split('.')[-1]
+        base_filename = '.'.join(filename.split('.')[:-1])
+        base_filename_lower = base_filename.lower()
+        
+        # === EXE 文件处理 ===
+        if file_ext == 'exe':
+            # 检查是否为SFX文件
+            if not self.sfx_detector.is_sfx(file_path):
+                return {"is_multi": False, "type": "exe-notarchive"}
+            
+            # 获取详细的SFX检测结果
+            sfx_result = self.sfx_detector.is_sfx(file_path, detailed=True)
+            signature_info = sfx_result.get('signature', {})
+            rar_marker = sfx_result.get('rar_marker', False)
+            
+            # 判断是RAR SFX还是7z SFX
+            is_rar_sfx = False
+            if signature_info.get('found', False) and signature_info.get('format') == 'RAR':
+                is_rar_sfx = True
+            elif rar_marker:
+                is_rar_sfx = True
+            
+            if is_rar_sfx:
+                # SFX-RAR文件
+                part_match = re.search(r'\.part\d+$', base_filename_lower)
+                if part_match:
+                    # 检查是否存在对应的.exe文件（exe SFX-RAR分卷）
+                    base_without_part = base_filename[:part_match.start()]
+                    exe_pattern = base_without_part + '.part*.exe'
+                    exe_files = safe_glob(os.path.join(dir_path, exe_pattern))
+                    if exe_files:
+                        return {"is_multi": True, "type": "exe-rar-multi"}
+                    else:
+                        return {"is_multi": False, "type": "exe-rar-single"}
+                else:
+                    return {"is_multi": False, "type": "exe-rar-single"}
+            else:
+                # SFX-7z文件
+                # 检查是否存在对应的.7z.*分卷文件
+                seven_z_pattern = filename + '.7z.*'
+                seven_z_files = safe_glob(os.path.join(dir_path, seven_z_pattern))
+                if seven_z_files:
+                    return {"is_multi": True, "type": "exe-7z-multi"}
+                else:
+                    return {"is_multi": False, "type": "exe-7z-single"}
+        
+        # === 7z 文件处理 ===
+        elif file_ext == '7z':
+            return {"is_multi": False, "type": "7z-single"}
+        
+        # === 7z 分卷处理 ===
+        elif file_ext.isdigit() and filename_lower.endswith('.7z.' + file_ext):
+            # 去除 .7z 得到 base_filename
+            base_without_7z = filename[:-len('.7z.' + file_ext)]
+            exe_file = os.path.join(dir_path, base_without_7z + '.exe')
+            if safe_isfile(exe_file, VERBOSE):
+                return {"is_multi": True, "type": "exe-7z-multi"}
+            else:
+                return {"is_multi": True, "type": "7z-multi"}
+        
+        # === RAR 文件处理 ===
+        elif file_ext == 'rar':
+            part_match = re.search(r'\.part\d+$', base_filename_lower)
+            if part_match:
+                # RAR5分卷
+                base_without_part = base_filename[:part_match.start()]
+                exe_pattern = base_without_part + '.part*.exe'
+                exe_files = safe_glob(os.path.join(dir_path, exe_pattern))
+                if exe_files:
+                    return {"is_multi": True, "type": "exe-rar-multi"}
+                else:
+                    return {"is_multi": True, "type": "rar5-multi"}
+            else:
+                # 检查是否存在.r*分卷文件
+                r_pattern = filename + '.r*'
+                r_files = safe_glob(os.path.join(dir_path, r_pattern))
+                if r_files:
+                    return {"is_multi": True, "type": "rar4-multi"}
+                else:
+                    return {"is_multi": False, "type": "rar4/rar5-single"}
+        
+        # === RAR4 分卷从卷处理 ===
+        elif re.match(r'^r\d+$', file_ext):
+            # 检查是否存在主.rar文件
+            main_rar = os.path.join(dir_path, filename[:-len('.' + file_ext)] + '.rar')
+            if safe_isfile(main_rar, VERBOSE):
+                return {"is_multi": True, "type": "rar4-multi"}
+            else:
+                return {"is_multi": False, "type": "unknown"}
+        
+        # === ZIP 文件处理 ===
+        elif file_ext == 'zip':
+            # 检查是否存在.z*分卷文件
+            z_pattern = filename + '.z*'
+            z_files = safe_glob(os.path.join(dir_path, z_pattern))
+            if z_files:
+                return {"is_multi": True, "type": "zip-multi"}
+            else:
+                return {"is_multi": False, "type": "zip-single"}
+        
+        # === ZIP 分卷从卷处理 ===
+        elif re.match(r'^z\d+$', file_ext):
+            # 检查是否存在主.zip文件
+            main_zip = os.path.join(dir_path, filename[:-len('.' + file_ext)] + '.zip')
+            if safe_isfile(main_zip, VERBOSE):
+                return {"is_multi": True, "type": "zip-multi"}
+            else:
+                return {"is_multi": False, "type": "unknown"}
+        
+        else:
+            return {"is_multi": False, "type": "unknown"}
 
     def is_main_volume(self, file_path):
         """
@@ -1487,13 +1625,14 @@ class ArchiveProcessor:
         if file_ext.isdigit() and filename_lower.endswith('.7z.' + file_ext):
             # 检查扩展名是否不为第一卷标识
             if file_ext not in ['001', '0001', '00001']:
-                # 确保不存在对应的.exe文件
+                # 将{filename} 末尾 去除 ".7z" 得到 {base_filename}
                 base_without_7z = '.'.join(filename.split('.')[:-2])
                 potential_exe = os.path.join(dir_path, base_without_7z + '.exe')
                 if not safe_exists(potential_exe, VERBOSE):
+                    # 纯7z分卷从卷：{dirPath} 下不存在 {base_filename}.exe 文件
                     return True
                 else:
-                    # 如果存在exe文件，检查是否为SFX-7z分卷的从卷
+                    # exe SFX-7z分卷的从卷：{dirPath} 下存在 {base_filename}.exe 文件
                     if safe_isfile(potential_exe, VERBOSE) and self.sfx_detector.is_sfx(potential_exe):
                         sfx_result = self.sfx_detector.is_sfx(potential_exe, detailed=True)
                         signature_info = sfx_result.get('signature', {})
@@ -1507,6 +1646,7 @@ class ArchiveProcessor:
                             is_rar_sfx = True
                         
                         if not is_rar_sfx:
+                            # 满足：sfx.is_sfx == true && rar_signature == not_exist
                             return True
         
         # === RAR5 分卷从卷 ===
@@ -1514,21 +1654,23 @@ class ArchiveProcessor:
             part_match = re.search(r'\.part(\d+)$', base_filename_lower)
             if part_match:
                 part_num = part_match.group(1)
-                # 检查是否不为第一分卷
+                # 检查是否不为第一分卷：part(d+) 的数字 不能为 (1|01|001|0001|00001)
                 if part_num not in ['1', '01', '001', '0001', '00001']:
-                    # 确保不存在对应的.exe文件或者存在但不是SFX-RAR分卷
+                    # 将{filename} 末尾 去除 ".part(d+)" 得到 {base_filename}
                     base_without_part = base_filename[:part_match.start()]
                     potential_exe_pattern = base_without_part + '.part*.exe'
                     exe_files = safe_glob(os.path.join(dir_path, potential_exe_pattern))
+                    
                     if not exe_files:
+                        # 纯RAR5分卷从卷：{dirPath} 下不存在 {base_filename}.part(d+).exe 文件
                         return True
                     else:
-                        # 如果存在exe文件，这是SFX-RAR分卷的.rar从卷
+                        # exe SFX-RAR分卷的从卷：{dirPath} 下存在 {base_filename}.part(d+).exe 文件
                         return True
         
         # === RAR4 分卷从卷 ===
         if re.match(r'^r\d+$', file_ext):
-            # .r00, .r01, etc. 文件
+            # RAR4分卷从卷：{fileExt} = r(d+) && {dirPath} 下存在 {filename}.rar 文件
             rar_base = base_filename + '.rar'
             potential_main_rar = os.path.join(dir_path, rar_base)
             if safe_exists(potential_main_rar, VERBOSE):
@@ -1536,7 +1678,7 @@ class ArchiveProcessor:
         
         # === ZIP 分卷从卷 ===
         if re.match(r'^z\d+$', file_ext):
-            # .z01, .z02, etc. 文件
+            # zip分卷从卷：{fileExt} == z(d+) && {dirPath} 下存在 {filename}.zip 文件
             zip_base = base_filename + '.zip'
             potential_main_zip = os.path.join(dir_path, zip_base)
             if safe_exists(potential_main_zip, VERBOSE):
@@ -1546,13 +1688,13 @@ class ArchiveProcessor:
 
     def get_all_volumes(self, file_path):
         """
-        获取压缩包的所有分卷文件
+        获取压缩包的所有分卷文件 - 重构版本，支持从任意分卷开始查找完整集合
         
         Args:
-            file_path: 主卷文件路径
+            file_path: 分卷文件路径（可以是任意分卷）
             
         Returns:
-            list: 所有分卷文件路径列表（包括主卷）
+            list: 所有分卷文件路径列表（包括传入的文件）
         """
 
         file_path = os.path.abspath(file_path)
@@ -1560,7 +1702,6 @@ class ArchiveProcessor:
         if not safe_isfile(file_path, VERBOSE):
             return [file_path]
 
-        
         filename = os.path.basename(file_path)
         filename_lower = filename.lower()
         dir_path = os.path.dirname(file_path)
@@ -1573,89 +1714,138 @@ class ArchiveProcessor:
             return [file_path]
             
         file_ext = filename_lower.split('.')[-1]
-        base_filename = '.'.join(filename.split('.')[:-1])
+        
+        # 步骤1：判断文件是单包还是分卷
+        archive_info = self.is_archive_single_or_volume_innerLogic(file_path)
+        is_multi = archive_info.get('is_multi', False)
+        archive_type = archive_info.get('type', 'unknown')
+        
+        if VERBOSE:
+            print(f"  DEBUG: 归档类型检测结果: is_multi={is_multi}, type={archive_type}")
+        
+        # 如果是单包，直接返回单个文件
+        if not is_multi:
+            return [file_path]
+        
+        # 步骤2：根据不同的分卷类型，设置正确的base_filename
+        base_filename = None
+        
+        if archive_type == '7z-multi':
+            # 7z分卷：将{filename} 末尾 去除 ".7z" 得到 {base_filename}
+            if filename_lower.endswith('.7z.' + file_ext):
+                base_filename = filename[:-len('.7z.' + file_ext)]
+        elif archive_type == 'rar5-multi':
+            # RAR5分卷：将{filename} 末尾 去除 ".part(d+)" 得到 {base_filename}
+            base_without_ext = '.'.join(filename.split('.')[:-1])  # 去除扩展名
+            part_match = re.search(r'\.part\d+$', base_without_ext.lower())
+            if part_match:
+                base_filename = base_without_ext[:part_match.start()]
+        elif archive_type == 'rar4-multi':
+            # RAR4分卷：base_filename = filename (去除扩展名)
+            base_filename = '.'.join(filename.split('.')[:-1])
+        elif archive_type == 'zip-multi':
+            # ZIP分卷：base_filename = filename (去除扩展名)
+            base_filename = '.'.join(filename.split('.')[:-1])
+        elif archive_type == 'exe-rar-multi':
+            # exe SFX-RAR分卷：将{filename} 末尾 去除 ".part(d+)" 得到 {base_filename}
+            base_without_ext = '.'.join(filename.split('.')[:-1])  # 去除扩展名
+            part_match = re.search(r'\.part\d+$', base_without_ext.lower())
+            if part_match:
+                base_filename = base_without_ext[:part_match.start()]
+        elif archive_type == 'exe-7z-multi':
+            # exe SFX-7z分卷：将{filename} 末尾 去除 ".7z" 得到 {base_filename}，特殊的，如果末尾不是.7z就不要去除
+            if filename_lower.endswith('.7z'):
+                base_filename = filename[:-4]  # 去除 ".7z"
+            else:
+                base_filename = '.'.join(filename.split('.')[:-1])  # 去除扩展名
+        
+        if base_filename is None:
+            # 如果无法确定base_filename，回退到原始逻辑
+            base_filename = '.'.join(filename.split('.')[:-1])
+            if VERBOSE:
+                print(f"  DEBUG: 无法确定base_filename，回退到原始逻辑: {base_filename}")
+        
+        if VERBOSE:
+            print(f"  DEBUG: 确定的base_filename: {base_filename}")
         
         volumes = []
         
-        # === 7z 分卷 ===
-        if file_ext.isdigit() and filename_lower.endswith('.7z.' + file_ext):
-            base_without_7z = '.'.join(filename.split('.')[:-2])
-            potential_exe = os.path.join(dir_path, base_without_7z + '.exe')
-            
-            if not safe_exists(potential_exe, VERBOSE):
-                # 纯7z分卷
-                pattern = base_without_7z + '.7z.*'
-                volume_files = safe_glob(os.path.join(dir_path, pattern))
-                volumes.extend([f for f in volume_files if re.match(r'.*\.7z\.\d+$', f.lower())])
-            else:
-                # SFX-7z分卷（情况2：从.7z.*文件开始查找）
-                if safe_isfile(potential_exe, VERBOSE) and self.sfx_detector.is_sfx(potential_exe):
-                    volumes.append(potential_exe)  # 添加.exe主文件
-                    pattern = base_without_7z + '.7z.*'
-                    volume_files = safe_glob(os.path.join(dir_path, pattern))
-                    volumes.extend([f for f in volume_files if re.match(r'.*\.7z\.\d+$', f.lower())])
+        ### 分卷检测逻辑 ###
+        # 7z分卷检测
+        if archive_type == '7z-multi':
+            # 寻找所有 {base_filename}.7z.(d+) 文件
+            pattern = base_filename + '.7z.*'
+            seven_z_files = safe_glob(os.path.join(dir_path, pattern))
+            for f in seven_z_files:
+                f_name = os.path.basename(f)
+                f_ext = f_name.split('.')[-1]
+                if f_ext.isdigit():
+                    volumes.append(f)
         
-        # === RAR5 分卷 ===
-        elif file_ext == 'rar':
-            part_match = re.search(r'\.part\d+$', base_filename.lower())
-            if part_match:
-                base_without_part = base_filename[:part_match.start()]
-                potential_exe_pattern = base_without_part + '.part*.exe'
-                exe_files = safe_glob(os.path.join(dir_path, potential_exe_pattern))
-                
-                if not exe_files:
-                    # 纯RAR5分卷
-                    pattern = base_without_part + '.part*.rar'
-                    volumes.extend(safe_glob(os.path.join(dir_path, pattern)))
-                else:
-                    # SFX-RAR分卷（情况2：从.rar文件开始查找）
-                    volumes.extend(exe_files)  # 添加所有.exe文件
-                    pattern = base_without_part + '.part*.rar'
-                    volumes.extend(safe_glob(os.path.join(dir_path, pattern)))
-            else:
-                # RAR4分卷
-                rar4_volumes = safe_glob(os.path.join(dir_path, base_filename + '.r*'))
-                if rar4_volumes:
-                    volumes.append(file_path)  # 主.rar文件
-                    volumes.extend(rar4_volumes)
+        # RAR5分卷检测
+        elif archive_type == 'rar5-multi':
+            # 寻找所有 {base_filename}.part(d+).rar 文件
+            pattern = base_filename + '.part*.rar'
+            rar5_files = safe_glob(os.path.join(dir_path, pattern))
+            volumes.extend(rar5_files)
         
-        # === ZIP 分卷 ===
-        elif file_ext == 'zip':
-            zip_volumes = safe_glob(os.path.join(dir_path, base_filename + '.z*'))
-            if zip_volumes:
-                volumes.append(file_path)  # 主.zip文件
-                volumes.extend(zip_volumes)
+        # RAR4分卷检测
+        elif archive_type == 'rar4-multi':
+            # 寻找所有 {filename}.rar + {filename}.r(d+) 文件
+            # 主卷
+            main_rar = os.path.join(dir_path, base_filename + '.rar')
+            if safe_exists(main_rar, VERBOSE):
+                volumes.append(main_rar)
+            # 从卷
+            pattern = base_filename + '.r*'
+            rar4_files = safe_glob(os.path.join(dir_path, pattern))
+            for f in rar4_files:
+                f_name = os.path.basename(f)
+                f_ext = f_name.split('.')[-1]
+                if re.match(r'^r\d+$', f_ext):
+                    volumes.append(f)
         
-        # === EXE SFX 分卷 ===
-        elif file_ext == 'exe':
-            if self.sfx_detector.is_sfx(file_path):
-                sfx_result = self.sfx_detector.is_sfx(file_path, detailed=True)
-                signature_info = sfx_result.get('signature', {})
-                rar_marker = sfx_result.get('rar_marker', False)
-                
-                # 判断是RAR SFX还是7z SFX
-                is_rar_sfx = False
-                if signature_info.get('found', False) and signature_info.get('format') == 'RAR':
-                    is_rar_sfx = True
-                elif rar_marker:
-                    is_rar_sfx = True
-                
-                if is_rar_sfx:
-                    # SFX-RAR分卷（情况1：从.exe文件开始查找）
-                    part_match = re.search(r'\.part\d+$', base_filename.lower())
-                    if part_match:
-                        base_without_part = base_filename[:part_match.start()]
-                        # 查找所有相关的.exe和.rar文件
-                        exe_pattern = base_without_part + '.part*.exe'
-                        rar_pattern = base_without_part + '.part*.rar'
-                        volumes.extend(safe_glob(os.path.join(dir_path, exe_pattern)))
-                        volumes.extend(safe_glob(os.path.join(dir_path, rar_pattern)))
-                else:
-                    # SFX-7z分卷（情况1：从.exe文件开始查找）
-                    seven_volumes = safe_glob(os.path.join(dir_path, base_filename + '.7z.*'))
-                    if seven_volumes:
-                        volumes.append(file_path)  # 主.exe文件
-                        volumes.extend([f for f in seven_volumes if re.match(r'.*\.7z\.\d+$', f.lower())])
+        # ZIP分卷检测
+        elif archive_type == 'zip-multi':
+            # 寻找所有 {filename}.zip + {filename}.z(d+) 文件
+            # 主卷
+            main_zip = os.path.join(dir_path, base_filename + '.zip')
+            if safe_exists(main_zip, VERBOSE):
+                volumes.append(main_zip)
+            # 从卷
+            pattern = base_filename + '.z*'
+            zip_files = safe_glob(os.path.join(dir_path, pattern))
+            for f in zip_files:
+                f_name = os.path.basename(f)
+                f_ext = f_name.split('.')[-1]
+                if re.match(r'^z\d+$', f_ext):
+                    volumes.append(f)
+        
+        # exe SFX-RAR分卷检测
+        elif archive_type == 'exe-rar-multi':
+            # 寻找所有 {base_filename}.part(d+).rar + {base_filename}.part(d+).exe 文件
+            pattern_rar = base_filename + '.part*.rar'
+            pattern_exe = base_filename + '.part*.exe'
+            exe_rar_files = safe_glob(os.path.join(dir_path, pattern_rar))
+            exe_exe_files = safe_glob(os.path.join(dir_path, pattern_exe))
+            volumes.extend(exe_rar_files)
+            volumes.extend(exe_exe_files)
+        
+        # exe SFX-7z分卷检测
+        elif archive_type == 'exe-7z-multi':
+            # 寻找所有 {base_filename}.exe + {base_filename}.7z.(d+) 文件
+            # 主卷exe
+            main_exe = os.path.join(dir_path, base_filename + '.exe')
+            if safe_exists(main_exe, VERBOSE):
+                volumes.append(main_exe)
+            # 从卷7z
+            pattern = base_filename + '.7z.*'
+            seven_z_files = safe_glob(os.path.join(dir_path, pattern))
+            for f in seven_z_files:
+                f_name = os.path.basename(f)
+                f_ext = f_name.split('.')[-1]
+                if f_ext.isdigit():
+                    volumes.append(f)
         
         # 如果没有找到分卷，返回原文件
         if not volumes:
@@ -2370,11 +2560,87 @@ def safe_open(file_path, mode='r', *args, **kwargs):
 
 def safe_glob(pattern: str, debug: bool = False):
     """
-    glob.glob 的安全包装，使模式可以含有超长路径前缀。
-    注意：glob / fnmatch 自身在 \\?\\ 前缀下仍工作良好。
+    简单的glob替代，使用正则表达式避免fnmatch的特殊字符问题
     """
-    safe_pattern = safe_path_for_operation(pattern, debug)
-    return glob.glob(safe_pattern)
+    import re
+    
+    if debug:
+        print(f"  DEBUG: 原始pattern: {pattern}")
+    
+    # 分离目录和文件名模式
+    dir_path = os.path.dirname(pattern)
+    file_pattern = os.path.basename(pattern)
+    
+    if debug:
+        print(f"  DEBUG: 目录路径: {dir_path}")
+        print(f"  DEBUG: 文件模式: {file_pattern}")
+    
+    # 如果没有目录路径，使用当前目录
+    if not dir_path:
+        dir_path = '.'
+    
+    # 先对目录路径进行安全处理
+    safe_dir_path = safe_path_for_operation(dir_path, debug)
+    
+    try:
+        # 确保目录存在
+        if not os.path.exists(safe_dir_path):
+            if debug:
+                print(f"  DEBUG: 目录不存在: {safe_dir_path}")
+            return []
+        
+        # 获取目录中的所有文件
+        try:
+            files = os.listdir(safe_dir_path)
+        except (OSError, UnicodeDecodeError) as e:
+            if debug:
+                print(f"  DEBUG: 列出目录失败: {e}")
+            return []
+        
+        if debug:
+            print(f"  DEBUG: 目录中的文件数量: {len(files)}")
+        
+        # 将glob模式转换为正则表达式
+        # 只处理*和?通配符，其他所有字符都作为字面字符
+        regex_pattern = re.escape(file_pattern)  # 先转义所有特殊字符
+        regex_pattern = regex_pattern.replace(r'\*', '.*')  # 恢复*通配符
+        regex_pattern = regex_pattern.replace(r'\?', '.')   # 恢复?通配符
+        regex_pattern = '^' + regex_pattern + '$'  # 精确匹配
+        
+        if debug:
+            print(f"  DEBUG: 原始文件模式: {file_pattern}")
+            print(f"  DEBUG: 正则表达式: {regex_pattern}")
+        
+        # 编译正则表达式
+        try:
+            regex = re.compile(regex_pattern)
+        except re.error as e:
+            if debug:
+                print(f"  DEBUG: 正则表达式编译失败: {e}")
+            return []
+        
+        matched_files = []
+        for file in files:
+            try:
+                if regex.match(file):
+                    full_path = os.path.join(dir_path, file)
+                    matched_files.append(full_path)
+                    if debug:
+                        print(f"  DEBUG: 匹配到文件: {file}")
+            except (UnicodeDecodeError, UnicodeEncodeError) as e:
+                if debug:
+                    print(f"  DEBUG: 文件名编码问题: {file}, 错误: {e}")
+                continue
+        
+        if debug:
+            print(f"  DEBUG: 总共匹配到 {len(matched_files)} 个文件")
+        
+        return sorted(matched_files)
+        
+    except Exception as e:
+        if debug:
+            print(f"  DEBUG: safe_glob异常: {e}")
+        return []
 
 def _patch_cmd_paths(cmd):
     """
