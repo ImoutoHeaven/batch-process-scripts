@@ -2308,44 +2308,46 @@ def get_short_path_name(long_path):
     except Exception:
         return long_path
 
-# === 修复windows长路径 ===
-def _normalize_windows_long_path(path: str) -> str:
-    """
-    Convert to Win32 long‑path form (\\?\\ or \\?\\UNC\\).
-    Handles existing long paths and avoids duplicate back‑slashes.
-    """
-    if not is_windows():
-        return path
-    abs_path = os.path.abspath(os.path.expandvars(path))
-    if abs_path.startswith(('\\\\?\\', '\\\\.\\')):
-        return abs_path                       # 已是长路径
-    if abs_path.startswith('\\\\'):           # UNC
-        # 注意：lstrip 只能去掉 *一个* 前导反斜杠
-        return '\\\\?\\UNC\\' + abs_path[2:]  # 去掉最前面的两个 '\'
-    return '\\\\?\\' + abs_path
-
-
-
 def safe_path_for_operation(path: str, debug: bool = False) -> str:
     """
-    统一的“可安全参与文件系统/子进程操作”的路径转换：
-    1. 若非 Windows：直接返回原始路径
-    2. Windows：
-       2.1 优先尝试扩展长度路径 `_normalize_windows_long_path`
-       2.2 若生成路径仍超长或出现异常，再回退到 8.3 短路径 `get_short_path_name`
+    Windows路径安全处理：优先使用短路径避免兼容性问题
+    - 自动处理长路径问题（>260字符）
+    - 处理包含特殊字符的路径
+    - 确保与os.path模块良好配合
+    - 对非Windows系统直接返回原始路径
     """
     if not is_windows() or not path:
         return path
-
+    
     try:
-        long_path = _normalize_windows_long_path(path)
-        # Win32 API 对扩展长度路径的上限是 32 k，足够使用
-        return long_path
+        # 先标准化路径
+        abs_path = os.path.abspath(os.path.expandvars(path))
+        
+        # Windows文件名中不允许的字符（不包括冒号，因为冒号在盘符中是合法的）
+        invalid_chars = '<>"|?*'
+        
+        # 检查是否需要使用短路径：
+        # 1. 路径过长（超过Windows传统限制260字符）
+        # 2. 包含文件名不允许的特殊字符
+        needs_short_path = (
+            len(abs_path) > 260 or 
+            any(char in abs_path for char in invalid_chars)
+        )
+        
+        if needs_short_path:
+            if debug:
+                reason = "长路径" if len(abs_path) > 260 else "特殊字符"
+                print(f"  DEBUG: 检测到{reason}，使用短路径: {path}")
+            
+            short_path = get_short_path_name(abs_path)
+            return short_path if short_path != abs_path else abs_path
+        
+        return abs_path
+        
     except Exception as e:
-        # 极端情况（如路径含保留字符）再尝试短路径
         if debug:
-            print(f"  DEBUG: long‑path normalize failed for {path}: {e}; fallback to short path")
-        return get_short_path_name(path) or path
+            print(f"  DEBUG: 路径处理失败 {path}: {e}")
+        return path
 
 def safe_open(file_path, mode='r', *args, **kwargs):
     """
