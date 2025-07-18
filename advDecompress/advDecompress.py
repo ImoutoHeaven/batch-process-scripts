@@ -1543,9 +1543,13 @@ class ArchiveProcessor:
         Returns:
             list: 所有分卷文件路径列表（包括主卷）
         """
+
+        file_path = os.path.abspath(file_path)
+
         if not safe_isfile(file_path, VERBOSE):
             return [file_path]
-            
+
+        
         filename = os.path.basename(file_path)
         filename_lower = filename.lower()
         dir_path = os.path.dirname(file_path)
