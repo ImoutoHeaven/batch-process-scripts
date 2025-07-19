@@ -1713,7 +1713,9 @@ class ArchiveProcessor:
         if '.' not in filename_lower:
             return [file_path]
             
-        file_ext = filename_lower.split('.')[-1]
+        original_ext = filename.split('.')[-1]
+        file_ext = original_ext.lower()
+        is_ext_lower = (file_ext == original_ext)
         
         # 步骤1：判断文件是单包还是分卷
         archive_info = self.is_archive_single_or_volume_innerLogic(file_path)
@@ -2561,6 +2563,7 @@ def safe_open(file_path, mode='r', *args, **kwargs):
 def safe_glob(pattern: str, debug: bool = False):
     """
     简单的glob替代，使用正则表达式避免fnmatch的特殊字符问题
+    支持大小写不敏感匹配
     """
     import re
     
@@ -2611,9 +2614,9 @@ def safe_glob(pattern: str, debug: bool = False):
             print(f"  DEBUG: 原始文件模式: {file_pattern}")
             print(f"  DEBUG: 正则表达式: {regex_pattern}")
         
-        # 编译正则表达式
+        # 编译正则表达式，使用大小写不敏感标志
         try:
-            regex = re.compile(regex_pattern)
+            regex = re.compile(regex_pattern, re.IGNORECASE)
         except re.error as e:
             if debug:
                 print(f"  DEBUG: 正则表达式编译失败: {e}")
