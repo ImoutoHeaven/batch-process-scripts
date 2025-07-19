@@ -59,9 +59,9 @@ class SFXDetector:
     SIGNATURES = {
         'RAR': [b'Rar!'],
         '7Z': [b'\x37\x7A\xBC\xAF\x27\x1C'],
-        'ZIP': [b'PK\x03\x04'],
-        'CAB': [b'MSCF'],
-        'ARJ': [b'\x60\xEA'],
+        # 'ZIP': [b'PK\x03\x04'],  # 没人会用ZIP打包为EXE，但程序却可能会用
+        # 'CAB': [b'MSCF'],       # 没人会用CAB打包为EXE，但程序却可能会用
+        # 'ARJ': [b'\x60\xEA'],   # 没人会用ARJ打包为EXE，但程序却可能会用
     }
 
     def __init__(self, verbose=False):
