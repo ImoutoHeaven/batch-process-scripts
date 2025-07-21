@@ -41,6 +41,10 @@ debug_mode = False
 # {id: {command, status, process, retry_count, start_time, end_time, pid}}
 command_states = {}
 
+# 逻辑块信息 (用于 sequence 模式显示)
+logical_blocks = []
+current_execution_mode = "max-concurrent"  # "max-concurrent" 或 "sequence"
+
 # ---------------------- 解析命令行参数 ----------------------
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -209,32 +213,115 @@ def format_command_list(cmds):
 def format_command_status():
     with command_lock:
         now = datetime.datetime.now()
-        status_groups = {
-            CommandStatus.RUNNING:   [],
-            CommandStatus.INQUEUE:   [],
-            CommandStatus.PAUSED:    [],
-            CommandStatus.COMPLETED: [],
-            CommandStatus.FAILED:    []
+        
+        # 统计各状态数量
+        status_counts = {
+            CommandStatus.RUNNING: 0,
+            CommandStatus.INQUEUE: 0,
+            CommandStatus.PAUSED: 0,
+            CommandStatus.COMPLETED: 0,
+            CommandStatus.FAILED: 0
         }
+        
+        # 按状态分组命令
+        status_groups = {
+            CommandStatus.RUNNING: [],
+            CommandStatus.INQUEUE: [],
+            CommandStatus.PAUSED: [],
+            CommandStatus.COMPLETED: [],
+            CommandStatus.FAILED: []
+        }
+        
         for cid, st in sorted(command_states.items()):
-            status_groups[st["status"]].append((cid, st))
-        lines = ["\n--- 命令状态 ---"]
-        for status, group in status_groups.items():
+            status = st["status"]
+            status_groups[status].append((cid, st))
+            status_counts[status] += 1
+        
+        # 构建输出
+        lines = []
+        
+        # 状态统计标题行
+        succeeded_count = status_counts[CommandStatus.COMPLETED]
+        running_count = status_counts[CommandStatus.RUNNING]
+        total_commands = len(command_states)
+        
+        lines.append("--- 命令状态 ---")
+        lines.append(f"状态统计: SUCCEEDED: {succeeded_count} | RUNNING: {running_count}")
+        lines.append("-" * 50)
+        
+        # 如果是 sequence 模式，显示逻辑块信息
+        if current_execution_mode == "sequence" and logical_blocks:
+            lines.append("逻辑块状态:")
+            for i, block in enumerate(logical_blocks, 1):
+                cmd_indices = block["cmds"]
+                require_prev = block.get("require_prev_success", False)
+                
+                # 计算块状态
+                block_statuses = [command_states[idx]["status"] for idx in cmd_indices]
+                if all(st == CommandStatus.COMPLETED for st in block_statuses):
+                    block_status = "✓ 已完成"
+                elif any(st == CommandStatus.RUNNING for st in block_statuses):
+                    block_status = "▶ 执行中"
+                elif any(st == CommandStatus.FAILED for st in block_statuses):
+                    block_status = "✗ 失败"
+                else:
+                    block_status = "⏳ 等待"
+                
+                prev_marker = " (需前块成功)" if require_prev else ""
+                cmd_list = ",".join(str(idx+1) for idx in cmd_indices)
+                lines.append(f"  块 {i}: [{block_status}] 指令 {cmd_list}{prev_marker}")
+            lines.append("-" * 50)
+        
+        # 显示各状态的命令详情
+        status_display_order = [
+            (CommandStatus.RUNNING, "▶ RUNNING"),
+            (CommandStatus.COMPLETED, "✓ SUCCEEDED"), 
+            (CommandStatus.FAILED, "✗ FAILED"),
+            (CommandStatus.PAUSED, "⏸ PAUSED"),
+            (CommandStatus.INQUEUE, "⏳ INQUEUE")
+        ]
+        
+        for status, display_name in status_display_order:
+            group = status_groups[status]
             if not group:
                 continue
-            lines.append(f"\n--- {status} ({len(group)}) ---")
+                
             for cid, st in group:
+                # 计算运行时间
                 dur = ""
                 if st["start_time"]:
                     end = st["end_time"] or now
                     td = int((end - st["start_time"]).total_seconds())
                     h, m = divmod(td, 3600)
                     m, s = divmod(m, 60)
-                    dur = f"{h:02d}:{m:02d}:{s:02d}"
+                    dur = f"[{h:02d}:{m:02d}:{s:02d}]"
+                
+                # 状态图标
+                status_icon = "✓" if status == CommandStatus.COMPLETED else \
+                             "▶" if status == CommandStatus.RUNNING else \
+                             "✗" if status == CommandStatus.FAILED else \
+                             "⏸" if status == CommandStatus.PAUSED else "⏳"
+                
+                # 重试信息
                 retry = f" (重试:{st['retry_count']})" if st["retry_count"] else ""
+                
+                # PID信息（调试模式）
                 pid = f" [PID:{st['pid']}]" if debug_mode and st.get("pid") else ""
-                lines.append(f"ID {cid+1}: [{dur}]{retry}{pid} {st['command']}")
-        lines.append("\n-----------------\n")
+                
+                # 时间戳
+                timestamp = ""
+                if st["end_time"] and status in [CommandStatus.COMPLETED, CommandStatus.FAILED]:
+                    timestamp = f"  [{st['end_time'].strftime('%H:%M:%S')}]"
+                elif st["start_time"] and status == CommandStatus.RUNNING:
+                    timestamp = f"  [{st['start_time'].strftime('%H:%M:%S')}]"
+                
+                # 格式化命令行
+                cmd_display = st['command']
+                if len(cmd_display) > 120:
+                    cmd_display = cmd_display[:117] + "..."
+                
+                lines.append(f"ID {cid+1:3d}: [{status_icon} {display_name:>10}] {dur:>11}{timestamp}  {cmd_display}{retry}{pid}")
+        
         return "\n".join(lines)
 
 # ---------------------- 输入监听线程 ----------------------
@@ -532,9 +619,12 @@ def main():
 
     try:
         if args.sequence:
+            global current_execution_mode, logical_blocks
+            current_execution_mode = "sequence"
             try:
                 blocks = parse_sequence_expression(
                     args.sequence, len(commands))
+                logical_blocks = blocks
             except SequenceParseError as e:
                 print(f"[sequence 解析错误] {e}")
                 sys.exit(1)
