@@ -1473,25 +1473,30 @@ class ArchiveProcessor:
         if ext.isdigit() and ext2 == '7z' and not safe_exists(os.path.join(folder, bf + '.exe')):
             volumes |= set(safe_glob(os.path.join(folder, bf + '.7z.*')))
 
-        # 7z SFX
+        # EXE SFX 统一处理（从 .exe 文件开始的所有 SFX 情况）
         elif ext == 'exe' and self.sfx_detector.is_sfx(file_path):
             sfx = self.sfx_detector.is_sfx(file_path, detailed=True)
             is_rar_sfx = (sfx.get('signature', {}).get('format') == 'RAR') or sfx.get('rar_marker', False)
-            if not is_rar_sfx and safe_glob(os.path.join(folder, bf + '.7z.*')):
-                volumes.add(os.path.join(folder, bf + '.exe'))
-                volumes |= set(safe_glob(os.path.join(folder, bf + '.7z.*')))
+            
+            if is_rar_sfx:
+                # EXE-RAR SFX 分卷处理
+                if safe_glob(os.path.join(folder, bf + '.part*.rar')):
+                    volumes.add(file_path)  # 添加 .exe 主卷
+                    volumes |= set(safe_glob(os.path.join(folder, bf + '.part*.rar')))
+            else:
+                # EXE-7z SFX 分卷处理  
+                if safe_glob(os.path.join(folder, bf + '.7z.*')):
+                    volumes.add(file_path)  # 添加 .exe 主卷
+                    volumes |= set(safe_glob(os.path.join(folder, bf + '.7z.*')))
 
         # RAR5 纯
         elif ext == 'rar' and re.fullmatch(r'part\d+', ext2) \
              and not safe_glob(os.path.join(folder, bf + '.part*.exe')):
             volumes |= set(safe_glob(os.path.join(folder, bf + '.part*.rar')))
 
-        # RAR5 SFX
-        elif (ext == 'exe' and self.sfx_detector.is_sfx(file_path) and \
-              ((self.sfx_detector.is_sfx(file_path, detailed=True).get('signature', {}).get('format') == 'RAR') or \
-               self.sfx_detector.is_sfx(file_path, detailed=True).get('rar_marker', False))) or \
-             (ext == 'rar' and re.fullmatch(r'part\d+', ext2) and \
-              safe_glob(os.path.join(folder, bf + '.part*.exe'))):
+        # RAR5 SFX 从卷（从 .rar 文件开始查找的情况）
+        elif ext == 'rar' and re.fullmatch(r'part\d+', ext2) and \
+             safe_glob(os.path.join(folder, bf + '.part*.exe')):
             volumes.add(os.path.join(folder, bf + '.exe'))
             volumes |= set(safe_glob(os.path.join(folder, bf + '.part*.rar')))
 
