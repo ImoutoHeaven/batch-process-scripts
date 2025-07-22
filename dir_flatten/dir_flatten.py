@@ -5,8 +5,59 @@ import uuid
 import time
 import errno
 import sys
+import logging
+from datetime import datetime
 from typing import List, Dict, Any
 
+
+# ----------------- Logging setup -----------------
+
+def setup_logging(verbose: bool = False, debug: bool = False):
+    """Setup logging configuration with formatted output."""
+    level = logging.DEBUG if debug else (logging.INFO if verbose else logging.WARNING)
+    
+    # Create custom formatter with colors for different levels
+    class ColoredFormatter(logging.Formatter):
+        COLORS = {
+            'DEBUG': '\033[36m',    # Cyan
+            'INFO': '\033[32m',     # Green
+            'WARNING': '\033[33m',  # Yellow
+            'ERROR': '\033[31m',    # Red
+            'CRITICAL': '\033[35m', # Magenta
+        }
+        RESET = '\033[0m'
+        
+        def format(self, record):
+            # Add timestamp
+            record.timestamp = datetime.now().strftime('%H:%M:%S')
+            
+            # Format the message
+            log_message = super().format(record)
+            
+            # Add color if terminal supports it
+            if hasattr(sys.stderr, 'isatty') and sys.stderr.isatty():
+                color = self.COLORS.get(record.levelname, '')
+                return f"{color}[{record.timestamp}] {record.levelname:8s} | {log_message}{self.RESET}"
+            else:
+                return f"[{record.timestamp}] {record.levelname:8s} | {log_message}"
+    
+    # Configure root logger
+    logging.basicConfig(
+        level=level,
+        format='%(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    # Set custom formatter
+    for handler in logging.root.handlers:
+        handler.setFormatter(ColoredFormatter())
+    
+    return logging.getLogger('dir_flatten')
+
+# Global logger instance
+logger = None
 
 # ----------------- Util helpers -----------------
 
@@ -40,8 +91,8 @@ def find_file_content(tmp_dir: str, debug: bool = False) -> Dict[str, Any]:
         'parent_folder_name': ''
     }
 
-    if debug:
-        print(f"  DEBUG: 开始查找 file_content: {tmp_dir}")
+    if debug and logger:
+        logger.debug(f"开始查找 file_content: {tmp_dir}")
 
     def get_items_at_depth(path: str, current_depth: int = 1):
         items: List[Dict[str, Any]] = []
@@ -64,15 +115,15 @@ def find_file_content(tmp_dir: str, debug: bool = False) -> Dict[str, Any]:
                         for f in files:
                             items.append({'name': f, 'path': os.path.join(root, f), 'is_dir': False})
         except Exception as e:
-            if debug:
-                print(f"  DEBUG: 获取深度{current_depth}项目失败: {e}")
+            if debug and logger:
+                logger.debug(f"获取深度{current_depth}项目失败: {e}")
         return items
 
     # Search depth by depth
     for depth in range(1, 11):
         items = get_items_at_depth(tmp_dir, depth)
-        if debug:
-            print(f"  DEBUG: 深度{depth}: {len(items)} items")
+        if debug and logger:
+            logger.debug(f"深度{depth}: {len(items)} items")
         if len(items) >= 2:
             result.update({
                 'found': True,
@@ -138,8 +189,8 @@ def cleanup_empty_dirs(root: str, keep_root: bool = True, debug: bool = False):
             # Directory already gone
             continue
         except Exception as e:
-            if debug:
-                print(f"  DEBUG: 检查 {dirpath} 失败: {e}")
+            if debug and logger:
+                logger.debug(f"检查目录 {dirpath} 失败: {e}")
             continue
 
         if is_empty:
@@ -147,11 +198,11 @@ def cleanup_empty_dirs(root: str, keep_root: bool = True, debug: bool = False):
                 continue
             try:
                 os.rmdir(dirpath)
-                if debug:
-                    print(f"  DEBUG: 删除空目录 {dirpath}")
+                if debug and logger:
+                    logger.debug(f"删除空目录: {dirpath}")
             except Exception as e:
-                if debug:
-                    print(f"  DEBUG: 删除 {dirpath} 失败: {e}")
+                if debug and logger:
+                    logger.debug(f"删除目录 {dirpath} 失败: {e}")
 
 
 # ----------------- Main flatten logic -----------------
@@ -172,10 +223,15 @@ def _all_entries_under(paths: List[str]) -> List[str]:
 
 
 def _move(src: str, dst: str):
+    """Move file/directory with cross-device support and logging."""
     try:
+        if logger:
+            logger.debug(f"Moving: {src} -> {dst}")
         shutil.move(src, dst)
     except OSError as e:
         if e.errno == errno.EXDEV:
+            if logger:
+                logger.debug(f"Cross-device move detected, using copy+delete: {src} -> {dst}")
             if os.path.isdir(src):
                 shutil.copytree(src, dst)
                 shutil.rmtree(src)
@@ -183,18 +239,24 @@ def _move(src: str, dst: str):
                 shutil.copy2(src, dst)
                 os.unlink(src)
         else:
+            if logger:
+                logger.error(f"Move failed: {src} -> {dst}, error: {e}")
             raise
 
 
 def flatten_subfolder(subfolder: str, *, verbose: bool = False, dry_run: bool = False):
-    if verbose:
-        print(f"[INFO] 处理子目录: {subfolder}")
+    if verbose and logger:
+        logger.info(f"处理子目录: {subfolder}")
 
     info = find_file_content(subfolder, debug=verbose)
     if not info['found'] or info['depth'] <= 1:
-        if verbose:
-            print("[INFO] 跳过, depth<=1 或未检测到 file_content\n")
+        if verbose and logger:
+            logger.info("跳过, depth<=1 或未检测到 file_content")
         return
+    
+    # Log analysis result
+    if verbose and logger:
+        logger.info(f"分析结果: depth={info['depth']}, items={len(info['items'])}, parent={info['parent_folder_name']}")
 
     parent = info['parent_folder_path']
     items = info['items']
@@ -206,40 +268,40 @@ def flatten_subfolder(subfolder: str, *, verbose: bool = False, dry_run: bool = 
         dest = os.path.join(subfolder, rel)
         if os.path.exists(dest):
             conflict = True
-            if verbose:
-                print(f"[WARN] 冲突: {dest} 已存在")
+            if verbose and logger:
+                logger.warning(f"冲突: {dest} 已存在")
     if conflict:
-        if verbose:
-            print("[WARN] 本子目录存在冲突, 放弃处理\n")
+        if verbose and logger:
+            logger.warning("本子目录存在冲突, 放弃处理")
         return
 
     tmp_dir = os.path.join(os.getcwd(), f"tmp_{int(time.time())}_{uuid.uuid4().hex[:8]}")
-    if verbose:
-        print(f"[INFO] 创建临时目录 {tmp_dir}")
+    if verbose and logger:
+        logger.info(f"创建临时目录: {tmp_dir}")
     if not dry_run:
         os.makedirs(tmp_dir, exist_ok=True)
 
     for item in items:
         dst = os.path.join(tmp_dir, item['name'])
-        if verbose:
-            print(f"[MOVE] {item['path']} -> {dst}")
+        if verbose and logger:
+            logger.info(f"MOVE: {item['path']} -> {dst}")
         if not dry_run:
             _move(item['path'], dst)
 
-    if verbose:
-        print(f"[INFO] 清理空目录 {subfolder}")
+    if verbose and logger:
+        logger.info(f"清理空目录: {subfolder}")
     if not dry_run:
         cleanup_empty_dirs(subfolder, keep_root=True, debug=verbose)
 
     for name in os.listdir(tmp_dir):
         src = os.path.join(tmp_dir, name)
         dst = os.path.join(subfolder, name)
-        if verbose:
-            print(f"[MOVE] {src} -> {dst}")
+        if verbose and logger:
+            logger.info(f"MOVE: {src} -> {dst}")
         if not dry_run:
             _move(src, dst)
-    if verbose:
-        print(f"[INFO] 删除临时目录 {tmp_dir}\n")
+    if verbose and logger:
+        logger.info(f"删除临时目录: {tmp_dir}")
     if not dry_run:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -247,8 +309,12 @@ def flatten_subfolder(subfolder: str, *, verbose: bool = False, dry_run: bool = 
 # ----------------- Driver code -----------------
 
 def collect_subfolders(root: str, scan_depth: int, debug: bool = False) -> List[str]:
+    """Collect subfolders at specified depth with logging."""
     result: List[str] = []
     root = os.path.abspath(root)
+    
+    if debug and logger:
+        logger.debug(f"Collecting subfolders at depth {scan_depth} from: {root}")
     for dirpath, dirnames, _ in os.walk(root):
         rel = os.path.relpath(dirpath, root)
         depth = 0 if rel == '.' else len(rel.split(os.sep))
@@ -256,6 +322,8 @@ def collect_subfolders(root: str, scan_depth: int, debug: bool = False) -> List[
         if depth == scan_depth:
             if safe_isdir(dirpath, debug):
                 result.append(dirpath)
+                if debug and logger:
+                    logger.debug(f"Found subfolder at depth {depth}: {dirpath}")
             # 不再深入该目录的子目录，避免收集更深层
             dirnames.clear()
         # 若已超过指定深度，则无需继续向下遍历
@@ -265,36 +333,55 @@ def collect_subfolders(root: str, scan_depth: int, debug: bool = False) -> List[
 
 
 def main(argv=None):
+    global logger
+    
     parser = argparse.ArgumentParser(description="目录扁平化工具")
     parser.add_argument('root_path', help='根目录路径')
     parser.add_argument('--scan-depth', type=int, required=True, help='从 root=0 开始的相对深度 (直接子目录=1, 依此类推)')
     parser.add_argument('--verbose', action='store_true', help='输出详细信息')
     parser.add_argument('--dry-run', action='store_true', help='仅模拟执行, 不做改动')
+    parser.add_argument('--debug', action='store_true', help='输出调试信息')
     args = parser.parse_args(args=argv)
+    
+    # Setup logging based on arguments
+    logger = setup_logging(verbose=args.verbose, debug=args.debug)
 
     if not os.path.isdir(args.root_path):
-        print("错误: 无效目录", file=sys.stderr)
+        logger.error("错误: 无效目录")
         sys.exit(1)
 
     root = os.path.abspath(args.root_path)
-    if args.verbose:
-        print(f"[INFO] root: {root}, scan_depth: {args.scan_depth}\n")
+    logger.info(f"=== 开始目录扁平化操作 ===")
+    logger.info(f"root: {root}")
+    logger.info(f"scan_depth: {args.scan_depth}")
+    if args.dry_run:
+        logger.info("DRY RUN 模式 - 不会实际修改文件")
 
-    subs = collect_subfolders(root, args.scan_depth, debug=args.verbose)
-    if args.verbose:
-        print(f"[INFO] 共 {len(subs)} 个 subfolder:")
+    subs = collect_subfolders(root, args.scan_depth, debug=args.debug)
+    logger.info(f"共找到 {len(subs)} 个子目录待处理")
+    if args.debug:
         for s in subs:
-            print(f"  - {s}")
-        print()
+            logger.debug(f"- {s}")
 
-    for sub in subs:
+    success_count = 0
+    error_count = 0
+    
+    for i, sub in enumerate(subs, 1):
         try:
+            logger.info(f"[{i}/{len(subs)}] 处理: {os.path.basename(sub)}")
             flatten_subfolder(sub, verbose=args.verbose, dry_run=args.dry_run)
+            success_count += 1
         except Exception as e:
-            print(f"[ERROR] 处理 {sub} 失败: {e}")
-            if args.verbose:
+            error_count += 1
+            logger.error(f"处理 {sub} 失败: {e}")
+            if args.debug:
                 import traceback
-                traceback.print_exc()
+                logger.debug(traceback.format_exc())
+    
+    logger.info(f"=== 完成 ===")
+    logger.info(f"成功处理: {success_count} 个目录")
+    if error_count > 0:
+        logger.warning(f"失败: {error_count} 个目录")
 
 
 if __name__ == '__main__':
