@@ -26,6 +26,7 @@ import atexit
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Union, Tuple
+import stat
 
 # Global verbose flag
 VERBOSE = False
@@ -2314,10 +2315,21 @@ def safe_rmdir(path, debug=False):
 
 
 def safe_rmtree(path, debug=False):
-    """安全的递归目录删除"""
+    """安全的递归目录删除，自动处理只读属性"""
+    def _onerror(func, path_, exc_info):
+        """当无法删除只读文件时，修改权限后重试"""
+        try:
+            os.chmod(path_, stat.S_IWRITE)
+            func(path_)
+            if debug:
+                print(f"  DEBUG: 强制删除只读项: {path_}")
+        except Exception as e_inner:
+            if debug:
+                print(f"  DEBUG: 强制删除失败 {path_}: {e_inner}")
+
     try:
         safe_path = safe_path_for_operation(path, debug)
-        shutil.rmtree(safe_path)
+        shutil.rmtree(safe_path, onerror=_onerror)
         if debug:
             print(f"  DEBUG: 成功递归删除目录: {path}")
         return True
@@ -3952,7 +3964,7 @@ def apply_file_content_collect_policy(tmp_dir, output_dir, archive_name, thresho
                 print(f"  Extracted using file-content-{threshold}-collect policy to: {output_dir} ({total_items} items < {threshold})")
 
     finally:
-        # 6. 清理content目录
+        # 6. 清理content目录和tmp目录
         if safe_exists(content_dir, VERBOSE):
             safe_rmtree(content_dir, VERBOSE)
 
