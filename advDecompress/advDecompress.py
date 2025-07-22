@@ -3696,18 +3696,28 @@ def apply_file_content_with_folder_separate_policy(tmp_dir, output_dir, archive_
             if VERBOSE:
                 print(f"  DEBUG: 使用file_content的父文件夹名称: {deepest_folder_name}")
 
-        # 5. 创建最终输出目录（使用archive_name/{deepest_folder_name}结构）
+        # 5. 创建最终输出目录
         archive_container_dir = os.path.join(output_dir, archive_name)
         archive_container_dir = ensure_unique_name(archive_container_dir, unique_suffix)
         safe_makedirs(archive_container_dir, debug=VERBOSE)
         
-        final_archive_dir = os.path.join(archive_container_dir, deepest_folder_name)
-        final_archive_dir = ensure_unique_name(final_archive_dir, unique_suffix)
-        safe_makedirs(final_archive_dir, debug=VERBOSE)
-
-        if VERBOSE:
-            print(f"  DEBUG: 创建archive容器目录: {archive_container_dir}")
-            print(f"  DEBUG: 创建最终目录: {final_archive_dir}")
+        # 根据archive_name和deepest_folder_name是否相同决定目录结构
+        if archive_name == deepest_folder_name:
+            # 使用archive_name/{file_content}结构
+            final_archive_dir = archive_container_dir
+            if VERBOSE:
+                print(f"  DEBUG: archive_name与deepest_folder_name相同，使用archive_name/{{file_content}}结构")
+                print(f"  DEBUG: 创建archive容器目录: {archive_container_dir}")
+                print(f"  DEBUG: 最终目录即为容器目录: {final_archive_dir}")
+        else:
+            # 使用archive_name/{deepest_folder_name}/{file_content}结构
+            final_archive_dir = os.path.join(archive_container_dir, deepest_folder_name)
+            final_archive_dir = ensure_unique_name(final_archive_dir, unique_suffix)
+            safe_makedirs(final_archive_dir, debug=VERBOSE)
+            if VERBOSE:
+                print(f"  DEBUG: archive_name与deepest_folder_name不同，使用archive_name/{{deepest_folder_name}}/{{file_content}}结构")
+                print(f"  DEBUG: 创建archive容器目录: {archive_container_dir}")
+                print(f"  DEBUG: 创建最终目录: {final_archive_dir}")
 
         # 6. 移动content到最终目录
         for item in os.listdir(content_dir):
