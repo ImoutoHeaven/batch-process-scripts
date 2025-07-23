@@ -317,8 +317,6 @@ def format_command_status():
                 
                 # 格式化命令行
                 cmd_display = st['command']
-                if len(cmd_display) > 120:
-                    cmd_display = cmd_display[:117] + "..."
                 
                 lines.append(f"ID {cid+1:3d}: [{status_icon} {display_name:>10}] {dur:>11}{timestamp}  {cmd_display}{retry}{pid}")
         
