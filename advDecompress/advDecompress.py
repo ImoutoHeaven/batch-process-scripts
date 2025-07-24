@@ -2557,27 +2557,109 @@ def signal_handler(signum, frame):
 
 def setup_windows_utf8():
     """Setup UTF-8 encoding for Windows console operations"""
-    if sys.platform.startswith('win'):
+    if not sys.platform.startswith('win'):
+        return
+
+    success_count = 0
+    total_attempts = 0
+
+    try:
+        # Set environment variables for UTF-8 encoding
+        os.environ['PYTHONIOENCODING'] = 'utf-8'
+        os.environ['LC_ALL'] = 'C.UTF-8'
+        os.environ['LANG'] = 'C.UTF-8'
+
+        if VERBOSE:
+            print("  DEBUG: 设置环境变量: PYTHONIOENCODING=utf-8, LC_ALL=C.UTF-8, LANG=C.UTF-8")
+
+        # 检测当前shell环境
+        is_powershell = False
+
+        # 检测PowerShell环境
+        if 'PSModulePath' in os.environ:
+            is_powershell = True
+        # 检测CMD环境或默认情况
+        else:
+            # 默认假设是CMD环境
+            is_powershell = False
+
+        shell_type = "PowerShell" if is_powershell else "CMD"
+        if VERBOSE:
+            print(f"  DEBUG: 检测到shell环境: {shell_type}")
+
+        # 方法1: 使用Windows API设置控制台编码 (最可靠的方法)
+        total_attempts += 1
         try:
-            # Set environment variables for UTF-8 encoding
-            os.environ['PYTHONIOENCODING'] = 'utf-8'
-            os.environ['LC_ALL'] = 'C.UTF-8'
-            os.environ['LANG'] = 'C.UTF-8'
+            import ctypes
+            if hasattr(ctypes.windll.kernel32, 'SetConsoleCP') and \
+               hasattr(ctypes.windll.kernel32, 'SetConsoleOutputCP'):
+                # 设置控制台输入输出编码为UTF-8 (65001)
+                input_result = ctypes.windll.kernel32.SetConsoleCP(65001)
+                output_result = ctypes.windll.kernel32.SetConsoleOutputCP(65001)
 
-            # Try to set console code page to UTF-8 (65001)
-            try:
-                subprocess.run(['chcp', '65001'],
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL,
-                               check=False)
-            except:
-                pass
-
-            if VERBOSE:
-                print("  DEBUG: Windows UTF-8 environment setup attempted")
+                if input_result and output_result:
+                    success_count += 1
+                    if VERBOSE:
+                        print("  DEBUG: ✓ Windows API设置控制台编码成功 (SetConsoleCP/SetConsoleOutputCP)")
+                else:
+                    if VERBOSE:
+                        print(f"  DEBUG: ✗ Windows API设置控制台编码失败 (输入:{input_result}, 输出:{output_result})")
+            else:
+                if VERBOSE:
+                    print("  DEBUG: ✗ Windows API方法不可用 (SetConsoleCP/SetConsoleOutputCP)")
         except Exception as e:
             if VERBOSE:
-                print(f"  DEBUG: Could not setup UTF-8 environment: {e}")
+                print(f"  DEBUG: ✗ Windows API设置控制台编码异常: {e}")
+
+        # 方法2: 根据shell环境使用对应的命令
+        total_attempts += 1
+        if is_powershell:
+            # PowerShell环境: 使用PowerShell命令设置编码
+            try:
+                ps_cmd = '[Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8'
+                result = subprocess.run(['powershell', '-Command', ps_cmd],
+                                      stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL,
+                                      check=False,
+                                      timeout=5)
+                if result.returncode == 0:
+                    success_count += 1
+                    if VERBOSE:
+                        print("  DEBUG: ✓ PowerShell控制台编码设置成功")
+                else:
+                    if VERBOSE:
+                        print(f"  DEBUG: ✗ PowerShell控制台编码设置失败 (返回码: {result.returncode})")
+            except Exception as e:
+                if VERBOSE:
+                    print(f"  DEBUG: ✗ PowerShell控制台编码设置异常: {e}")
+        else:
+            # CMD环境: 使用chcp命令设置代码页
+            try:
+                result = subprocess.run(['chcp', '65001'],
+                                      stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL,
+                                      check=False,
+                                      timeout=5)
+                if result.returncode == 0:
+                    success_count += 1
+                    if VERBOSE:
+                        print("  DEBUG: ✓ CMD代码页设置成功 (chcp 65001)")
+                else:
+                    if VERBOSE:
+                        print(f"  DEBUG: ✗ CMD代码页设置失败 (返回码: {result.returncode})")
+            except Exception as e:
+                if VERBOSE:
+                    print(f"  DEBUG: ✗ CMD代码页设置异常: {e}")
+
+        # 总结设置结果
+        if success_count > 0:
+            if VERBOSE:
+                print(f"  DEBUG: Windows UTF-8环境设置完成 ({success_count}/{total_attempts} 方法成功)")
+        else:
+            print(f"  警告: Windows UTF-8环境设置失败 (0/{total_attempts} 方法成功)，可能影响特殊字符显示")
+
+    except Exception as e:
+        print(f"  警告: Windows UTF-8环境设置过程中发生异常: {e}")
 
 
 def safe_decode(byte_data, encoding='utf-8', fallback_encodings=None):
