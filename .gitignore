@@ -1,3 +1,7 @@
 .git
 .augment
 .augment/*
+advDecompress/__pycache__
+*/__pycache__
+__pycache__
+__pycache__/*
