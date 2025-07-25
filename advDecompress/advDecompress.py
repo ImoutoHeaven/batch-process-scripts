@@ -983,6 +983,17 @@ class ArchiveProcessor:
         elif self.args.decompress_policy == 'file-content-with-folder-separate':
             apply_file_content_with_folder_separate_policy(tmp_dir, final_output_dir, archive_base_name, unique_suffix)
 
+        elif re.match(r'^file-content-auto-folder-\d+-collect-(len|meaningful)$', self.args.decompress_policy):
+            # file-content-auto-folder-N-collect-len/meaningful policy
+            parts = self.args.decompress_policy.split('-')
+            threshold = int(parts[4])  # N值
+            strategy_type = parts[6]   # len 或 meaningful
+
+            if strategy_type == 'len':
+                apply_file_content_auto_folder_collect_len_policy(tmp_dir, final_output_dir, archive_base_name, threshold, unique_suffix)
+            elif strategy_type == 'meaningful':
+                apply_file_content_auto_folder_collect_meaningful_policy(tmp_dir, final_output_dir, archive_base_name, threshold, unique_suffix)
+
         elif self.args.decompress_policy.startswith('file-content-') and self.args.decompress_policy.endswith('-collect'):
             # file-content-N-collect policy
             threshold = int(self.args.decompress_policy.split('-')[2])
@@ -3250,6 +3261,55 @@ def ensure_unique_name(target_path, unique_suffix):
     return result
 
 
+def get_deepest_folder_name(file_content_info, tmp_dir, archive_base_name):
+    """
+    确定deepest_folder_name
+
+    Args:
+        file_content_info: find_file_content返回的信息
+        tmp_dir: 临时目录路径
+        archive_base_name: 归档基础名称
+
+    Returns:
+        str: deepest_folder_name
+    """
+    parent_folder_path = file_content_info['parent_folder_path']
+
+    # 规范化路径进行比较
+    tmp_dir_normalized = os.path.normpath(os.path.abspath(tmp_dir))
+    parent_normalized = os.path.normpath(os.path.abspath(parent_folder_path))
+
+    if parent_normalized == tmp_dir_normalized:
+        # 父文件夹就是tmp文件夹，使用archive_base_name
+        return archive_base_name
+    else:
+        # 使用父文件夹名称
+        return os.path.basename(parent_folder_path)
+
+
+def remove_ascii_non_meaningful_chars(text):
+    """
+    去除ASCII非表意字符，保留ASCII字母数字和所有非ASCII字符
+
+    Args:
+        text: 输入字符串
+
+    Returns:
+        str: 过滤后的字符串
+    """
+    result = []
+    for char in text:
+        # 保留ASCII字母数字
+        if char.isalnum() and ord(char) < 128:
+            result.append(char)
+        # 保留所有非ASCII字符
+        elif ord(char) >= 128:
+            result.append(char)
+        # 跳过ASCII标点符号和空白字符
+
+    return ''.join(result)
+
+
 def clean_temp_dir(temp_dir):
     """Safely remove temporary directory and confirm it's empty first."""
     try:
@@ -3767,16 +3827,9 @@ def apply_file_content_with_folder_separate_policy(tmp_dir, output_dir, archive_
             safe_move(src_path, dst_path, VERBOSE)
 
         # 4. 确定deepest_folder_name
-        # 如果父文件夹就是tmp文件夹，则认为父文件夹名称是archive_name
-        # 如果父文件夹不是tmp文件夹，则使用file_content的父文件夹名称
-        if file_content['parent_folder_path'] == tmp_dir:
-            deepest_folder_name = archive_name
-            if VERBOSE:
-                print(f"  DEBUG: file_content的父文件夹是tmp目录，使用归档名称: {deepest_folder_name}")
-        else:
-            deepest_folder_name = file_content['parent_folder_name']
-            if VERBOSE:
-                print(f"  DEBUG: 使用file_content的父文件夹名称: {deepest_folder_name}")
+        deepest_folder_name = get_deepest_folder_name(file_content, tmp_dir, archive_name)
+        if VERBOSE:
+            print(f"  DEBUG: 确定的deepest_folder_name: {deepest_folder_name}")
 
         # 5. 创建最终输出目录
         archive_container_dir = os.path.join(output_dir, archive_name)
@@ -4218,6 +4271,364 @@ def should_use_rar_extractor(archive_path, enable_rar=False, sfx_detector=None):
 # ==================== 结束新增RAR策略 ====================
 
 
+def apply_file_content_auto_folder_collect_len_policy(tmp_dir, output_dir, archive_name, threshold, unique_suffix):
+    """
+    应用file-content-auto-folder-N-collect-len策略
+
+    Args:
+        tmp_dir: 临时目录
+        output_dir: 输出目录
+        archive_name: 归档名称
+        threshold: 阈值N
+        unique_suffix: 唯一后缀
+    """
+    if VERBOSE:
+        print(f"  DEBUG: 应用file-content-auto-folder-{threshold}-collect-len策略")
+
+    # 1. 查找file_content（不移动）
+    file_content = find_file_content(tmp_dir, VERBOSE)
+
+    if not file_content['found']:
+        if VERBOSE:
+            print(f"  DEBUG: 未找到file_content，回退到{threshold}-collect策略")
+        # 回退到n-collect策略
+        files, dirs = count_items_in_dir(tmp_dir)
+        total_items = files + dirs
+
+        if total_items >= threshold:
+            # Create archive folder
+            archive_folder = os.path.join(output_dir, archive_name)
+            archive_folder = ensure_unique_name(archive_folder, unique_suffix)
+            safe_makedirs(archive_folder, debug=VERBOSE)
+
+            # Move all items to archive folder
+            for item in os.listdir(tmp_dir):
+                src_item = os.path.join(tmp_dir, item)
+                dest_item = os.path.join(archive_folder, item)
+                safe_move(src_item, dest_item, VERBOSE)
+
+            print(f"  Extracted to: {archive_folder} ({total_items} items >= {threshold})")
+        else:
+            # Extract directly using direct policy logic
+            tmp_items = os.listdir(tmp_dir)
+            conflicts = [item for item in tmp_items if safe_exists(os.path.join(output_dir, item), VERBOSE)]
+
+            if conflicts:
+                # Create archive folder due to conflicts
+                archive_folder = os.path.join(output_dir, archive_name)
+                archive_folder = ensure_unique_name(archive_folder, unique_suffix)
+                safe_makedirs(archive_folder, debug=VERBOSE)
+
+                for item in tmp_items:
+                    src_item = os.path.join(tmp_dir, item)
+                    dest_item = os.path.join(archive_folder, item)
+                    safe_move(src_item, dest_item, VERBOSE)
+
+                print(f"  Extracted to: {archive_folder} (conflicts detected, {total_items} items < {threshold})")
+            else:
+                # No conflicts, extract directly
+                for item in tmp_items:
+                    src_item = os.path.join(tmp_dir, item)
+                    dest_item = os.path.join(output_dir, item)
+                    safe_move(src_item, dest_item, VERBOSE)
+
+                print(f"  Extracted to: {output_dir} ({total_items} items < {threshold})")
+        return
+
+    # 2. 确定deepest_folder_name（在移动之前）
+    deepest_folder_name = get_deepest_folder_name(file_content, tmp_dir, archive_name)
+    if VERBOSE:
+        print(f"  DEBUG: 确定的deepest_folder_name: {deepest_folder_name}")
+
+    # 3. 创建content临时目录
+    content_dir = f"content_{unique_suffix}"
+
+    try:
+        safe_makedirs(content_dir, debug=VERBOSE)
+
+        if VERBOSE:
+            print(f"  DEBUG: 创建content目录: {content_dir}")
+
+        # 4. 移动file_content到content目录
+        for item in file_content['items']:
+            src_path = item['path']
+            dst_path = os.path.join(content_dir, item['name'])
+
+            if VERBOSE:
+                print(f"  DEBUG: 移动file_content项目: {src_path} -> {dst_path}")
+
+            safe_move(src_path, dst_path, VERBOSE)
+
+        # 5. 计算content目录中的项目数量
+        files, dirs = count_items_in_dir(content_dir)
+        total_items = files + dirs
+
+        if VERBOSE:
+            print(f"  DEBUG: content目录统计 - 文件: {files}, 目录: {dirs}, 总计: {total_items}, 阈值: {threshold}")
+
+        # 6. 根据数量决定是否包裹
+        if total_items >= threshold:
+            # 需要创建文件夹，进入步骤7
+            need_folder = True
+        else:
+            # 检查冲突
+            conflict_found = False
+            for root, dirs, files in safe_walk(content_dir, VERBOSE):
+                rel_root = os.path.relpath(root, content_dir)
+                rel_root = '' if rel_root == '.' else rel_root
+                # 只检查文件冲突
+                for f in files:
+                    rel_path = os.path.join(rel_root, f) if rel_root else f
+                    dest_path = os.path.join(output_dir, rel_path)
+                    if safe_isfile(dest_path, VERBOSE):
+                        if VERBOSE:
+                            print(f"  DEBUG: 冲突文件检测到: {dest_path}")
+                        conflict_found = True
+                        break
+                if conflict_found:
+                    break
+
+            if conflict_found:
+                # 有冲突，需要创建文件夹
+                need_folder = True
+            else:
+                # 无冲突，直接移动到输出目录
+                need_folder = False
+
+        if need_folder:
+            # 7. 判断新建文件夹的名称（len策略）
+            len_d = len(deepest_folder_name)
+            len_a = len(archive_name)
+
+            if len_d >= len_a:
+                folder_name = deepest_folder_name
+            else:
+                folder_name = archive_name
+
+            if VERBOSE:
+                print(f"  DEBUG: len策略 - deepest_folder_name长度: {len_d}, archive_name长度: {len_a}, 选择: {folder_name}")
+
+            # 创建最终文件夹
+            final_archive_dir = os.path.join(output_dir, folder_name)
+            final_archive_dir = ensure_unique_name(final_archive_dir, unique_suffix)
+            safe_makedirs(final_archive_dir, debug=VERBOSE)
+
+            # 移动content到最终文件夹
+            for item in os.listdir(content_dir):
+                src_path = os.path.join(content_dir, item)
+                dst_path = os.path.join(final_archive_dir, item)
+
+                if VERBOSE:
+                    print(f"  DEBUG: 移动到最终文件夹: {src_path} -> {dst_path}")
+
+                safe_move(src_path, dst_path, VERBOSE)
+
+            print(f"  Extracted using file-content-auto-folder-{threshold}-collect-len policy to: {final_archive_dir}")
+        else:
+            # 无冲突，直接移动到输出目录
+            for root, dirs, files in safe_walk(content_dir, VERBOSE):
+                rel_root = os.path.relpath(root, content_dir)
+                target_root = output_dir if rel_root == '.' else os.path.join(output_dir, rel_root)
+                safe_makedirs(target_root, debug=VERBOSE)
+
+                for d in dirs:
+                    dest_dir = os.path.join(target_root, d)
+                    safe_makedirs(dest_dir, debug=VERBOSE)
+
+                for f in files:
+                    src_f = os.path.join(root, f)
+                    dest_f = os.path.join(target_root, f)
+                    safe_move(src_f, dest_f, VERBOSE)
+
+            print(f"  Extracted using file-content-auto-folder-{threshold}-collect-len policy to: {output_dir} ({total_items} items < {threshold})")
+
+    finally:
+        # 8. 清理content目录
+        if safe_exists(content_dir, VERBOSE):
+            safe_rmtree(content_dir, VERBOSE)
+
+
+def apply_file_content_auto_folder_collect_meaningful_policy(tmp_dir, output_dir, archive_name, threshold, unique_suffix):
+    """
+    应用file-content-auto-folder-N-collect-meaningful策略
+
+    Args:
+        tmp_dir: 临时目录
+        output_dir: 输出目录
+        archive_name: 归档名称
+        threshold: 阈值N
+        unique_suffix: 唯一后缀
+    """
+    if VERBOSE:
+        print(f"  DEBUG: 应用file-content-auto-folder-{threshold}-collect-meaningful策略")
+
+    # 1. 查找file_content（不移动）
+    file_content = find_file_content(tmp_dir, VERBOSE)
+
+    if not file_content['found']:
+        if VERBOSE:
+            print(f"  DEBUG: 未找到file_content，回退到{threshold}-collect策略")
+        # 回退到n-collect策略
+        files, dirs = count_items_in_dir(tmp_dir)
+        total_items = files + dirs
+
+        if total_items >= threshold:
+            # Create archive folder
+            archive_folder = os.path.join(output_dir, archive_name)
+            archive_folder = ensure_unique_name(archive_folder, unique_suffix)
+            safe_makedirs(archive_folder, debug=VERBOSE)
+
+            # Move all items to archive folder
+            for item in os.listdir(tmp_dir):
+                src_item = os.path.join(tmp_dir, item)
+                dest_item = os.path.join(archive_folder, item)
+                safe_move(src_item, dest_item, VERBOSE)
+
+            print(f"  Extracted to: {archive_folder} ({total_items} items >= {threshold})")
+        else:
+            # Extract directly using direct policy logic
+            tmp_items = os.listdir(tmp_dir)
+            conflicts = [item for item in tmp_items if safe_exists(os.path.join(output_dir, item), VERBOSE)]
+
+            if conflicts:
+                # Create archive folder due to conflicts
+                archive_folder = os.path.join(output_dir, archive_name)
+                archive_folder = ensure_unique_name(archive_folder, unique_suffix)
+                safe_makedirs(archive_folder, debug=VERBOSE)
+
+                for item in tmp_items:
+                    src_item = os.path.join(tmp_dir, item)
+                    dest_item = os.path.join(archive_folder, item)
+                    safe_move(src_item, dest_item, VERBOSE)
+
+                print(f"  Extracted to: {archive_folder} (conflicts detected, {total_items} items < {threshold})")
+            else:
+                # No conflicts, extract directly
+                for item in tmp_items:
+                    src_item = os.path.join(tmp_dir, item)
+                    dest_item = os.path.join(output_dir, item)
+                    safe_move(src_item, dest_item, VERBOSE)
+
+                print(f"  Extracted to: {output_dir} ({total_items} items < {threshold})")
+        return
+
+    # 2. 确定deepest_folder_name（在移动之前）
+    deepest_folder_name = get_deepest_folder_name(file_content, tmp_dir, archive_name)
+    if VERBOSE:
+        print(f"  DEBUG: 确定的deepest_folder_name: {deepest_folder_name}")
+
+    # 3. 创建content临时目录
+    content_dir = f"content_{unique_suffix}"
+
+    try:
+        safe_makedirs(content_dir, debug=VERBOSE)
+
+        if VERBOSE:
+            print(f"  DEBUG: 创建content目录: {content_dir}")
+
+        # 4. 移动file_content到content目录
+        for item in file_content['items']:
+            src_path = item['path']
+            dst_path = os.path.join(content_dir, item['name'])
+
+            if VERBOSE:
+                print(f"  DEBUG: 移动file_content项目: {src_path} -> {dst_path}")
+
+            safe_move(src_path, dst_path, VERBOSE)
+
+        # 5. 计算content目录中的项目数量
+        files, dirs = count_items_in_dir(content_dir)
+        total_items = files + dirs
+
+        if VERBOSE:
+            print(f"  DEBUG: content目录统计 - 文件: {files}, 目录: {dirs}, 总计: {total_items}, 阈值: {threshold}")
+
+        # 6. 根据数量决定是否包裹
+        if total_items >= threshold:
+            # 需要创建文件夹，进入步骤7
+            need_folder = True
+        else:
+            # 检查冲突
+            conflict_found = False
+            for root, dirs, files in safe_walk(content_dir, VERBOSE):
+                rel_root = os.path.relpath(root, content_dir)
+                rel_root = '' if rel_root == '.' else rel_root
+                # 只检查文件冲突
+                for f in files:
+                    rel_path = os.path.join(rel_root, f) if rel_root else f
+                    dest_path = os.path.join(output_dir, rel_path)
+                    if safe_isfile(dest_path, VERBOSE):
+                        if VERBOSE:
+                            print(f"  DEBUG: 冲突文件检测到: {dest_path}")
+                        conflict_found = True
+                        break
+                if conflict_found:
+                    break
+
+            if conflict_found:
+                # 有冲突，需要创建文件夹
+                need_folder = True
+            else:
+                # 无冲突，直接移动到输出目录
+                need_folder = False
+
+        if need_folder:
+            # 7. 判断新建文件夹的名称（meaningful策略）
+            meaningful_deepest = remove_ascii_non_meaningful_chars(deepest_folder_name)
+            meaningful_archive = remove_ascii_non_meaningful_chars(archive_name)
+
+            len_d = len(meaningful_deepest)
+            len_a = len(meaningful_archive)
+
+            if len_d >= len_a:
+                folder_name = deepest_folder_name  # 使用原始名称
+            else:
+                folder_name = archive_name  # 使用原始名称
+
+            if VERBOSE:
+                print(f"  DEBUG: meaningful策略 - deepest_folder_name: '{deepest_folder_name}' -> '{meaningful_deepest}' (长度: {len_d})")
+                print(f"  DEBUG: meaningful策略 - archive_name: '{archive_name}' -> '{meaningful_archive}' (长度: {len_a})")
+                print(f"  DEBUG: meaningful策略 - 选择: {folder_name}")
+
+            # 创建最终文件夹
+            final_archive_dir = os.path.join(output_dir, folder_name)
+            final_archive_dir = ensure_unique_name(final_archive_dir, unique_suffix)
+            safe_makedirs(final_archive_dir, debug=VERBOSE)
+
+            # 移动content到最终文件夹
+            for item in os.listdir(content_dir):
+                src_path = os.path.join(content_dir, item)
+                dst_path = os.path.join(final_archive_dir, item)
+
+                if VERBOSE:
+                    print(f"  DEBUG: 移动到最终文件夹: {src_path} -> {dst_path}")
+
+                safe_move(src_path, dst_path, VERBOSE)
+
+            print(f"  Extracted using file-content-auto-folder-{threshold}-collect-meaningful policy to: {final_archive_dir}")
+        else:
+            # 无冲突，直接移动到输出目录
+            for root, dirs, files in safe_walk(content_dir, VERBOSE):
+                rel_root = os.path.relpath(root, content_dir)
+                target_root = output_dir if rel_root == '.' else os.path.join(output_dir, rel_root)
+                safe_makedirs(target_root, debug=VERBOSE)
+
+                for d in dirs:
+                    dest_dir = os.path.join(target_root, d)
+                    safe_makedirs(dest_dir, debug=VERBOSE)
+
+                for f in files:
+                    src_f = os.path.join(root, f)
+                    dest_f = os.path.join(target_root, f)
+                    safe_move(src_f, dest_f, VERBOSE)
+
+            print(f"  Extracted using file-content-auto-folder-{threshold}-collect-meaningful policy to: {output_dir} ({total_items} items < {threshold})")
+
+    finally:
+        # 8. 清理content目录
+        if safe_exists(content_dir, VERBOSE):
+            safe_rmtree(content_dir, VERBOSE)
+
 
 def main():
     """Main function."""
@@ -4295,7 +4706,7 @@ def main():
     parser.add_argument(
         '-dp', '--decompress-policy',
         default='2-collect',
-        help='Decompress policy: separate/direct/only-file-content/file-content-with-folder/file-content-with-folder-separate/only-file-content-direct/N-collect/file-content-N-collect (default: 2-collect)'
+        help='Decompress policy: separate/direct/only-file-content/file-content-with-folder/file-content-with-folder-separate/only-file-content-direct/N-collect/file-content-N-collect/file-content-auto-folder-N-collect-len/file-content-auto-folder-N-collect-meaningful (default: 2-collect)'
     )
 
     parser.add_argument(
@@ -4512,6 +4923,13 @@ def main():
                 threshold = int(args.decompress_policy.split('-')[2])
                 if threshold < 1:
                     print(f"Error: file-content-N-collect threshold must be >= 1")
+                    return 1
+            elif re.match(r'^file-content-auto-folder-\d+-collect-(len|meaningful)$', args.decompress_policy):
+                # Validate file-content-auto-folder-N-collect-len/meaningful threshold
+                parts = args.decompress_policy.split('-')
+                threshold = int(parts[4])  # N值
+                if threshold < 1:
+                    print(f"Error: file-content-auto-folder-N-collect threshold must be >= 1")
                     return 1
             else:
                 print(f"Error: Invalid decompress policy: {args.decompress_policy}")
