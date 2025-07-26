@@ -1183,7 +1183,11 @@ class ArchiveProcessor:
                 enable_llm = getattr(self.args, 'enable_llm', False)
                 try:
                     import zipfile
-                    import chardet
+                    decode_model = getattr(self.args, 'traditional_zip_decode_model', 'chardet')
+                    if decode_model == 'charset_normalizer':
+                        from charset_normalizer import detect
+                    else:
+                        import chardet
                     if enable_llm:
                         from transformers import pipeline
                 except ImportError as e:
@@ -1203,7 +1207,8 @@ class ArchiveProcessor:
                     archive_path, 
                     enable_llm=enable_llm,
                     chardet_confidence_threshold=chardet_confidence_threshold,
-                    llm_confidence_threshold=llm_confidence_threshold
+                    llm_confidence_threshold=llm_confidence_threshold,
+                    decode_model=decode_model
                 )
                 
                 if not encoding_result['success']:
@@ -1218,7 +1223,7 @@ class ArchiveProcessor:
                 
                 if VERBOSE:
                     if enable_llm and 'llm_confidence' in encoding_result:
-                        print(f"  DEBUG: 混合检测成功 - chardet置信度: {encoding_result.get('chardet_confidence', 0):.2%}, "
+                        print(f"  DEBUG: 混合检测成功 - chardet置信度: {encoding_result.get('detection_confidence', 0):.2%}, "
                               f"LLM置信度: {encoding_result.get('llm_confidence', 0):.2%}, "
                               f"综合置信度: {detected_confidence:.2%}")
                     else:
@@ -1806,7 +1811,7 @@ def detect_language_with_llm(text_samples):
 
 
 
-def guess_zip_encoding(zip_path, enable_llm=False, chardet_confidence_threshold=0.9, llm_confidence_threshold=0.95):
+def guess_zip_encoding(zip_path, enable_llm=False, chardet_confidence_threshold=0.9, llm_confidence_threshold=0.95, decode_model='chardet'):
     """
     混合编码检测：chardet + LLM验证
     
@@ -1824,8 +1829,13 @@ def guess_zip_encoding(zip_path, enable_llm=False, chardet_confidence_threshold=
         enable_llm: 是否启用LLM二次验证
         chardet_confidence_threshold: chardet置信度阈值 (0.0-1.0)
         llm_confidence_threshold: LLM置信度阈值 (0.0-1.0)
+        decode_model: 编码检测库 ('chardet' 或 'charset_normalizer')
     """
-    import zipfile, chardet
+    import zipfile
+    if decode_model == 'charset_normalizer':
+        from charset_normalizer import detect
+    else:
+        import chardet
 
     result = {'encoding': None,
               'language': None,
@@ -1857,50 +1867,57 @@ def guess_zip_encoding(zip_path, enable_llm=False, chardet_confidence_threshold=
                 print("  DEBUG: 全部条目已采用 UTF‑8 – 非传统ZIP")
             return result
 
-        # 步骤1: 使用 chardet 检测编码
+        # 步骤1: 使用指定库检测编码
         sample = b'\n'.join(filename_bytes)
-        chardet_result = chardet.detect(sample)
         
-        if not chardet_result or not chardet_result.get('encoding'):
+        # 统一使用 detect() 方法（两个库都兼容）
+        if decode_model == 'charset_normalizer':
+            detection_result = detect(sample)
+            library_name = "charset_normalizer"
+        else:
+            detection_result = chardet.detect(sample)
+            library_name = "chardet"
+            
+        if not detection_result or not detection_result.get('encoding'):
             if VERBOSE:
-                print("  DEBUG: chardet检测失败")
+                print(f"  DEBUG: {library_name}检测失败")
             return result
             
-        chardet_confidence = chardet_result.get('confidence', 0.0)
-        chardet_encoding = chardet_result['encoding']
+        detected_confidence = detection_result.get('confidence', 0.0)
+        detected_encoding = detection_result['encoding']
         
         if VERBOSE:
-            print(f"  DEBUG: chardet检测结果 - 编码: {chardet_encoding}, 置信度: {chardet_confidence:.3f}")
+            print(f"  DEBUG: {library_name}检测结果 - 编码: {detected_encoding}, 置信度: {detected_confidence:.3f}")
         
-        # 步骤2: chardet置信度检查
-        if chardet_confidence < chardet_confidence_threshold:
+        # 步骤2: 置信度检查
+        if detected_confidence < chardet_confidence_threshold:
             if VERBOSE:
-                print(f"  DEBUG: chardet置信度过低 ({chardet_confidence:.3f} < {chardet_confidence_threshold:.3f})，跳过")
+                print(f"  DEBUG: 检测置信度过低 ({detected_confidence:.3f} < {chardet_confidence_threshold:.3f})，跳过")
             return result
         
-        # 步骤3: 如果不启用LLM，直接返回chardet结果
+        # 步骤3: 如果不启用LLM，直接返回检测结果
         if not enable_llm:
             result.update({
-                'encoding': chardet_encoding,
-                'language': chardet_result.get('language'),
-                'confidence': chardet_confidence,
+                'encoding': detected_encoding,
+                'language': detection_result.get('language'),  # 兼容的方式获取语言信息
+                'confidence': detected_confidence,
                 'success': True
             })
             if VERBOSE:
-                print(f"  DEBUG: 使用chardet结果，无LLM验证")
+                print(f"  DEBUG: 使用{library_name}结果，无LLM验证")
             return result
         
-        # 步骤4: 用chardet检测到的编码解码文本，发送给LLM验证
-        llm_result = verify_encoding_with_llm(zip_path, chardet_encoding, llm_confidence_threshold)
+        # 步骤4: 用检测到的编码解码文本，发送给LLM验证
+        llm_result = verify_encoding_with_llm(zip_path, detected_encoding, llm_confidence_threshold)
         
         if llm_result['success'] and llm_result['confidence'] >= llm_confidence_threshold:
             # LLM验证通过，返回混合结果
             result.update({
-                'encoding': chardet_encoding,
+                'encoding': detected_encoding,
                 'language': llm_result['language'],
-                'chardet_confidence': chardet_confidence,
+                'detection_confidence': detected_confidence,
                 'llm_confidence': llm_result['confidence'],
-                'confidence': min(chardet_confidence, llm_result['confidence']),  # 取较小值作为总体置信度
+                'confidence': min(detected_confidence, llm_result['confidence']),  # 取较小值作为总体置信度
                 'success': True
             })
             if VERBOSE:
@@ -1937,63 +1954,162 @@ def get_7z_encoding_param(encoding):
     if not encoding:
         return None
     
-    # chardet稳定输出的完整映射表
+    # chardet和charset_normalizer稳定输出的完整映射表
     encoding_map = {
         # ASCII和基础编码
         'ascii': '1252',  # ASCII可以安全地使用Windows-1252
         
         # Unicode编码系列
         'utf-8': 'UTF-8',
+        'utf-8-sig': 'UTF-8',  # charset_normalizer带BOM的UTF-8
+        'utf8': 'UTF-8',       # 简写形式
         'utf-16': 'UTF-16',
         'utf-16-be': 'UTF-16BE',
-        'utf-16-le': 'UTF-16LE', 
+        'utf-16-le': 'UTF-16LE',
+        'utf16': 'UTF-16',     # 简写形式
         'utf-32': 'UTF-32',
         'utf-32-be': 'UTF-32BE',
         'utf-32-le': 'UTF-32LE',
+        'utf32': 'UTF-32',     # 简写形式
         
-        # 中文编码 (chardet返回的确切名称)
+        # 中文编码 (两个库的可能输出)
         'big5': '950',
+        'big5-tw': '950',      # charset_normalizer别名
+        'big5hkscs': '950',    # 香港增补字符集
         'gb2312': '936',
         'gb18030': '936',
+        'gb18030-2000': '936', # charset_normalizer可能输出
+        'gbk': '936',          # charset_normalizer常用输出
+        'cp936': '936',        # Windows代码页
+        'ms936': '936',        # 微软别名
         'euc-tw': '950',
         'hz-gb-2312': '936',
+        'hz': '936',           # 简写
         'iso-2022-cn': '936',
         
-        # 日文编码
+        # 日文编码 - 关键差异区域
+        # chardet的传统输出
         'shift_jis': '932',
+        'shift-jis': '932',    # 连字符变体
+        'sjis': '932',         # 简写形式
+        's_jis': '932',        # 下划线变体
+        'shiftjis': '932',     # 无分隔符
+        # charset_normalizer的标准输出
+        'cp932': '932',        # Windows代码页932 (最常见输出)
+        'windows-31j': '932',  # IANA标准名称
+        'ms932': '932',        # 微软内部名称
+        'ms_kanji': '932',     # 微软别名
+        'mskanji': '932',      # 无下划线变体
+        'x_mac_japanese': '932', # Mac日语编码
+        # 其他日语编码
         'euc-jp': '20932',
+        'eucjp': '20932',      # 简写
+        'ujis': '20932',       # Unix JIS
         'iso-2022-jp': '50222',
+        'iso2022jp': '50222',  # 无连字符
+        'euc_jis_2004': '20932',     # JIS X 0213
+        'shift_jis_2004': '932',     # JIS X 0213
+        'shift_jisx0213': '932',     # JIS X 0213变体
         
         # 韩文编码
         'euc-kr': '949',
+        'euckr': '949',        # 简写
+        'cp949': '949',        # Windows代码页949 (charset_normalizer常用)
+        'ms949': '949',        # 微软别名
+        'uhc': '949',          # Unified Hangul Code
+        'ks_c_5601': '949',    # 韩国标准
+        'ks_c_5601_1987': '949', # charset_normalizer可能输出
+        'ksc5601': '949',      # chardet可能输出
         'iso-2022-kr': '50225',
+        'iso2022kr': '50225',  # 无连字符
+        'johab': '1361',       # 朝鲜语Johab编码
+        'cp1361': '1361',      # Johab的代码页
+        'ms1361': '1361',      # 微软别名
         
         # 俄语/西里尔编码
         'koi8-r': '20866',
+        'koi8_r': '20866',     # 下划线变体
         'maccyrillic': '10007',
+        'mac_cyrillic': '10007', # 下划线变体
         'ibm855': '855',
+        'cp855': '855',        # charset_normalizer格式
         'ibm866': '866',
+        'cp866': '866',        # charset_normalizer格式
         'iso-8859-5': '28595',
+        'iso8859_5': '28595',  # charset_normalizer格式
         'windows-1251': '1251',
+        'cp1251': '1251',      # charset_normalizer常用
+        'cyrillic': '28595',   # 通用西里尔
         
         # 西欧语言编码
         'iso-8859-1': '28591',
+        'iso8859_1': '28591',  # charset_normalizer格式
+        'latin-1': '28591',
+        'latin_1': '28591',    # charset_normalizer别名
+        'latin1': '28591',     # 简写
         'windows-1252': '1252',
+        'cp1252': '1252',      # charset_normalizer常用
         
         # 中欧语言编码（匈牙利语等）
-        'iso-8859-2': '28592', 
+        'iso-8859-2': '28592',
+        'iso8859_2': '28592',  # charset_normalizer格式
+        'latin-2': '28592',
+        'latin_2': '28592',    # charset_normalizer别名
         'windows-1250': '1250',
+        'cp1250': '1250',      # charset_normalizer常用
         
         # 希腊语编码
         'iso-8859-7': '28597',
+        'iso8859_7': '28597',  # charset_normalizer格式
+        'greek': '28597',      # chardet可能输出
         'windows-1253': '1253',
+        'cp1253': '1253',      # charset_normalizer常用
         
         # 希伯来语编码
         'iso-8859-8': '28598',
+        'iso8859_8': '28598',  # charset_normalizer格式
+        'hebrew': '28598',     # chardet可能输出
         'windows-1255': '1255',
+        'cp1255': '1255',      # charset_normalizer常用
+        
+        # 土耳其语编码
+        'iso-8859-9': '28599',
+        'iso8859_9': '28599',  # charset_normalizer格式
+        'latin-5': '28599',
+        'windows-1254': '1254',
+        'cp1254': '1254',      # charset_normalizer常用
+        
+        # 阿拉伯语编码
+        'iso-8859-6': '28596',
+        'iso8859_6': '28596',  # charset_normalizer格式
+        'arabic': '28596',     # chardet可能输出
+        'windows-1256': '1256',
+        'cp1256': '1256',      # charset_normalizer常用
+        
+        # 波罗的海语言编码
+        'iso-8859-4': '28594',
+        'iso8859_4': '28594',  # charset_normalizer格式
+        'windows-1257': '1257',
+        'cp1257': '1257',      # charset_normalizer常用
+        
+        # 越南语编码
+        'windows-1258': '1258',
+        'cp1258': '1258',      # charset_normalizer常用
         
         # 泰语编码
         'tis-620': '874',
+        'tis620': '874',       # 简写
+        'cp874': '874',        # charset_normalizer常用
+        'thai': '874',         # chardet可能输出
+        
+        # 其他常见编码
+        'cp437': '437',        # DOS美国
+        'cp850': '850',        # DOS西欧
+        'cp852': '852',        # DOS中欧
+        'cp775': '775',        # DOS波罗的海
+        'hp_roman8': '1051',   # HP Roman8
+        'mac_roman': '10000',  # Mac Roman
+        'macintosh': '10000',  # Mac Roman别名
     }
     
     # 标准化输入编码名称（只处理大小写）
@@ -2006,26 +2122,54 @@ def get_7z_encoding_param(encoding):
             print(f"  DEBUG: 编码映射 {encoding} -> {code_page}")
         return code_page
     
-    # 处理chardet可能的命名变体（只处理连字符和下划线的差异）
-    # 因为chardet在不同版本间可能有细微的命名差异
+    # 处理编码名称的常见变体
+    # 因为不同库和版本间可能有细微的命名差异
     normalized_variants = [
-        encoding_lower.replace('-', '_'),  # ISO-8859-1 -> ISO_8859_1
-        encoding_lower.replace('_', '-'),  # SHIFT_JIS -> SHIFT-JIS
-        encoding_lower.replace('-', ''),   # ISO-8859-1 -> ISO88591
-        encoding_lower.replace('_', ''),   # SHIFT_JIS -> SHIFTJIS
+        encoding_lower.replace('-', '_'),  # ISO-8859-1 -> iso_8859_1
+        encoding_lower.replace('_', '-'),  # shift_jis -> shift-jis  
+        encoding_lower.replace('-', ''),   # ISO-8859-1 -> iso88591
+        encoding_lower.replace('_', ''),   # shift_jis -> shiftjis
+        encoding_lower.replace(' ', '-'),  # "shift jis" -> shift-jis
+        encoding_lower.replace(' ', '_'),  # "shift jis" -> shift_jis
+        encoding_lower.replace(' ', ''),   # "shift jis" -> shiftjis
     ]
     
     for variant in normalized_variants:
         if variant in encoding_map:
             code_page = encoding_map[variant]
             if VERBOSE:
-                print(f"  DEBUG: 编码变体映射 {encoding} -> {code_page}")
+                print(f"  DEBUG: 编码变体映射 {encoding} ({variant}) -> {code_page}")
             return code_page
+    
+    # 特殊处理：如果是未知的CP开头的编码，尝试直接提取数字
+    if encoding_lower.startswith('cp') and len(encoding_lower) > 2:
+        try:
+            cp_number = encoding_lower[2:]
+            # 验证是否为纯数字且在合理范围内
+            cp_int = int(cp_number)
+            if 1 <= cp_int <= 65535:  # 合理的代码页范围
+                if VERBOSE:
+                    print(f"  DEBUG: 直接使用代码页号 {encoding} -> {cp_number}")
+                return cp_number
+        except ValueError:
+            pass
+    
+    # 特殊处理：Windows-开头的编码
+    if encoding_lower.startswith('windows-') and len(encoding_lower) > 8:
+        try:
+            win_number = encoding_lower[8:]  # 去掉 "windows-"
+            win_int = int(win_number)
+            if 1250 <= win_int <= 1258:  # Windows代码页范围
+                if VERBOSE:
+                    print(f"  DEBUG: Windows编码映射 {encoding} -> {win_number}")
+                return win_number
+        except ValueError:
+            pass
     
     # 如果完全没有匹配，记录并返回None
     if VERBOSE:
         print(f"  DEBUG: 未知编码，无法映射到7z参数: {encoding}")
-        print(f"  DEBUG: 建议检查chardet版本和文档，确认 '{encoding}' 是否为有效输出")
+        print(f"  DEBUG: 建议检查chardet或charset_normalizer版本和文档，确认 '{encoding}' 是否为有效输出")
     
     return None
     
@@ -4905,6 +5049,15 @@ def main():
     )
 
     parser.add_argument(
+        '-tzdm', '--traditional-zip-decode-model',
+        choices=['chardet', 'charset_normalizer'],
+        default='chardet',
+        help='Library to use for encoding detection (default: chardet). '
+             'chardet: Traditional chardet library. '
+             'charset_normalizer: Modern charset-normalizer library with better accuracy.'
+    )
+
+    parser.add_argument(
         '-el', '--enable-llm',
         action='store_true',
         help='Enable LLM verification after chardet detection in decode-auto mode. '
@@ -5138,13 +5291,19 @@ def main():
             if policy == 'decode-auto':
                 try:
                     import zipfile
-                    import chardet
+                    if args.traditional_zip_decode_model == 'charset_normalizer':
+                        from charset_normalizer import detect
+                    else:
+                        import chardet
                     if args.enable_llm:
                         from transformers import pipeline
                 except ImportError as e:
                     if 'chardet' in str(e):
                         print(f"Error: chardet library is required for --traditional-zip-policy decode-auto: {e}")
                         print("Please install: pip install chardet")
+                    elif 'charset_normalizer' in str(e):
+                        print(f"Error: charset_normalizer library is required for --traditional-zip-decode-model charset_normalizer: {e}")
+                        print("Please install: pip install charset-normalizer")
                     elif args.enable_llm and ('transformers' in str(e) or 'torch' in str(e)):
                         print(f"Error: transformers library is required for --enable-llm: {e}")
                         print("Please install: pip install transformers torch")
