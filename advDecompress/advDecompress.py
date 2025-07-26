@@ -1180,39 +1180,51 @@ class ArchiveProcessor:
         elif policy == 'decode-auto':
             try:
                 # 首先检查依赖库是否可用
+                enable_llm = getattr(self.args, 'enable_llm', False)
                 try:
                     import zipfile
                     import chardet
+                    if enable_llm:
+                        from transformers import pipeline
                 except ImportError as e:
                     if VERBOSE:
                         print(f"  DEBUG: decode-auto所需库不可用，跳过传统ZIP策略: {e}")
+                        if enable_llm and ('transformers' in str(e) or 'torch' in str(e)):
+                            print(f"  DEBUG: 请安装transformers库: pip install transformers torch")
                     result['should_continue'] = False
                     result['reason'] = f'decode-auto依赖库不可用，跳过处理'
                     return result
                 
-                # 检测编码
-                encoding_result = guess_zip_encoding(archive_path)
+                # 混合编码检测
+                chardet_confidence_threshold = getattr(self.args, 'traditional_zip_decode_confidence', 90) / 100.0
+                llm_confidence_threshold = getattr(self.args, 'llm_confidence', 95) / 100.0
+                
+                encoding_result = guess_zip_encoding(
+                    archive_path, 
+                    enable_llm=enable_llm,
+                    chardet_confidence_threshold=chardet_confidence_threshold,
+                    llm_confidence_threshold=llm_confidence_threshold
+                )
                 
                 if not encoding_result['success']:
                     if VERBOSE:
-                        print(f"  DEBUG: 编码检测失败，跳过处理")
+                        print(f"  DEBUG: 混合编码检测失败，跳过处理")
                     result['should_continue'] = False  
-                    result['reason'] = '编码检测失败'
+                    result['reason'] = '混合编码检测失败'
                     return result
                 
-                # 检查置信度
-                confidence_threshold = getattr(self.args, 'traditional_zip_decode_confidence', 90) / 100.0
+                # 显示检测结果信息
                 detected_confidence = encoding_result['confidence']
                 
                 if VERBOSE:
-                    print(f"  DEBUG: 检测置信度: {detected_confidence:.2%}, 阈值: {confidence_threshold:.2%}")
+                    if enable_llm and 'llm_confidence' in encoding_result:
+                        print(f"  DEBUG: 混合检测成功 - chardet置信度: {encoding_result.get('chardet_confidence', 0):.2%}, "
+                              f"LLM置信度: {encoding_result.get('llm_confidence', 0):.2%}, "
+                              f"综合置信度: {detected_confidence:.2%}")
+                    else:
+                        print(f"  DEBUG: chardet检测成功 - 置信度: {detected_confidence:.2%}")
                 
-                if detected_confidence < confidence_threshold:
-                    if VERBOSE:
-                        print(f"  DEBUG: 置信度低于阈值，跳过处理")
-                    result['should_continue'] = False
-                    result['reason'] = f'编码检测置信度({detected_confidence:.1%})低于阈值({confidence_threshold:.1%})'
-                    return result
+                # 注意：置信度检查已在guess_zip_encoding内部完成，这里不需要再检查
                 
                 # 转换编码为7z参数
                 detected_encoding = encoding_result['encoding']
@@ -1644,21 +1656,174 @@ class ArchiveProcessor:
             self.args.traditional_zip_decode_confidence = 90
             if VERBOSE:
                 print(f"  DEBUG: 设置默认值 traditional_zip_decode_confidence = 90")
+        
+        if not hasattr(self.args, 'enable_llm'):
+            self.args.enable_llm = False
+            if VERBOSE:
+                print(f"  DEBUG: 设置默认值 enable_llm = False")
+        
+        if not hasattr(self.args, 'llm_confidence'):
+            self.args.llm_confidence = 95
+            if VERBOSE:
+                print(f"  DEBUG: 设置默认值 llm_confidence = 95")
 
 
-# ==================== 新增编码检测函数 ====================
+# ==================== 编码检测和验证函数 ====================
 
-def guess_zip_encoding(zip_path):
+def verify_encoding_with_llm(zip_path, encoding, confidence_threshold):
     """
-    Detect the legacy code‑page used by a *non‑UTF‑8* ZIP file.
+    用指定编码解码ZIP文件名，通过LLM进行语言验证
+    
+    Args:
+        zip_path: ZIP文件路径
+        encoding: chardet检测到的编码
+        confidence_threshold: LLM置信度阈值 (0.0-1.0)
+        
+    Returns:
+        dict: 包含 language, confidence, success 的字典
+    """
+    import zipfile
+    
+    result = {'language': None,
+              'confidence': 0.0,
+              'success': False}
+    
+    try:
+        # 1. 用指定编码解码所有文件名
+        decoded_texts = []
+        safe_zip_path = safe_path_for_operation(zip_path, VERBOSE)
+        
+        with zipfile.ZipFile(safe_zip_path, 'r') as zf:
+            for info in zf.infolist():
+                if info.flag_bits & 0x800:  # 跳过UTF-8条目
+                    continue
+                    
+                raw_name = getattr(info, 'orig_filename', None) or info.filename
+                
+                # 统一转 bytes
+                if isinstance(raw_name, str):
+                    raw_name = raw_name.encode('cp437', 'surrogateescape')
+                
+                # 用指定编码解码
+                try:
+                    decoded_text = raw_name.decode(encoding)
+                    decoded_texts.append(decoded_text)
+                except UnicodeDecodeError:
+                    if VERBOSE:
+                        print(f"  DEBUG: 无法用 {encoding} 解码文件名: {raw_name}")
+                    continue
+        
+        if not decoded_texts:
+            if VERBOSE:
+                print(f"  DEBUG: 无法用编码 {encoding} 解码任何文件名")
+            return result
+        
+        # 2. 发送给LLM进行语言检测
+        llm_result = detect_language_with_llm(decoded_texts)
+        
+        if llm_result['success']:
+            result.update({
+                'language': llm_result['language'],
+                'confidence': llm_result['confidence'],
+                'success': True
+            })
+            
+            if VERBOSE:
+                print(f"  DEBUG: LLM语言验证结果 - 语言: {llm_result['language']}, 置信度: {llm_result['confidence']:.3f}")
+        
+    except Exception as e:
+        if VERBOSE:
+            print(f"  DEBUG: LLM编码验证异常: {e}")
+    
+    return result
 
+
+def detect_language_with_llm(text_samples):
+    """
+    使用 LLM 模型检测文本语言（纯语言检测，不推断编码）
+    
+    Args:
+        text_samples: list of str, 文本样本列表
+    
+    Returns:
+        dict: 包含 language, confidence, success 的字典
+    """
+    result = {'language': None,
+              'confidence': 0.0,
+              'success': False}
+    
+    try:
+        from transformers import pipeline
+        
+        # 如果模型不存在会自动下载
+        model_ckpt = "papluca/xlm-roberta-base-language-detection"
+        if VERBOSE:
+            print(f"  DEBUG: 正在加载LLM模型 {model_ckpt}...")
+        
+        try:
+            pipe = pipeline("text-classification", model=model_ckpt)
+            if VERBOSE:
+                print(f"  DEBUG: LLM模型加载成功")
+        except Exception as download_error:
+            if VERBOSE:
+                print(f"  DEBUG: LLM模型下载/加载失败: {download_error}")
+                print(f"  DEBUG: 可能的原因: 网络连接问题、磁盘空间不足、或模型仓库不可用")
+            result['success'] = False
+            return result
+        
+        # 合并样本文本
+        combined_text = '\n'.join(text_samples[:10])  # 限制样本数量避免过长
+        if len(combined_text) > 1000:  # 限制文本长度
+            combined_text = combined_text[:1000]
+        
+        # 执行语言检测
+        detection_result = pipe(combined_text, top_k=1, truncation=True)
+        
+        if detection_result and len(detection_result) > 0:
+            detected_lang = detection_result[0]['label']
+            confidence = detection_result[0]['score']
+            
+            result.update({
+                'language': detected_lang,
+                'confidence': confidence,
+                'success': True
+            })
+            
+            if VERBOSE:
+                print(f"  DEBUG: LLM语言检测结果 - 语言: {detected_lang}, 置信度: {confidence:.3f}")
+                
+    except ImportError as e:
+        if VERBOSE:
+            print(f"  DEBUG: transformers库不可用，请安装: pip install transformers torch")
+        result['success'] = False
+    except Exception as e:
+        if VERBOSE:
+            print(f"  DEBUG: LLM语言检测异常: {e}")
+        result['success'] = False
+    
+    return result
+
+
+
+
+def guess_zip_encoding(zip_path, enable_llm=False, chardet_confidence_threshold=0.9, llm_confidence_threshold=0.95):
+    """
+    混合编码检测：chardet + LLM验证
+    
     改进要点
     --------
     1. 统一通过 `safe_path_for_operation()` 处理超长 / Unicode 路径。  
     2. **保证** 参与 `b'\\n'.join()` 的全部元素都是 `bytes`，  
        - `ZipInfo.orig_filename` 可能是 *str*，需转 CP437。  
        - 若属性不存在则退回 `info.filename`（同样转 bytes）。  
-    3. 当所有条目均已设置 UTF‑8 标志时直接返回 `success=False`，避免误报。  
+    3. 当所有条目均已设置 UTF‑8 标志时直接返回 `success=False`，避免误报。
+    4. 混合检测模式：先用chardet检测，再用LLM验证语言一致性。
+    
+    Args:
+        zip_path: ZIP 文件路径
+        enable_llm: 是否启用LLM二次验证
+        chardet_confidence_threshold: chardet置信度阈值 (0.0-1.0)
+        llm_confidence_threshold: LLM置信度阈值 (0.0-1.0)
     """
     import zipfile, chardet
 
@@ -1668,7 +1833,7 @@ def guess_zip_encoding(zip_path):
               'success':   False}
 
     if VERBOSE:
-        print(f"  DEBUG: 开始检测ZIP编码: {zip_path}")
+        print(f"  DEBUG: 开始混合编码检测: {zip_path}")
 
     safe_zip_path   = safe_path_for_operation(zip_path, VERBOSE)
     filename_bytes  = []
@@ -1692,14 +1857,63 @@ def guess_zip_encoding(zip_path):
                 print("  DEBUG: 全部条目已采用 UTF‑8 – 非传统ZIP")
             return result
 
+        # 步骤1: 使用 chardet 检测编码
         sample = b'\n'.join(filename_bytes)
-        det    = chardet.detect(sample)
-
-        if det.get('encoding'):
-            result.update({'encoding':  det['encoding'],
-                           'language':  det.get('language'),
-                           'confidence':det.get('confidence', 0.0),
-                           'success':   True})
+        chardet_result = chardet.detect(sample)
+        
+        if not chardet_result or not chardet_result.get('encoding'):
+            if VERBOSE:
+                print("  DEBUG: chardet检测失败")
+            return result
+            
+        chardet_confidence = chardet_result.get('confidence', 0.0)
+        chardet_encoding = chardet_result['encoding']
+        
+        if VERBOSE:
+            print(f"  DEBUG: chardet检测结果 - 编码: {chardet_encoding}, 置信度: {chardet_confidence:.3f}")
+        
+        # 步骤2: chardet置信度检查
+        if chardet_confidence < chardet_confidence_threshold:
+            if VERBOSE:
+                print(f"  DEBUG: chardet置信度过低 ({chardet_confidence:.3f} < {chardet_confidence_threshold:.3f})，跳过")
+            return result
+        
+        # 步骤3: 如果不启用LLM，直接返回chardet结果
+        if not enable_llm:
+            result.update({
+                'encoding': chardet_encoding,
+                'language': chardet_result.get('language'),
+                'confidence': chardet_confidence,
+                'success': True
+            })
+            if VERBOSE:
+                print(f"  DEBUG: 使用chardet结果，无LLM验证")
+            return result
+        
+        # 步骤4: 用chardet检测到的编码解码文本，发送给LLM验证
+        llm_result = verify_encoding_with_llm(zip_path, chardet_encoding, llm_confidence_threshold)
+        
+        if llm_result['success'] and llm_result['confidence'] >= llm_confidence_threshold:
+            # LLM验证通过，返回混合结果
+            result.update({
+                'encoding': chardet_encoding,
+                'language': llm_result['language'],
+                'chardet_confidence': chardet_confidence,
+                'llm_confidence': llm_result['confidence'],
+                'confidence': min(chardet_confidence, llm_result['confidence']),  # 取较小值作为总体置信度
+                'success': True
+            })
+            if VERBOSE:
+                print(f"  DEBUG: LLM验证通过 - 语言: {llm_result['language']}, 置信度: {llm_result['confidence']:.3f}")
+        else:
+            # LLM验证失败，认为整体检测失败
+            if VERBOSE:
+                if not llm_result['success']:
+                    print("  DEBUG: LLM验证失败")
+                else:
+                    print(f"  DEBUG: LLM置信度过低 ({llm_result['confidence']:.3f} < {llm_confidence_threshold:.3f})")
+            result = {'success': False}
+            
     except Exception as exc:
         if VERBOSE:
             print(f"  DEBUG: ZIP编码检测异常: {exc}")
@@ -4691,6 +4905,21 @@ def main():
     )
 
     parser.add_argument(
+        '-el', '--enable-llm',
+        action='store_true',
+        help='Enable LLM verification after chardet detection in decode-auto mode. '
+             'LLM will verify the language consistency of decoded text.'
+    )
+
+    parser.add_argument(
+        '-lc', '--llm-confidence',
+        type=int,
+        default=95,
+        help='Minimum confidence percentage for LLM language verification (default: 95). '
+             'Only used when --enable-llm is specified.'
+    )
+
+    parser.add_argument(
         '-er', '--enable-rar',
         action='store_true',
         help='Enable RAR command-line tool for extracting RAR archives and RAR SFX files. Falls back to 7z if RAR is not available.'
@@ -4900,14 +5129,27 @@ def main():
                 print(f"Error: --traditional-zip-decode-confidence must be between 0 and 100")
                 return 1
             
+            # 验证LLM置信度参数范围
+            if args.llm_confidence < 0 or args.llm_confidence > 100:
+                print(f"Error: --llm-confidence must be between 0 and 100")
+                return 1
+            
             # 检查依赖库是否可用（仅对decode-auto策略）
             if policy == 'decode-auto':
                 try:
                     import zipfile
                     import chardet
+                    if args.enable_llm:
+                        from transformers import pipeline
                 except ImportError as e:
-                    print(f"Error: Required library not available for --traditional-zip-policy decode-auto: {e}")
-                    print("Please install: pip install chardet")
+                    if 'chardet' in str(e):
+                        print(f"Error: chardet library is required for --traditional-zip-policy decode-auto: {e}")
+                        print("Please install: pip install chardet")
+                    elif args.enable_llm and ('transformers' in str(e) or 'torch' in str(e)):
+                        print(f"Error: transformers library is required for --enable-llm: {e}")
+                        print("Please install: pip install transformers torch")
+                    else:
+                        print(f"Error: Required library not available: {e}")
                     return 1
 
         # Validate decompress policy
