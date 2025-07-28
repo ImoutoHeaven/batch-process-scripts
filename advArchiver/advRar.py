@@ -816,7 +816,7 @@ def profile_type(value):
 def parse_arguments():
     """解析命令行参数，并新增 --threads 并发选项"""
     parser = argparse.ArgumentParser(description='RAR压缩工具')
-    parser.add_argument('folder_path', help='要处理的文件夹路径')
+    parser.add_argument('input_path', help='要处理的文件或文件夹路径')
     parser.add_argument('--dry-run', action='store_true', help='仅预览操作，不执行实际命令')
     parser.add_argument('--depth', type=int, default=0, help='压缩处理的深度级别 (0, 1, 2, ...)')
     parser.add_argument('-p', '--password', help='设置压缩包密码')
@@ -1448,14 +1448,18 @@ def main():
             print(info_msg)
 
     # 验证目标路径
-    if not safe_exists(args.folder_path, args.debug):
-        error_msg = f"错误: 路径不存在 - {args.folder_path}"
+    if not safe_exists(args.input_path, args.debug):
+        error_msg = f"错误: 路径不存在 - {args.input_path}"
         stats.log(error_msg)
         print(error_msg)
         sys.exit(1)
 
-    if not safe_isdir(args.folder_path, args.debug):
-        error_msg = f"错误: 不是一个目录 - {args.folder_path}"
+    # 检查输入是文件还是目录
+    is_input_file = safe_isfile(args.input_path, args.debug)
+    is_input_dir = safe_isdir(args.input_path, args.debug)
+    
+    if not (is_input_file or is_input_dir):
+        error_msg = f"错误: 输入路径既不是文件也不是目录 - {args.input_path}"
         stats.log(error_msg)
         print(error_msg)
         sys.exit(1)
@@ -1523,53 +1527,73 @@ def main():
             stats.log(f"- 跳过扩展名: {args.skip_extensions}")
             stats.log(f"- 扩展名文件夹树跳过: {args.ext_skip_folder_tree}")
 
-        # 获取指定深度的文件和文件夹列表（应用过滤规则）
-        items = get_items_at_depth(args.folder_path, args.depth, args)
-
-        if args.debug:
-            debug_msg = f"找到以下符合深度 {args.depth} 的项目（应用过滤后）:"
-            stats.log(debug_msg)
-            stats.log(f"文件数量: {len(items['files'])}")
-            stats.log(f"文件夹数量: {len(items['folders'])}")
-            if len(items['files']) > 0:
-                stats.log("文件列表（前10个）:")
-                for path in items['files'][:10]:
-                    stats.log(f"- {path}")
-                if len(items['files']) > 10:
-                    stats.log(f"... 还有 {len(items['files']) - 10} 个文件")
-            if len(items['folders']) > 0:
-                stats.log("文件夹列表（前10个）:")
-                for path in items['folders'][:10]:
-                    stats.log(f"- {path}")
-                if len(items['folders']) > 10:
-                    stats.log(f"... 还有 {len(items['folders']) - 10} 个文件夹")
-
-        total_items = len(items['files']) + len(items['folders'])
-        if total_items == 0:
-            warning_msg = f"警告: 在深度 {args.depth} 没有找到任何符合条件的文件或文件夹"
-            stats.log(warning_msg)
-            print(warning_msg)
-            sys.exit(0)
-
-        start_msg = f"准备处理 {total_items} 个项目（{len(items['files'])} 个文件，{len(items['folders'])} 个文件夹）"
-        stats.log(start_msg)
-        print(start_msg)
-
-        # 获取基础路径（用于计算相对路径）
-        base_path = safe_abspath(args.folder_path)
-
-        # 根据线程数选择执行模式
-        if args.threads > 1:
-            run_tasks_concurrently(items, args, base_path)
+        # 处理单文件输入
+        if is_input_file:
+            if args.depth > 0:
+                print(f"注意: 单文件模式下 --depth 参数被忽略（当前设置: {args.depth}）")
+            if args.skip_files:
+                print("注意: 单文件模式下 --skip-files 参数被忽略")
+            if args.skip_folders:
+                print("注意: 单文件模式下 --skip-folders 参数被忽略")
+            
+            # 检查是否应该跳过此文件（基于扩展名）
+            if should_skip_file(args.input_path, args.skip_extensions):
+                warning_msg = f"文件被扩展名过滤规则跳过: {args.input_path}"
+                stats.log(warning_msg)
+                print(warning_msg)
+                sys.exit(0)
+            
+            print(f"单文件模式: 处理文件 {args.input_path}")
+            base_path = os.path.dirname(safe_abspath(args.input_path))
+            process_file(args.input_path, args, base_path)
         else:
-            # 顺序执行
-            for i, file_path in enumerate(items['files'], 1):
-                print(f"\n[{i}/{len(items['files'])}] 处理文件: {file_path}")
-                process_file(file_path, args, base_path)
+            # 目录模式：获取指定深度的文件和文件夹列表（应用过滤规则）
+            items = get_items_at_depth(args.input_path, args.depth, args)
 
-            for i, folder_path in enumerate(items['folders'], 1):
-                print(f"\n[{i}/{len(items['folders'])}] 处理文件夹: {folder_path}")
-                process_folder(folder_path, args, base_path)
+            if args.debug:
+                debug_msg = f"找到以下符合深度 {args.depth} 的项目（应用过滤后）:"
+                stats.log(debug_msg)
+                stats.log(f"文件数量: {len(items['files'])}")
+                stats.log(f"文件夹数量: {len(items['folders'])}")
+                if len(items['files']) > 0:
+                    stats.log("文件列表（前10个）:")
+                    for path in items['files'][:10]:
+                        stats.log(f"- {path}")
+                    if len(items['files']) > 10:
+                        stats.log(f"... 还有 {len(items['files']) - 10} 个文件")
+                if len(items['folders']) > 0:
+                    stats.log("文件夹列表（前10个）:")
+                    for path in items['folders'][:10]:
+                        stats.log(f"- {path}")
+                    if len(items['folders']) > 10:
+                        stats.log(f"... 还有 {len(items['folders']) - 10} 个文件夹")
+
+            total_items = len(items['files']) + len(items['folders'])
+            if total_items == 0:
+                warning_msg = f"警告: 在深度 {args.depth} 没有找到任何符合条件的文件或文件夹"
+                stats.log(warning_msg)
+                print(warning_msg)
+                sys.exit(0)
+
+            start_msg = f"准备处理 {total_items} 个项目（{len(items['files'])} 个文件，{len(items['folders'])} 个文件夹）"
+            stats.log(start_msg)
+            print(start_msg)
+
+            # 获取基础路径（用于计算相对路径）
+            base_path = safe_abspath(args.input_path)
+
+            # 根据线程数选择执行模式
+            if args.threads > 1:
+                run_tasks_concurrently(items, args, base_path)
+            else:
+                # 顺序执行
+                for i, file_path in enumerate(items['files'], 1):
+                    print(f"\n[{i}/{len(items['files'])}] 处理文件: {file_path}")
+                    process_file(file_path, args, base_path)
+
+                for i, folder_path in enumerate(items['folders'], 1):
+                    print(f"\n[{i}/{len(items['folders'])}] 处理文件夹: {folder_path}")
+                    process_folder(folder_path, args, base_path)
 
     finally:
         # 打印最终统计信息
