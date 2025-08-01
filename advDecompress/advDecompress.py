@@ -1304,13 +1304,13 @@ class ArchiveProcessor:
                 return 'volume'
 
         # --- RAR4 ---
-        if ext == 'rar' and safe_glob(os.path.join(folder, bf + '.r*')):
+        if ext == 'rar' and self._has_volume_files(bf, folder, 'rar4'):
             return 'volume'
         if re.fullmatch(r'r\d+', ext):
             return 'volume'
 
         # --- ZIP ---
-        if ext == 'zip' and safe_glob(os.path.join(folder, bf + '.z*')):
+        if ext == 'zip' and self._has_volume_files(bf, folder, 'zip'):
             return 'volume'
         if re.fullmatch(r'z\d+', ext):
             return 'volume'
@@ -1328,7 +1328,7 @@ class ArchiveProcessor:
                     return 'volume'
                 return 'single'
             else:
-                if safe_glob(os.path.join(folder, bf + '.7z.*')):
+                if self._has_volume_files(bf, folder, '7z'):
                     return 'volume'
                 return 'single'
 
@@ -1363,7 +1363,7 @@ class ArchiveProcessor:
 
         # --- RAR4 ---
         if ext == 'rar':
-            if safe_glob(os.path.join(folder, bf + '.r*')):
+            if self._has_volume_files(bf, folder, 'rar4'):
                 return {"is_multi": True, "type": "rar4-multi"}
             return {"is_multi": False, "type": "rar4/rar5-single"}
         if re.fullmatch(r'r\d+', ext):
@@ -1371,7 +1371,7 @@ class ArchiveProcessor:
 
         # --- ZIP ---
         if ext == 'zip':
-            if safe_glob(os.path.join(folder, bf + '.z*')):
+            if self._has_volume_files(bf, folder, 'zip'):
                 return {"is_multi": True, "type": "zip-multi"}
             return {"is_multi": False, "type": "zip-single"}
         if re.fullmatch(r'z\d+', ext):
@@ -1390,7 +1390,7 @@ class ArchiveProcessor:
                     return {"is_multi": True, "type": "exe-rar-multi"}
                 return {"is_multi": False, "type": "exe-rar-single"}
             else:
-                if safe_glob(os.path.join(folder, bf + '.7z.*')):
+                if self._has_volume_files(bf, folder, '7z'):
                     return {"is_multi": True, "type": "exe-7z-multi"}
                 return {"is_multi": False, "type": "exe-7z-single"}
 
@@ -1419,11 +1419,11 @@ class ArchiveProcessor:
                 return True
 
         # RAR4 主卷
-        if ext == 'rar' and safe_glob(os.path.join(folder, bf + '.r*')):
+        if ext == 'rar' and self._has_volume_files(bf, folder, 'rar4'):
             return True
 
         # ZIP 主卷
-        if ext == 'zip' and safe_glob(os.path.join(folder, bf + '.z*')):
+        if ext == 'zip' and self._has_volume_files(bf, folder, 'zip'):
             return True
 
         # EXE SFX 主卷
@@ -1438,7 +1438,7 @@ class ArchiveProcessor:
                     return True
 
             # EXE-7z-SFX
-            if (not is_rar_sfx) and safe_glob(os.path.join(folder, bf + '.7z.*')):
+            if (not is_rar_sfx) and self._has_volume_files(bf, folder, '7z'):
                 return True
 
         return False
@@ -1487,6 +1487,25 @@ class ArchiveProcessor:
 
         return False
 
+    def _get_volume_files(self, base_filename, folder, volume_type):
+        """
+        获取指定类型的分卷文件列表
+        volume_type: '7z', 'rar4', 'zip'
+        返回匹配的分卷文件列表
+        """
+        patterns = {
+            '7z': f"{base_filename}.7z.[^.]+",
+            'rar4': f"{base_filename}.r[^.]+", 
+            'zip': f"{base_filename}.z[^.]+"
+        }
+        if volume_type not in patterns:
+            return []
+        return safe_glob(os.path.join(folder, patterns[volume_type]))
+
+    def _has_volume_files(self, base_filename, folder, volume_type):
+        """检查是否存在指定类型的分卷文件"""
+        return bool(self._get_volume_files(base_filename, folder, volume_type))
+
     def get_all_volumes(self, file_path):
         """给定归档或分卷文件，返回同组内所有分卷（包含主卷）"""
         if not safe_isfile(file_path, VERBOSE):
@@ -1499,7 +1518,7 @@ class ArchiveProcessor:
 
         # 7z 纯
         if ext.isdigit() and ext2 == '7z' and not safe_exists(os.path.join(folder, bf + '.exe')):
-            volumes |= set(safe_glob(os.path.join(folder, bf + '.7z.*')))
+            volumes |= set(self._get_volume_files(bf, folder, '7z'))
 
         # EXE SFX 统一处理（从 .exe 文件开始的所有 SFX 情况）
         elif ext == 'exe' and self.sfx_detector.is_sfx(file_path):
@@ -1513,9 +1532,9 @@ class ArchiveProcessor:
                     volumes |= set(safe_glob(os.path.join(folder, bf + '.part*.rar')))
             else:
                 # EXE-7z SFX 分卷处理  
-                if safe_glob(os.path.join(folder, bf + '.7z.*')):
+                if self._has_volume_files(bf, folder, '7z'):
                     volumes.add(file_path)  # 添加 .exe 主卷
-                    volumes |= set(safe_glob(os.path.join(folder, bf + '.7z.*')))
+                    volumes |= set(self._get_volume_files(bf, folder, '7z'))
 
         # RAR5 纯
         elif ext == 'rar' and re.fullmatch(r'part\d+', ext2) \
@@ -1529,14 +1548,14 @@ class ArchiveProcessor:
             volumes |= set(safe_glob(os.path.join(folder, bf + '.part*.rar')))
 
         # RAR4
-        elif (ext == 'rar' and safe_glob(os.path.join(folder, bf + '.r*'))) or re.fullmatch(r'r\d+', ext):
+        elif (ext == 'rar' and self._has_volume_files(bf, folder, 'rar4')) or re.fullmatch(r'r\d+', ext):
             volumes.add(os.path.join(folder, bf + '.rar'))
-            volumes |= set(safe_glob(os.path.join(folder, bf + '.r*')))
+            volumes |= set(self._get_volume_files(bf, folder, 'rar4'))
 
         # ZIP
-        elif (ext == 'zip' and safe_glob(os.path.join(folder, bf + '.z*'))) or re.fullmatch(r'z\d+', ext):
+        elif (ext == 'zip' and self._has_volume_files(bf, folder, 'zip')) or re.fullmatch(r'z\d+', ext):
             volumes.add(os.path.join(folder, bf + '.zip'))
-            volumes |= set(safe_glob(os.path.join(folder, bf + '.z*')))
+            volumes |= set(self._get_volume_files(bf, folder, 'zip'))
 
         if not volumes:
             volumes.add(file_path)
@@ -2553,10 +2572,32 @@ def safe_glob(pattern: str, debug: bool = False):
             print(f"  DEBUG: 目录中的文件数量: {len(files)}")
         
         # 将glob模式转换为正则表达式
-        # 只处理*和?通配符，其他所有字符都作为字面字符
-        regex_pattern = re.escape(file_pattern)  # 先转义所有特殊字符
-        regex_pattern = regex_pattern.replace(r'\*', '.*')  # 恢复*通配符
-        regex_pattern = regex_pattern.replace(r'\?', '.')   # 恢复?通配符
+        # 先处理字符类，再进行转义，避免字符类被破坏
+        import re
+        
+        # 1. 先提取并保护字符类
+        char_classes = []
+        temp_pattern = file_pattern
+        
+        # 查找并保护字符类 [^x]+ 或 [^x]*
+        def replace_char_class(match):
+            char_classes.append(match.group(0))
+            return f"__CHAR_CLASS_{len(char_classes)-1}__"
+        
+        temp_pattern = re.sub(r'\[(\^?)([^\]]+)\][+*?]?', replace_char_class, temp_pattern)
+        
+        # 2. 转义剩余的特殊字符  
+        regex_pattern = re.escape(temp_pattern)
+        
+        # 3. 恢复通配符
+        regex_pattern = regex_pattern.replace(r'\*', '.*')
+        regex_pattern = regex_pattern.replace(r'\?', '.')
+        
+        # 4. 恢复字符类
+        for i, char_class in enumerate(char_classes):
+            placeholder = f"__CHAR_CLASS_{i}__"
+            regex_pattern = regex_pattern.replace(placeholder, char_class)
+        
         regex_pattern = '^' + regex_pattern + '$'  # 精确匹配
         
         if debug:
