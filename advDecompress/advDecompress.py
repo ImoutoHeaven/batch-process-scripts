@@ -524,6 +524,8 @@ class ArchiveProcessor:
         self.failed_archives = []
         self.successful_archives = []
         self.skipped_archives = []
+        self.skipped_rename_archives = []  # 扩展名修复时跳过的文件
+        self.fixed_rename_archives = []    # 扩展名修复时成功重命名的文件 (原路径, 新路径)
         
         # 【新增】验证和修正参数
         self.validate_args()
@@ -2292,6 +2294,270 @@ def is_traditional_zip(archive_path):
             print(f"  DEBUG: 传统ZIP检测异常: {exc}")
         return False
 
+
+
+# === Extension Fix Logic ====
+
+def detect_archive_type(file_path):
+    """
+    通过文件头检测归档文件类型
+    
+    Args:
+        file_path: 文件路径
+        
+    Returns:
+        str: 检测到的归档类型（"RAR 4.x", "RAR 5.x", "ZIP", "ZIP (empty)", "ZIP (spanned)", "7Z", "Unknown"）
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            header = f.read(8)
+        
+        # RAR检测
+        if header[:7] == b'\x52\x61\x72\x21\x1A\x07\x00':
+            return "RAR 4.x"
+        elif header[:8] == b'\x52\x61\x72\x21\x1A\x07\x01\x00':
+            return "RAR 5.x"
+        
+        # ZIP检测
+        elif header[:4] == b'\x50\x4B\x03\x04':
+            return "ZIP"
+        elif header[:4] == b'\x50\x4B\x05\x06':
+            return "ZIP (empty)"
+        elif header[:4] == b'\x50\x4B\x07\x08':
+            return "ZIP (spanned)"
+        
+        # 7Z检测
+        elif header[:6] == b'\x37\x7A\xBC\xAF\x27\x1C':
+            return "7Z"
+        
+        return "Unknown"
+    except Exception as e:
+        if VERBOSE:
+            print(f"  DEBUG: 文件头检测异常 {file_path}: {e}")
+        return "Unknown"
+
+
+def fix_archive_ext(processor, abs_path, args):
+    """
+    扩展名修复主函数
+    
+    Args:
+        processor: ArchiveProcessor实例
+        abs_path: 绝对路径
+        args: 命令行参数
+    """
+    if not args.fix_ext:
+        return
+    
+    if VERBOSE:
+        print("  DEBUG: 开始扩展名修复预处理...")
+    
+    # 解析深度范围参数
+    depth_range = None
+    if hasattr(args, 'depth_range') and args.depth_range:
+        try:
+            depth_range = parse_depth_range(args.depth_range)
+            if VERBOSE:
+                print(f"  DEBUG: 扩展名修复使用深度范围: {depth_range[0]}-{depth_range[1]}")
+        except ValueError as e:
+            print(f"Error: Invalid depth range for extension fix: {e}")
+            return
+    
+    # 1. 收集所有候选文件
+    candidate_files = []
+    
+    if safe_isfile(abs_path, VERBOSE):
+        # 单个文件情况
+        candidate_files.append(abs_path)
+    elif safe_isdir(abs_path, VERBOSE):
+        # 目录情况，根据深度范围收集文件
+        try:
+            for root, dirs, files in os.walk(abs_path):
+                check_interrupt()
+                
+                if depth_range:
+                    current_depth = root.replace(abs_path, '').count(os.sep)
+                    if current_depth < depth_range[0] or current_depth > depth_range[1]:
+                        continue
+                
+                for filename in files:
+                    filepath = os.path.join(root, filename)
+                    if safe_isfile(filepath, VERBOSE):
+                        candidate_files.append(filepath)
+        except Exception as e:
+            if VERBOSE:
+                print(f"  DEBUG: 收集文件时出错: {e}")
+            return
+    else:
+        if VERBOSE:
+            print(f"  DEBUG: 路径不存在或无法访问: {abs_path}")
+        return
+    
+    if VERBOSE:
+        print(f"  DEBUG: 收集到 {len(candidate_files)} 个候选文件")
+    
+    # 2. 对每个文件进行冲突检查和处理
+    files_to_process = []
+    
+    for filepath in candidate_files:
+        check_interrupt()
+        
+        try:
+            filename = os.path.basename(filepath)
+            parent_dir = os.path.dirname(filepath)
+            
+            # 获取目录下所有文件
+            try:
+                dir_files = [f for f in os.listdir(parent_dir) if safe_isfile(os.path.join(parent_dir, f), False)]
+            except:
+                if VERBOSE:
+                    print(f"  DEBUG: 无法列出目录文件: {parent_dir}")
+                continue
+            
+            should_skip = False
+            
+            # 解析文件名和扩展名
+            if '.' not in filename:
+                # (1.1) 文件没有扩展名
+                # 检查是否存在 {filename}.{anyExt} 的文件
+                for other_file in dir_files:
+                    if other_file != filename and other_file.startswith(filename + '.'):
+                        should_skip = True
+                        if VERBOSE:
+                            print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 存在同名扩展文件 {other_file}")
+                        break
+            else:
+                # 文件有扩展名
+                name_parts = filename.rsplit('.', 1)
+                basename = name_parts[0]
+                file_ext = name_parts[1].lower()
+                
+                # (1.2) 如果扩展名是 exe，跳过
+                if file_ext == 'exe':
+                    should_skip = True
+                    if VERBOSE:
+                        print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - exe文件")
+                elif '.' in basename:
+                    # (1.3) basename 包含 '.'，从右往左分割
+                    basename_parts = basename.rsplit('.', 1)
+                    first_part = basename_parts[0]
+                    last_part = basename_parts[1]
+                    
+                    # 检查冲突文件
+                    conflict_patterns = [
+                        first_part,  # 无扩展名
+                        first_part + '.',  # 前缀匹配任意扩展名
+                        first_part + '.' + last_part,  # 无扩展名
+                        first_part + '.' + last_part + '.'  # 前缀匹配任意扩展名
+                    ]
+                    
+                    for other_file in dir_files:
+                        if other_file == filename:
+                            continue
+                        
+                        # 检查是否匹配冲突模式
+                        if (other_file == conflict_patterns[0] or  # {firstPart}
+                            other_file == conflict_patterns[2] or  # {firstPart}.{lastPart}
+                            (other_file.startswith(conflict_patterns[1]) and len(other_file) > len(conflict_patterns[1])) or  # {firstPart}.{anyExt}
+                            (other_file.startswith(conflict_patterns[3]) and len(other_file) > len(conflict_patterns[3]))):  # {firstPart}.{lastPart}.{anyExt}
+                            should_skip = True
+                            if VERBOSE:
+                                print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 存在冲突文件 {other_file}")
+                            break
+                else:
+                    # (1.4) basename 不包含 '.'
+                    # 检查是否存在冲突文件
+                    for other_file in dir_files:
+                        if other_file == filename:
+                            continue
+                        
+                        if (other_file == basename or  # {filename} 无扩展名
+                            (other_file.startswith(basename + '.') and other_file != filename)):  # {filename}.{anyExt}
+                            should_skip = True
+                            if VERBOSE:
+                                print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 存在冲突文件 {other_file}")
+                            break
+            
+            if should_skip:
+                processor.skipped_rename_archives.append(filepath)
+            else:
+                files_to_process.append(filepath)
+                
+        except Exception as e:
+            if VERBOSE:
+                print(f"  DEBUG: 处理文件时出错 {filepath}: {e}")
+            continue
+    
+    if VERBOSE:
+        print(f"  DEBUG: 筛选出 {len(files_to_process)} 个文件需要检测和重命名")
+    
+    # 3. 对筛选出的文件进行文件头检测和重命名
+    for filepath in files_to_process:
+        check_interrupt()
+        
+        try:
+            archive_type = detect_archive_type(filepath)
+            
+            if archive_type == "Unknown":
+                if VERBOSE:
+                    print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 未知文件类型")
+                processor.skipped_rename_archives.append(filepath)
+                continue
+            
+            # 确定目标扩展名
+            if archive_type.startswith("RAR"):
+                target_ext = "rar"
+            elif archive_type.startswith("ZIP"):
+                target_ext = "zip"
+            elif archive_type == "7Z":
+                target_ext = "7z"
+            else:
+                if VERBOSE:
+                    print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 不支持的归档类型 {archive_type}")
+                processor.skipped_rename_archives.append(filepath)
+                continue
+            
+            # 执行重命名
+            filename = os.path.basename(filepath)
+            parent_dir = os.path.dirname(filepath)
+            
+            if '.' not in filename:
+                # 无扩展名，添加扩展名
+                new_filename = filename + '.' + target_ext
+            else:
+                # 有扩展名，替换扩展名
+                name_parts = filename.rsplit('.', 1)
+                new_filename = name_parts[0] + '.' + target_ext
+            
+            new_filepath = os.path.join(parent_dir, new_filename)
+            
+            # 检查目标文件是否已存在
+            if safe_isfile(new_filepath, False):
+                if VERBOSE:
+                    print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 目标文件已存在 {new_filename}")
+                processor.skipped_rename_archives.append(filepath)
+                continue
+            
+            # 执行重命名
+            try:
+                os.rename(filepath, new_filepath)
+                processor.fixed_rename_archives.append((filepath, new_filepath))
+                print(f"fix-rename-archives: {filepath} -> {new_filepath} (检测为 {archive_type})")
+                if VERBOSE:
+                    print(f"  DEBUG: fix-rename-archives: 重命名成功 {filepath} -> {new_filepath}")
+            except Exception as e:
+                if VERBOSE:
+                    print(f"  DEBUG: skip-rename-archives: 重命名失败 {filepath} -> {new_filepath}: {e}")
+                processor.skipped_rename_archives.append(filepath)
+        
+        except Exception as e:
+            if VERBOSE:
+                print(f"  DEBUG: 检测文件头时出错 {filepath}: {e}")
+            processor.skipped_rename_archives.append(filepath)
+    
+    # 打印汇总
+    if processor.skipped_rename_archives or processor.fixed_rename_archives:
+        print(f"扩展名修复完成: 跳过 {len(processor.skipped_rename_archives)} 个文件, 重命名 {len(processor.fixed_rename_archives)} 个文件")
 
 
 # === depth 限制 实现 ====
@@ -5254,6 +5520,12 @@ def main():
              'If not specified, all depths are scanned.'
     )
 
+    parser.add_argument(
+        '--fix-ext', '-fe',
+        action='store_true',
+        help='Enable archive extension fix logic. Detects archive type by file header and fixes incorrect extensions before processing.'
+    )
+
     args = parser.parse_args()
 
     # Set global verbose flag
@@ -5417,6 +5689,10 @@ def main():
         # Create processor and find archives
         processor = ArchiveProcessor(args)
         abs_path = os.path.abspath(args.path)
+        
+        # Fix archive extensions if requested
+        fix_archive_ext(processor, abs_path, args)
+        
         archives = processor.find_archives(abs_path)
 
         if not archives:
@@ -5519,6 +5795,11 @@ def main():
         print(f"Successfully processed: {len(processor.successful_archives)}")
         print(f"Failed to process: {len(processor.failed_archives)}")
         print(f"Skipped: {len(processor.skipped_archives)}")
+        
+        # Extension fix summary
+        if args.fix_ext:
+            print(f"Extension fix - Renamed: {len(processor.fixed_rename_archives)}")
+            print(f"Extension fix - Skipped: {len(processor.skipped_rename_archives)}")
 
         if processor.failed_archives:
             print("\nFailed archives:")
@@ -5528,6 +5809,16 @@ def main():
         if processor.skipped_archives:
             print("\nSkipped archives:")
             for archive in processor.skipped_archives:
+                print(f"  - {archive}")
+        
+        if args.fix_ext and processor.fixed_rename_archives:
+            print("\nRenamed archives (extension fix):")
+            for old_path, new_path in processor.fixed_rename_archives:
+                print(f"  - {old_path} -> {new_path}")
+        
+        if args.fix_ext and processor.skipped_rename_archives:
+            print("\nSkipped archives (extension fix):")
+            for archive in processor.skipped_rename_archives:
                 print(f"  - {archive}")
 
         return 0
