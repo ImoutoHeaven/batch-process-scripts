@@ -2519,6 +2519,11 @@ def fix_archive_ext(processor, abs_path, args):
             
             # 执行重命名
             filename = os.path.basename(filepath)
+            
+            # 如果扩展名已正确（忽略大小写），直接跳过，不记录日志
+            if filename.lower().endswith('.' + target_ext):
+                continue
+
             parent_dir = os.path.dirname(filepath)
             
             if '.' not in filename:
