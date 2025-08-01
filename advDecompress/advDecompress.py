@@ -1500,7 +1500,7 @@ class ArchiveProcessor:
         }
         if volume_type not in patterns:
             return []
-        return safe_glob(os.path.join(folder, patterns[volume_type]))
+        return safe_glob(os.path.join(folder, patterns[volume_type]), preserve_char_classes=True)
 
     def _has_volume_files(self, base_filename, folder, volume_type):
         """检查是否存在指定类型的分卷文件"""
@@ -2528,7 +2528,7 @@ def safe_open(file_path, mode='r', *args, **kwargs):
         print(f"  DEBUG: safe_open -> {safe_path}")
     return open(safe_path, mode, *args, **kwargs)
 
-def safe_glob(pattern: str, debug: bool = False):
+def safe_glob(pattern: str, debug: bool = False, preserve_char_classes: bool = False):
     """
     简单的glob替代，使用正则表达式避免fnmatch的特殊字符问题
     支持大小写不敏感匹配
@@ -2572,31 +2572,44 @@ def safe_glob(pattern: str, debug: bool = False):
             print(f"  DEBUG: 目录中的文件数量: {len(files)}")
         
         # 将glob模式转换为正则表达式
-        # 先处理字符类，再进行转义，避免字符类被破坏
         import re
         
-        # 1. 先提取并保护字符类
-        char_classes = []
-        temp_pattern = file_pattern
-        
-        # 查找并保护字符类 [^x]+ 或 [^x]*
-        def replace_char_class(match):
-            char_classes.append(match.group(0))
-            return f"__CHAR_CLASS_{len(char_classes)-1}__"
-        
-        temp_pattern = re.sub(r'\[(\^?)([^\]]+)\][+*?]?', replace_char_class, temp_pattern)
-        
-        # 2. 转义剩余的特殊字符  
-        regex_pattern = re.escape(temp_pattern)
-        
-        # 3. 恢复通配符
-        regex_pattern = regex_pattern.replace(r'\*', '.*')
-        regex_pattern = regex_pattern.replace(r'\?', '.')
-        
-        # 4. 恢复字符类
-        for i, char_class in enumerate(char_classes):
-            placeholder = f"__CHAR_CLASS_{i}__"
-            regex_pattern = regex_pattern.replace(placeholder, char_class)
+        if preserve_char_classes:
+            # 需要保护特定的字符类模式（仅用于分卷文件匹配）
+            char_classes = []
+            temp_pattern = file_pattern
+            
+            # 只保护特定的字符类模式，如 [^.]+ 等
+            def replace_specific_char_class(match):
+                char_classes.append(match.group(0))
+                return f"__CHAR_CLASS_{len(char_classes)-1}__"
+            
+            # 在转义之前提取我们需要的字符类模式（原始字符串中的模式）
+            specific_patterns = [
+                r'\[\^\.\]\+',  # [^.]+
+                r'\[\^\.\]\*',  # [^.]*
+                r'\[\^\.\]\?',  # [^.]?
+            ]
+            
+            for pattern in specific_patterns:
+                temp_pattern = re.sub(pattern, replace_specific_char_class, temp_pattern)
+            
+            # 转义剩余的特殊字符  
+            regex_pattern = re.escape(temp_pattern)
+            
+            # 恢复通配符
+            regex_pattern = regex_pattern.replace(r'\*', '.*')
+            regex_pattern = regex_pattern.replace(r'\?', '.')
+            
+            # 恢复被保护的字符类
+            for i, char_class in enumerate(char_classes):
+                placeholder = re.escape(f"__CHAR_CLASS_{i}__")
+                regex_pattern = regex_pattern.replace(placeholder, char_class)
+        else:
+            # 传统模式：只处理*和?通配符
+            regex_pattern = re.escape(file_pattern)
+            regex_pattern = regex_pattern.replace(r'\*', '.*')
+            regex_pattern = regex_pattern.replace(r'\?', '.')
         
         regex_pattern = '^' + regex_pattern + '$'  # 精确匹配
         
