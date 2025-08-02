@@ -527,8 +527,15 @@ class ArchiveProcessor:
         self.skipped_rename_archives = []  # 扩展名修复时跳过的文件
         self.fixed_rename_archives = []    # 扩展名修复时成功重命名的文件 (原路径, 新路径)
         
+        # 【新增】全局密码管理
+        self.password_candidates = []      # 全局密码候选列表
+        self.password_hit_counts = {}      # 密码命中统计字典
+        
         # 【新增】验证和修正参数
         self.validate_args()
+        
+        # 【新增】构建全局密码候选列表
+        self.build_password_candidates()
 
     def find_archives(self, search_path):
         """重构后的查找归档文件函数（修正单文件volume处理）"""
@@ -693,35 +700,48 @@ class ArchiveProcessor:
 
         return archives
 
-    def find_correct_password(self, archive_path, password_candidates, encryption_status='encrypted_content'):
+    def find_correct_password(self, archive_path, password_candidates=None, encryption_status='encrypted_content'):
         """
         Find correct password from candidates using is_password_correct.
         
         Args:
             archive_path: Path to the archive
-            password_candidates: List of password candidates to test
+            password_candidates: List of password candidates to test (deprecated, uses self.password_candidates)
             encryption_status: Type of encryption ('encrypted_header', 'encrypted_content', or 'plain')
         
         Returns:
             str or None: Correct password if found, None if no correct password found
         """
-        if not password_candidates:
+        # 使用全局密码候选列表
+        candidates_to_test = self.password_candidates if self.password_candidates else []
+        
+        if not candidates_to_test:
             return ""
 
         if VERBOSE:
-            print(f"  DEBUG: Testing {len(password_candidates)} password candidates")
+            print(f"  DEBUG: Testing {len(candidates_to_test)} password candidates")
             print(f"  DEBUG: Encryption type: {encryption_status}")
 
-        for i, password in enumerate(password_candidates):
+        for i, password in enumerate(candidates_to_test):
             # Check for interrupt before testing each password
             check_interrupt()
             
             if VERBOSE:
-                print(f"  DEBUG: Testing password {i + 1}/{len(password_candidates)}")
+                print(f"  DEBUG: Testing password {i + 1}/{len(candidates_to_test)}")
 
             if is_password_correct(archive_path, password, encryption_status):
                 if VERBOSE:
                     print(f"  DEBUG: Found correct password (candidate {i + 1})")
+                
+                # 更新密码命中统计
+                if password in self.password_hit_counts:
+                    self.password_hit_counts[password] += 1
+                    if VERBOSE:
+                        print(f"  DEBUG: Password hit count updated to {self.password_hit_counts[password]}")
+                    
+                    # 重新排序密码候选列表
+                    self.reorder_password_candidates()
+                
                 return password
 
         return None
@@ -819,33 +839,13 @@ class ArchiveProcessor:
             elif VERBOSE:
                 print(f"  DEBUG: Archive is not encrypted")
 
-        # Step 3: Prepare password candidates and find correct password
-        password_candidates = []
+        # Step 3: Find correct password using global password candidates
         correct_password = ""
 
         if need_password_testing and encryption_status in ['encrypted_header', 'encrypted_content']:
-            # Build password candidate list: -p first, then -pf
-            if self.args.password:
-                password_candidates.append(self.args.password)
-                if VERBOSE:
-                    print(f"  DEBUG: Added command line password")
-
-            if self.args.password_file:
-                try:
-                    password_file_abs = os.path.abspath(self.args.password_file)
-                    with safe_open(password_file_abs, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            password = line.strip()
-                            if password and password not in password_candidates:
-                                password_candidates.append(password)
-                    if VERBOSE:
-                        print(f"  DEBUG: Read {len(password_candidates)} passwords from password file")
-                except Exception as e:
-                    print(f"  Warning: Cannot read password file: {e}")
-
-            # Test passwords using is_password_correct with encryption status
+            # Test passwords using global password candidates
             check_interrupt()  # Check before potentially long password testing
-            correct_password = self.find_correct_password(archive_path, password_candidates, encryption_status)
+            correct_password = self.find_correct_password(archive_path, encryption_status=encryption_status)
             if correct_password is None:
                 print(f"  Error: No correct password found for {archive_path}")
                 # Apply fail policy before returning - 使用新的get_all_volumes方法
@@ -1692,6 +1692,80 @@ class ArchiveProcessor:
             self.args.llm_confidence = 95
             if VERBOSE:
                 print(f"  DEBUG: 设置默认值 llm_confidence = 95")
+
+    def build_password_candidates(self):
+        """
+        构建全局密码候选列表，包含-p参数和-pf文件中的密码
+        """
+        self.password_candidates = []
+        self.password_hit_counts = {}
+        
+        # 优先添加-p参数指定的密码
+        if self.args.password:
+            self.password_candidates.append(self.args.password)
+            self.password_hit_counts[self.args.password] = 0
+            if VERBOSE:
+                print(f"  DEBUG: 添加命令行密码到候选列表")
+        
+        # 处理密码文件(-pf参数)
+        if self.args.password_file:
+            try:
+                password_file_abs = os.path.abspath(self.args.password_file)
+                with safe_open(password_file_abs, 'r', encoding='utf-8') as f:
+                    file_passwords = []
+                    for line in f:
+                        # 只去除换行符，保留首尾空格
+                        password = line.rstrip('\r\n')
+                        if password:  # 跳过空行
+                            file_passwords.append(password)
+                    
+                    # 对密码文件中的密码进行去重
+                    unique_passwords = []
+                    seen = set()
+                    for pwd in file_passwords:
+                        if pwd not in seen and pwd not in self.password_candidates:
+                            unique_passwords.append(pwd)
+                            seen.add(pwd)
+                    
+                    # 添加到候选列表并初始化命中统计
+                    self.password_candidates.extend(unique_passwords)
+                    for pwd in unique_passwords:
+                        self.password_hit_counts[pwd] = 0
+                    
+                    if VERBOSE:
+                        print(f"  DEBUG: 从密码文件读取 {len(unique_passwords)} 个唯一密码")
+                        print(f"  DEBUG: 总共构建 {len(self.password_candidates)} 个密码候选")
+                        
+            except Exception as e:
+                print(f"  Warning: 无法读取密码文件: {e}")
+    
+    def reorder_password_candidates(self):
+        """
+        根据命中次数重新排序密码候选列表，保持-p参数密码的优先级
+        """
+        if len(self.password_candidates) <= 1:
+            return
+        
+        # -p参数密码（如果存在）
+        p_password = self.args.password if self.args.password else None
+        
+        # 分离-p密码和其他密码
+        other_passwords = []
+        for pwd in self.password_candidates:
+            if pwd != p_password:
+                other_passwords.append(pwd)
+        
+        # 根据命中次数对其他密码排序（降序）
+        other_passwords.sort(key=lambda x: self.password_hit_counts.get(x, 0), reverse=True)
+        
+        # 重构密码候选列表：-p密码在前，其他按命中次数排序
+        self.password_candidates = []
+        if p_password:
+            self.password_candidates.append(p_password)
+        self.password_candidates.extend(other_passwords)
+        
+        if VERBOSE:
+            print(f"  DEBUG: 重新排序密码候选列表，总数: {len(self.password_candidates)}")
 
 
 # ==================== 编码检测和验证函数 ====================
