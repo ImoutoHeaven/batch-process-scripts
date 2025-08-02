@@ -2659,28 +2659,19 @@ def fix_archive_ext(processor, abs_path, args):
                 print(f"  DEBUG: 检测文件头时出错 {filepath}: {e}")
             final_skipped.append((filepath, f"检测文件头时出错: {e}"))
     
-    # 4. 显示交互式确认界面
+    # 4. 显示交互式确认界面（仅当有文件需要重命名时）
+    if not planned_renames:
+        if VERBOSE:
+            print(f"  DEBUG: 没有文件需要重命名，跳过 {len(final_skipped)} 个文件")
+        return
+    
     print("\n" + "=" * 60)
     print("EXTENSION FIX PREVIEW")
     print("=" * 60)
     
-    if planned_renames:
-        print(f"Files to rename ({len(planned_renames)} files):")
-        for old_path, new_path, archive_type in planned_renames:
-            print(f"  {old_path} -> {new_path} (detected as {archive_type})")
-    else:
-        print("No files to rename.")
-    
-    if final_skipped:
-        print(f"\nFiles to skip ({len(final_skipped)} files):")
-        for filepath, reason in final_skipped:
-            print(f"  {filepath} ({reason})")
-    else:
-        print("\nNo files to skip.")
-    
-    if not planned_renames:
-        print("\nNothing to do.")
-        return
+    print(f"Files to rename ({len(planned_renames)} files):")
+    for old_path, new_path, archive_type in planned_renames:
+        print(f"  {old_path} -> {new_path} (detected as {archive_type})")
     
     # 交互确认
     print(f"\nContinue with extension fix? [y/N]: ", end="", flush=True)
