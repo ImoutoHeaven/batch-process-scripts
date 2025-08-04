@@ -14,6 +14,7 @@
 * **传统 ZIP 支持**：自动/手动转码（Shift-JIS、GBK…），可用 LLM 二次校验，彻底解决乱码问题。
 * **多线程 & 全局锁**：支持并发解压，配合锁文件避免多实例冲突。
 * **成功/失败后处理**：成功或失败的归档可选择删除 / 保留 / 移动到指定目录。
+* **扩展名修复**：智能检测文件头并修复错误扩展名，支持大小阈值过滤以提升处理效率。
 * **跳过规则**：按格式/多卷类型精细跳过无需处理的文件。
 * **安全包装**：所有文件系统与子进程操作均带异常捕获与调试开关，日志清晰。
 
@@ -41,7 +42,11 @@
 ## 快速开始
 
 ```bash
+# 基本批量解压
 python advDecompress.py <扫描路径> -o <输出目录> -t 4 -v
+
+# 包含扩展名修复的完整用法
+python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t 4 -v
 ```
 
 ---
@@ -75,6 +80,8 @@ python advDecompress.py <扫描路径> -o <输出目录> -t 4 -v
 | `--lock-timeout` | 获取锁最大重试次数 | 30 |
 | `-dr`, `--depth-range` | 扫描深度范围，如 `0-2` / `1` | 全深度 |
 | `--fix-ext`, `-fe` | 启用扩展名修复（按文件头识别） | 关闭 |
+| `--safe-fix-ext`, `-sfe` | 启用安全扩展名修复（追加正确扩展名） | 关闭 |
+| `--fix-extension-threshold`, `-fet` | 扩展名修复文件大小阈值，小于此值跳过处理 | `10mb` |
 
 ---
 
@@ -94,6 +101,50 @@ python advDecompress.py <扫描路径> -o <输出目录> -t 4 -v
 | `file-content-auto-folder-N-collect-meaningful` | 自动选取“最有意义”文件夹名（ASCII 过滤）后按阈值判断。 |
 
 > N 为正整数，例如 `5-collect`、`file-content-10-collect`、`file-content-auto-folder-3-collect-len` 等。
+
+---
+
+## 扩展名修复功能详解
+
+脚本支持智能检测归档文件的真实类型并修复错误的扩展名，避免因扩展名错误导致的解压失败。
+
+### 使用方式
+
+| 参数 | 功能 |
+|------|------|
+| `--fix-ext`, `-fe` | 普通修复模式：替换错误扩展名或为无扩展名文件添加正确扩展名 |
+| `--safe-fix-ext`, `-sfe` | 安全修复模式：总是追加正确扩展名，不替换现有扩展名 |
+| `--fix-extension-threshold`, `-fet` | 文件大小阈值，小于此值的文件将被跳过 |
+
+### 文件大小阈值格式
+
+* **格式**：`<数字><单位>`，单位支持 `k`/`kb`、`m`/`mb`、`g`/`gb`（大小写不敏感）
+* **示例**：`500kb`、`10mb`、`2g`、`1GB`
+* **特殊值**：`0` 表示禁用大小过滤，处理所有文件
+* **默认值**：`10mb`（小于 10MB 的文件将被跳过）
+
+### 使用示例
+
+```bash
+# 启用普通修复模式，使用默认 10MB 阈值，只处理较大的文件
+python advDecompress.py /path/to/archives --fix-ext
+
+# 使用安全修复模式，设置 500KB 阈值
+python advDecompress.py /path/to/archives --safe-fix-ext -fet 500kb
+
+# 禁用大小过滤，处理所有文件（包括小文件）
+python advDecompress.py /path/to/archives --fix-ext -fet 0
+
+# 设置 2GB 阈值，只处理超大文件
+python advDecompress.py /path/to/archives --fix-ext -fet 2g
+```
+
+### 注意事项
+
+* 扩展名修复需要读取文件头进行类型检测，对于大量小文件可能较耗时
+* 设置合适的大小阈值可显著提升处理效率
+* 安全修复模式不会覆盖现有扩展名，适合不确定原扩展名正确性的场景
+* 修复操作需要用户交互确认，不支持静默批量操作
 
 ---
 
@@ -123,6 +174,12 @@ a python advDecompress.py /data/backups -er -dr 0 -sp delete --skip-zip --skip-7
 
 # 处理多卷 ZIP，若遭遇传统编码则自动解码
 python advDecompress.py archive.zip -tzp decode-auto -enable-rar
+
+# 启用扩展名修复，只处理大于 500KB 的文件
+python advDecompress.py /data/archives --fix-ext -fet 500kb -v
+
+# 启用扩展名修复，处理所有文件（不限大小）
+python advDecompress.py /data/archives --fix-ext -fet 0 -v
 ```
 
 ---

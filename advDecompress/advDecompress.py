@@ -2436,6 +2436,63 @@ def detect_archive_type(file_path):
         return "Unknown"
 
 
+def parse_file_size(size_str):
+    """
+    解析文件大小字符串，返回字节数
+    
+    Args:
+        size_str: 文件大小字符串，格式为 <int><k/m/g/kb/mb/gb>，大小写不敏感
+                 特殊值 "0" 表示不启用大小筛选
+    
+    Returns:
+        int: 字节数，0 表示不启用大小筛选
+    
+    Raises:
+        ValueError: 格式错误时抛出异常
+    """
+    if not size_str:
+        raise ValueError("Size string cannot be empty")
+    
+    size_str = size_str.strip().lower()
+    
+    # 特殊处理：输入为 "0" 时返回 0
+    if size_str == "0":
+        return 0
+    
+    # 定义单位映射（字节数）
+    units = {
+        'k': 1024,
+        'kb': 1024,
+        'm': 1024 * 1024,
+        'mb': 1024 * 1024,
+        'g': 1024 * 1024 * 1024,
+        'gb': 1024 * 1024 * 1024,
+    }
+    
+    # 查找数字部分和单位部分
+    unit_found = None
+    number_str = None
+    
+    for unit, multiplier in units.items():
+        if size_str.endswith(unit):
+            number_str = size_str[:-len(unit)]
+            unit_found = unit
+            break
+    
+    if unit_found is None:
+        raise ValueError(f"Invalid size format: {size_str}. Must include unit (k/m/g/kb/mb/gb) or be '0'")
+    
+    # 解析数字部分
+    try:
+        number = int(number_str)
+        if number < 0:
+            raise ValueError(f"Size cannot be negative: {number}")
+    except ValueError:
+        raise ValueError(f"Invalid number in size string: {number_str}")
+    
+    return number * units[unit_found]
+
+
 def fix_archive_ext(processor, abs_path, args):
     """
     扩展名修复主函数
@@ -2450,6 +2507,17 @@ def fix_archive_ext(processor, abs_path, args):
     
     if VERBOSE:
         print("  DEBUG: 开始扩展名修复预处理...")
+    
+    # 解析文件大小阈值参数
+    try:
+        size_threshold = parse_file_size(args.fix_extension_threshold)
+        if VERBOSE and size_threshold > 0:
+            print(f"  DEBUG: 扩展名修复使用文件大小阈值: {size_threshold} 字节 ({args.fix_extension_threshold})")
+        elif VERBOSE and size_threshold == 0:
+            print(f"  DEBUG: 扩展名修复禁用文件大小筛选")
+    except ValueError as e:
+        print(f"Error: Invalid fix-extension-threshold format: {e}")
+        return
     
     # 解析深度范围参数
     depth_range = None
@@ -2598,6 +2666,17 @@ def fix_archive_ext(processor, abs_path, args):
         check_interrupt()
         
         try:
+            # 文件大小阈值检查
+            if size_threshold > 0:
+                try:
+                    file_size = os.path.getsize(filepath)
+                    if file_size < size_threshold:
+                        # 静默跳过，不输出任何日志
+                        continue
+                except OSError:
+                    # 文件大小获取失败，继续处理（可能是权限问题等）
+                    pass
+            
             archive_type = detect_archive_type(filepath)
             
             if archive_type == "Unknown":
@@ -5682,6 +5761,14 @@ def main():
         '--safe-fix-ext', '-sfe',
         action='store_true',
         help='Enable safe archive extension fix logic. Always appends correct extension without replacing existing one. Requires interactive confirmation.'
+    )
+
+    parser.add_argument(
+        '--fix-extension-threshold', '-fet',
+        default='10mb',
+        help='File size threshold for extension fix. Files smaller than this threshold will be skipped during extension fix process. '
+             'Format: <int><k/m/g/kb/mb/gb> (case insensitive). Examples: "1mb", "500kb", "2g". '
+             'Use "0" to disable size filtering (process all files). Default: 10mb'
     )
 
     args = parser.parse_args()
