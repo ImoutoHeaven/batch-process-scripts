@@ -2582,71 +2582,87 @@ def fix_archive_ext(processor, abs_path, args):
                 continue
             
             should_skip = False
+            is_silent = False
             
-            # 解析文件名和扩展名
-            if not has_valid_extension(filename):
-                # (1.1) 文件没有扩展名
-                # 检查是否存在 {filename}.{anyExt} 的文件
-                for other_file in dir_files:
-                    if other_file != filename and other_file.startswith(filename + '.'):
+            # 文件大小阈值检查
+            if size_threshold > 0:
+                try:
+                    file_size = os.path.getsize(filepath)
+                    if file_size < size_threshold:
                         should_skip = True
-                        if VERBOSE:
-                            print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 存在同名扩展文件 {other_file}")
-                        break
-            else:
-                # 文件有扩展名
-                name_parts = filename.rsplit('.', 1)
-                basename = name_parts[0]
-                file_ext = name_parts[1].lower()
-                
-                # (1.2) 如果扩展名是 exe，跳过
-                if file_ext == 'exe':
-                    should_skip = True
-                    if VERBOSE:
-                        print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - exe文件")
-                elif '.' in basename:
-                    # (1.3) basename 包含 '.'，从右往左分割
-                    basename_parts = basename.rsplit('.', 1)
-                    first_part = basename_parts[0]
-                    last_part = basename_parts[1]
-                    
-                    # 检查冲突文件
-                    conflict_patterns = [
-                        first_part,  # 无扩展名
-                        first_part + '.',  # 前缀匹配任意扩展名
-                        first_part + '.' + last_part,  # 无扩展名
-                        first_part + '.' + last_part + '.'  # 前缀匹配任意扩展名
-                    ]
-                    
+                        is_silent = True
+                        # 静默跳过，不输出任何日志
+                except OSError:
+                    # 文件大小获取失败，继续处理（可能是权限问题等）
+                    pass
+            
+            # 如果已经因为文件大小被跳过，就不需要再检查其他条件了
+            if not should_skip:
+                # 解析文件名和扩展名
+                if not has_valid_extension(filename):
+                    # (1.1) 文件没有扩展名
+                    # 检查是否存在 {filename}.{anyExt} 的文件
                     for other_file in dir_files:
-                        if other_file == filename:
-                            continue
-                        
-                        # 检查是否匹配冲突模式
-                        if (other_file == conflict_patterns[0] or  # {firstPart}
-                            other_file == conflict_patterns[2] or  # {firstPart}.{lastPart}
-                            (other_file.startswith(conflict_patterns[1]) and len(other_file) > len(conflict_patterns[1])) or  # {firstPart}.{anyExt}
-                            (other_file.startswith(conflict_patterns[3]) and len(other_file) > len(conflict_patterns[3]))):  # {firstPart}.{lastPart}.{anyExt}
+                        if other_file != filename and other_file.startswith(filename + '.'):
                             should_skip = True
                             if VERBOSE:
-                                print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 存在冲突文件 {other_file}")
+                                print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 存在同名扩展文件 {other_file}")
                             break
                 else:
-                    # (1.4) basename 不包含 '.'
-                    # 检查是否存在冲突文件
-                    for other_file in dir_files:
-                        if other_file == filename:
-                            continue
+                    # 文件有扩展名
+                    name_parts = filename.rsplit('.', 1)
+                    basename = name_parts[0]
+                    file_ext = name_parts[1].lower()
+                    
+                    # (1.2) 如果扩展名是 exe，跳过
+                    if file_ext == 'exe':
+                        should_skip = True
+                        if VERBOSE:
+                            print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - exe文件")
+                    elif '.' in basename:
+                        # (1.3) basename 包含 '.'，从右往左分割
+                        basename_parts = basename.rsplit('.', 1)
+                        first_part = basename_parts[0]
+                        last_part = basename_parts[1]
                         
-                        if (other_file == basename or  # {filename} 无扩展名
-                            (other_file.startswith(basename + '.') and other_file != filename)):  # {filename}.{anyExt}
-                            should_skip = True
-                            if VERBOSE:
-                                print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 存在冲突文件 {other_file}")
-                            break
+                        # 检查冲突文件
+                        conflict_patterns = [
+                            first_part,  # 无扩展名
+                            first_part + '.',  # 前缀匹配任意扩展名
+                            first_part + '.' + last_part,  # 无扩展名
+                            first_part + '.' + last_part + '.'  # 前缀匹配任意扩展名
+                        ]
+                        
+                        for other_file in dir_files:
+                            if other_file == filename:
+                                continue
+                            
+                            # 检查是否匹配冲突模式
+                            if (other_file == conflict_patterns[0] or  # {firstPart}
+                                other_file == conflict_patterns[2] or  # {firstPart}.{lastPart}
+                                (other_file.startswith(conflict_patterns[1]) and len(other_file) > len(conflict_patterns[1])) or  # {firstPart}.{anyExt}
+                                (other_file.startswith(conflict_patterns[3]) and len(other_file) > len(conflict_patterns[3]))):  # {firstPart}.{lastPart}.{anyExt}
+                                should_skip = True
+                                if VERBOSE:
+                                    print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 存在冲突文件 {other_file}")
+                                break
+                    else:
+                        # (1.4) basename 不包含 '.'
+                        # 检查是否存在冲突文件
+                        for other_file in dir_files:
+                            if other_file == filename:
+                                continue
+                            
+                            if (other_file == basename or  # {filename} 无扩展名
+                                (other_file.startswith(basename + '.') and other_file != filename)):  # {filename}.{anyExt}
+                                should_skip = True
+                                if VERBOSE:
+                                    print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 存在冲突文件 {other_file}")
+                                break
             
             if should_skip:
-                processor.skipped_rename_archives.append(filepath)
+                if not is_silent:
+                    processor.skipped_rename_archives.append(filepath)
             else:
                 files_to_process.append(filepath)
                 
@@ -2666,23 +2682,10 @@ def fix_archive_ext(processor, abs_path, args):
         check_interrupt()
         
         try:
-            # 文件大小阈值检查
-            if size_threshold > 0:
-                try:
-                    file_size = os.path.getsize(filepath)
-                    if file_size < size_threshold:
-                        # 静默跳过，不输出任何日志
-                        continue
-                except OSError:
-                    # 文件大小获取失败，继续处理（可能是权限问题等）
-                    pass
-            
             archive_type = detect_archive_type(filepath)
             
             if archive_type == "Unknown":
-                if VERBOSE:
-                    print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 未知文件类型")
-                final_skipped.append((filepath, "未知文件类型"))
+                # 静默跳过非归档文件，不输出任何日志，不记录到跳过列表
                 continue
             
             # 确定目标扩展名
@@ -2693,9 +2696,7 @@ def fix_archive_ext(processor, abs_path, args):
             elif archive_type == "7Z":
                 target_ext = "7z"
             else:
-                if VERBOSE:
-                    print(f"  DEBUG: skip-rename-archives: 跳过 {filepath} - 不支持的归档类型 {archive_type}")
-                final_skipped.append((filepath, f"不支持的归档类型 {archive_type}"))
+                # 静默跳过非归档文件，不输出任何日志，不记录到跳过列表
                 continue
             
             # 计划重命名
