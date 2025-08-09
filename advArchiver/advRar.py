@@ -801,15 +801,16 @@ def profile_type(value):
         return value
 
     # 支持多种分卷单位格式：g/gb/m/mb/k/kb（不区分大小写）
-    match = re.match(r'^parted-(\d+)(g|gb|m|mb|k|kb)$', value, re.IGNORECASE)
+    # 新增：best-XX<unit> 表示使用 best 参数并进行分卷
+    match = re.match(r'^(parted|best)-(\d+)(g|gb|m|mb|k|kb)$', value, re.IGNORECASE)
     if match:
-        size = int(match.group(1))
-        unit = match.group(2).lower()
+        size = int(match.group(2))
+        unit = match.group(3).lower()
         if size > 0:
             return value
 
     raise argparse.ArgumentTypeError(
-        f"'{value}' 不是一个有效的配置。请选择 'store', 'best', 'fastest', 或者 'parted-XXunit' (例如: 'parted-10g', 'parted-100mb', 'parted-500k')。"
+        f"'{value}' 不是一个有效的配置。请选择 'store', 'best', 'fastest', 或 'parted-XXunit' / 'best-XXunit' (例如: 'parted-10g', 'best-10g', 'parted-100mb', 'best-500k')。"
     )
 
 
@@ -825,7 +826,7 @@ def parse_arguments():
         '--profile',
         type=profile_type,
         default='best',
-        help="压缩配置文件: 'store', 'best', 'fastest', 或 'parted-XXunit' (例如: 'parted-10g', 'parted-100mb', 'parted-500k')"
+        help="压缩配置文件: 'store', 'best', 'fastest', 'parted-XXunit' 或 'best-XXunit' (例如: 'parted-10g', 'best-10g', 'parted-100mb', 'best-500k')"
     )
     parser.add_argument('--debug', action='store_true', help='显示调试信息')
     parser.add_argument('--no-lock', action='store_true', help='不使用全局锁（谨慎使用）')
@@ -1092,20 +1093,31 @@ def build_rar_switches(profile, password, delete_files=False):
     if delete_files:
         switches.append('-df')
 
-    # profile 逻辑（与旧实现一致）
-    if profile.startswith('parted-') or profile == 'store':
+    # 显式分支：store / fastest / parted-XXunit / best-XXunit / best
+    if profile == 'store':
         switches.extend([
             '-m0', '-md32m', '-s-', '-htb', '-qo+', '-oi:1', '-rr5p', '-ma5'
         ])
-        if profile.startswith('parted-'):
-            match = re.match(r'^parted-(\d+)(g|gb|m|mb|k|kb)$', profile, re.IGNORECASE)
-            if match:
-                size, unit = match.groups()
-                switches.append(f'-v{normalize_volume_size(size, unit)}')
     elif profile == 'fastest':
         switches.extend([
             '-m1', '-md256m', '-s-', '-htb', '-qo+', '-oi:1', '-rr5p', '-ma5'
         ])
+    elif profile.startswith('parted-'):
+        switches.extend([
+            '-m0', '-md32m', '-s-', '-htb', '-qo+', '-oi:1', '-rr5p', '-ma5'
+        ])
+        match = re.match(r'^parted-(\d+)(g|gb|m|mb|k|kb)$', profile, re.IGNORECASE)
+        if match:
+            size, unit = match.groups()
+            switches.append(f'-v{normalize_volume_size(size, unit)}')
+    elif profile.startswith('best-'):
+        switches.extend([
+            '-m5', '-md256m', '-s', '-htb', '-qo+', '-oi:1', '-rr5p', '-ma5'
+        ])
+        match = re.match(r'^best-(\d+)(g|gb|m|mb|k|kb)$', profile, re.IGNORECASE)
+        if match:
+            size, unit = match.groups()
+            switches.append(f'-v{normalize_volume_size(size, unit)}')
     else:  # best
         switches.extend([
             '-m5', '-md256m', '-s', '-htb', '-qo+', '-oi:1', '-rr5p', '-ma5'

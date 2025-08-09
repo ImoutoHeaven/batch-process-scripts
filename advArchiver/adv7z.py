@@ -1083,21 +1083,22 @@ def profile_type(value):
         return value
 
     # 支持多种分卷单位格式：g/gb/m/mb/k/kb（不区分大小写）
-    match = re.match(r'^parted-(\d+)(g|gb|m|mb|k|kb)$', value, re.IGNORECASE)
+    # 新增：best-XX<unit> 表示使用 best 参数并进行分卷
+    match = re.match(r'^(parted|best)-(\d+)(g|gb|m|mb|k|kb)$', value, re.IGNORECASE)
     if match:
-        size = int(match.group(1))
-        unit = match.group(2).lower()
+        size = int(match.group(2))
+        unit = match.group(3).lower()
         if size > 0:
             return value
 
     raise argparse.ArgumentTypeError(
-        f"'{value}' 不是一个有效的配置。请选择 'store', 'best', 'fastest', 或者 'parted-XXunit' (例如: 'parted-10g', 'parted-100mb', 'parted-500k')。"
+        f"'{value}' 不是一个有效的配置。请选择 'store', 'best', 'fastest', 或 'parted-XXunit' / 'best-XXunit' (例如: 'parted-10g', 'best-10g', 'parted-100mb', 'best-500k')。"
     )
 
 
 def is_parted_profile(profile):
     """检查profile是否为分卷模式"""
-    return profile.startswith('parted-')
+    return profile.startswith('parted-') or profile.startswith('best-')
 
 
 def parse_arguments():
@@ -1121,7 +1122,7 @@ def parse_arguments():
         '--profile',
         type=profile_type,
         default='best',
-        help="压缩配置文件: 'store', 'best', 'fastest', 或 'parted-XXunit' (例如: 'parted-10g')"
+        help="压缩配置文件: 'store', 'best', 'fastest', 'parted-XXunit' 或 'best-XXunit' (例如: 'parted-10g', 'best-10g')"
     )
     parser.add_argument('--debug', action='store_true', help='显示调试信息')
     parser.add_argument('--no-lock', action='store_true', help='不使用全局锁（谨慎使用）')
@@ -1325,21 +1326,12 @@ def build_7z_switches(profile, password, delete_files=False):
     if delete_files:
         switches.append('-sdel')
 
-    # 处理 'store' 和 'parted-XXunit' 配置
-    if profile.startswith('parted-') or profile == 'store':
+    # 显式分支：store / fastest / parted-XXunit / best-XXunit / best
+    if profile == 'store':
         switches.extend([
-            '-m0=Copy',  # 仅存储，不压缩
-            '-ms=off',  # 不使用固实压缩
+            '-m0=Copy',
+            '-ms=off',
         ])
-        # 如果是分卷模式，添加分卷大小参数
-        if profile.startswith('parted-'):
-            # 支持多种单位格式：g/gb/m/mb/k/kb
-            match = re.match(r'^parted-(\d+)(g|gb|m|mb|k|kb)$', profile, re.IGNORECASE)
-            if match:
-                size = match.group(1)
-                unit = match.group(2)
-                volume_size = normalize_volume_size(size, unit)
-                switches.append(f'-v{volume_size}')
 
     # 处理 'fastest' 配置
     elif profile == 'fastest':
@@ -1348,6 +1340,31 @@ def build_7z_switches(profile, password, delete_files=False):
             '-ms=off',  # 不使用固实压缩
             '-md=256m',  # 大字典：256MB
         ])
+
+    elif profile.startswith('parted-'):
+        switches.extend([
+            '-m0=Copy',  # 仅存储，不压缩
+            '-ms=off',  # 不使用固实压缩
+        ])
+        match = re.match(r'^parted-(\d+)(g|gb|m|mb|k|kb)$', profile, re.IGNORECASE)
+        if match:
+            size = match.group(1)
+            unit = match.group(2)
+            volume_size = normalize_volume_size(size, unit)
+            switches.append(f'-v{volume_size}')
+
+    elif profile.startswith('best-'):
+        switches.extend([
+            '-mx=9',  # 最佳压缩级别
+            '-ms=on',  # 使用固实压缩
+            '-md=256m',  # 大字典：256MB
+        ])
+        match = re.match(r'^best-(\d+)(g|gb|m|mb|k|kb)$', profile, re.IGNORECASE)
+        if match:
+            size = match.group(1)
+            unit = match.group(2)
+            volume_size = normalize_volume_size(size, unit)
+            switches.append(f'-v{volume_size}')
 
     # 处理 'best' 配置
     else:  # best
