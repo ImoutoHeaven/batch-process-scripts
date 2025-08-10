@@ -24,6 +24,103 @@ try:
 except ImportError:
     psutil = None
 
+# ---------------------- 控制台编码处理 ----------------------
+def init_console_encoding():
+    """初始化控制台编码，在Windows上设置UTF-8编码以避免GBK编码错误"""
+    if platform.system() == "Windows":
+        try:
+            # 设置控制台代码页为UTF-8
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleOutputCP(65001)  # UTF-8
+            kernel32.SetConsoleCP(65001)        # UTF-8
+            print("[控制台已设置为UTF-8模式]")
+        except Exception as e:
+            if debug_mode:
+                print(f"[DEBUG] 设置控制台编码失败: {e}")
+            # Fallback: 通过subprocess调用chcp命令
+            try:
+                subprocess.run("chcp 65001 >nul 2>&1", shell=True, check=True)
+                print("[控制台已设置为UTF-8模式]")
+            except Exception as e2:
+                if debug_mode:
+                    print(f"[DEBUG] Fallback设置编码也失败: {e2}")
+                print("[警告] 无法设置UTF-8编码，可能出现显示问题")
+    
+    # 设置Python stdout/stderr的错误处理模式
+    try:
+        import codecs
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(errors='replace')
+            sys.stderr.reconfigure(errors='replace')
+    except Exception as e:
+        if debug_mode:
+            print(f"[DEBUG] 设置stdout错误处理失败: {e}")
+
+def safe_print(*args, **kwargs):
+    """安全打印函数，处理编码错误"""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        # 使用UTF-8编码，如果失败则使用replace模式
+        try:
+            message = ' '.join(str(arg) for arg in args)
+            encoded = message.encode('utf-8', errors='replace').decode('utf-8')
+            print(encoded, **kwargs)
+        except Exception:
+            # 最后的fallback：转为ASCII
+            try:
+                message = ' '.join(str(arg) for arg in args)
+                ascii_message = message.encode('ascii', errors='replace').decode('ascii')
+                print(ascii_message, **kwargs)
+            except Exception:
+                print("[输出编码错误]", **kwargs)
+
+def safe_write(text, file=None):
+    """安全写入函数，处理编码错误"""
+    if file is None:
+        file = sys.stdout
+    
+    try:
+        file.write(text)
+        file.flush()
+    except UnicodeEncodeError:
+        # 尝试不同的编码策略
+        try:
+            encoded = text.encode('utf-8', errors='replace').decode('utf-8')
+            file.write(encoded)
+            file.flush()
+        except Exception:
+            try:
+                ascii_text = text.encode('ascii', errors='replace').decode('ascii')
+                file.write(ascii_text)
+                file.flush()
+            except Exception:
+                file.write("[编码错误]\n")
+                file.flush()
+
+def get_safe_status_icons():
+    """获取安全的状态图标，如果Unicode不可用则使用ASCII fallback"""
+    try:
+        # 尝试输出Unicode字符到测试缓冲区
+        import io
+        test_buffer = io.StringIO()
+        test_icons = {"completed": "✓", "running": "▶", "failed": "✗", 
+                     "paused": "⏸", "inqueue": "⏳"}
+        
+        for icon in test_icons.values():
+            test_buffer.write(icon)
+        
+        # 如果没有异常，返回Unicode图标
+        return test_icons
+    except (UnicodeError, UnicodeEncodeError):
+        # 如果Unicode不可用，返回ASCII fallback
+        return {"completed": "[OK]", "running": "[>]", "failed": "[X]", 
+               "paused": "[||]", "inqueue": "[..]"}
+
+# 全局状态图标
+status_icons = get_safe_status_icons()
+
 # ---------------------- 命令状态 & 全局变量 ----------------------
 class CommandStatus:
     INQUEUE   = "INQUEUE"    # 等待执行
@@ -152,7 +249,7 @@ def terminate_process(process, cmd_states=None):
     if cmd_states is not None:
         cmd_states['pid'] = pid
     if debug_mode:
-        print(f"[DEBUG] 终止进程 {pid}")
+        safe_print(f"[DEBUG] 终止进程 {pid}")
 
     try:
         if platform.system() == "Windows":
@@ -170,7 +267,7 @@ def terminate_process(process, cmd_states=None):
                         stderr=subprocess.DEVNULL, timeout=5)
             except Exception as e:
                 if debug_mode:
-                    print(f"[DEBUG] Windows 终止进程异常: {e}")
+                    safe_print(f"[DEBUG] Windows 终止进程异常: {e}")
         else:
             # Unix：杀进程组
             try:
@@ -181,7 +278,7 @@ def terminate_process(process, cmd_states=None):
                     os.killpg(pgid, signal.SIGKILL)
             except Exception as e:
                 if debug_mode:
-                    print(f"[DEBUG] Unix 终止进程组异常: {e}")
+                    safe_print(f"[DEBUG] Unix 终止进程组异常: {e}")
                 try:
                     os.kill(pid, signal.SIGTERM)
                     time.sleep(0.5)
@@ -194,14 +291,14 @@ def terminate_process(process, cmd_states=None):
 
 def terminate_all_processes():
     """终止所有 RUNNING 的进程"""
-    print("\n[正在终止所有进程...]")
+    safe_print("\n[正在终止所有进程...]")
     terminated = 0
     with command_lock:
         for st in command_states.values():
             if st["status"] == CommandStatus.RUNNING and st["process"]:
                 terminate_process(st["process"], cmd_states=st)
                 terminated += 1
-    print(f"[已终止 {terminated} 个进程]")
+    safe_print(f"[已终止 {terminated} 个进程]")
 
 def format_command_list(cmds):
     out = ["\n--- 命令列表 ---"]
@@ -259,13 +356,13 @@ def format_command_status():
                 # 计算块状态
                 block_statuses = [command_states[idx]["status"] for idx in cmd_indices]
                 if all(st == CommandStatus.COMPLETED for st in block_statuses):
-                    block_status = "✓ 已完成"
+                    block_status = f"{status_icons['completed']} 已完成"
                 elif any(st == CommandStatus.RUNNING for st in block_statuses):
-                    block_status = "▶ 执行中"
+                    block_status = f"{status_icons['running']} 执行中"
                 elif any(st == CommandStatus.FAILED for st in block_statuses):
-                    block_status = "✗ 失败"
+                    block_status = f"{status_icons['failed']} 失败"
                 else:
-                    block_status = "⏳ 等待"
+                    block_status = f"{status_icons['inqueue']} 等待"
                 
                 prev_marker = " (需前块成功)" if require_prev else ""
                 cmd_list = ",".join(str(idx+1) for idx in cmd_indices)
@@ -274,11 +371,11 @@ def format_command_status():
         
         # 显示各状态的命令详情
         status_display_order = [
-            (CommandStatus.RUNNING, "▶ RUNNING"),
-            (CommandStatus.COMPLETED, "✓ SUCCEEDED"), 
-            (CommandStatus.FAILED, "✗ FAILED"),
-            (CommandStatus.PAUSED, "⏸ PAUSED"),
-            (CommandStatus.INQUEUE, "⏳ INQUEUE")
+            (CommandStatus.RUNNING, f"{status_icons['running']} RUNNING"),
+            (CommandStatus.COMPLETED, f"{status_icons['completed']} SUCCEEDED"), 
+            (CommandStatus.FAILED, f"{status_icons['failed']} FAILED"),
+            (CommandStatus.PAUSED, f"{status_icons['paused']} PAUSED"),
+            (CommandStatus.INQUEUE, f"{status_icons['inqueue']} INQUEUE")
         ]
         
         for status, display_name in status_display_order:
@@ -297,10 +394,16 @@ def format_command_status():
                     dur = f"[{h:02d}:{m:02d}:{s:02d}]"
                 
                 # 状态图标
-                status_icon = "✓" if status == CommandStatus.COMPLETED else \
-                             "▶" if status == CommandStatus.RUNNING else \
-                             "✗" if status == CommandStatus.FAILED else \
-                             "⏸" if status == CommandStatus.PAUSED else "⏳"
+                if status == CommandStatus.COMPLETED:
+                    status_icon = status_icons['completed']
+                elif status == CommandStatus.RUNNING:
+                    status_icon = status_icons['running']
+                elif status == CommandStatus.FAILED:
+                    status_icon = status_icons['failed']
+                elif status == CommandStatus.PAUSED:
+                    status_icon = status_icons['paused']
+                else:
+                    status_icon = status_icons['inqueue']
                 
                 # 重试信息
                 retry = f" (重试:{st['retry_count']})" if st["retry_count"] else ""
@@ -330,18 +433,18 @@ def input_listener():
             input_queue.put(user_input)
 
             if user_input == "exit":
-                print("\n[停止所有命令并退出]")
+                safe_print("\n[停止所有命令并退出]")
                 stop_event.set()
                 terminate_all_processes()
                 break
             elif user_input == "status":
-                print(format_command_status())
+                safe_print(format_command_status())
             elif user_input.startswith(("pause", "resume")):
                 _handle_pause_resume(user_input)
             elif user_input == "debug":
                 global debug_mode
                 debug_mode = not debug_mode
-                print(f"\n[调试模式: {'启用' if debug_mode else '关闭'}]")
+                safe_print(f"\n[调试模式: {'启用' if debug_mode else '关闭'}]")
         except EOFError:
             break
         except KeyboardInterrupt:
@@ -350,7 +453,7 @@ def input_listener():
             break
         except Exception as e:
             if not keyboard_interrupt_flag.is_set():
-                print(f"输入监听器错误: {e}")
+                safe_print(f"输入监听器错误: {e}")
 
 def _handle_pause_resume(cmd_str):
     parts = cmd_str.split()
@@ -358,7 +461,7 @@ def _handle_pause_resume(cmd_str):
     target_id = int(parts[1]) - 1 if len(parts) > 1 and parts[1].isdigit() else None
     with command_lock:
         if target_id is not None and target_id not in command_states:
-            print(f"\n[命令 {target_id+1} 不存在]")
+            safe_print(f"\n[命令 {target_id+1} 不存在]")
             return
     if action == "pause":
         if target_id is None:
@@ -378,18 +481,18 @@ def _pause_cmd(cmd_id):
             st["status"] = CommandStatus.PAUSED
             if st["process"]:
                 terminate_process(st["process"], cmd_states=st)
-            print(f"\n[命令 {cmd_id+1} 已暂停]")
+            safe_print(f"\n[命令 {cmd_id+1} 已暂停]")
         else:
-            print(f"\n[命令 {cmd_id+1} 不在运行，无法暂停]")
+            safe_print(f"\n[命令 {cmd_id+1} 不在运行，无法暂停]")
 
 def _resume_cmd(cmd_id):
     with command_lock:
         st = command_states[cmd_id]
         if st["status"] == CommandStatus.PAUSED:
             st["status"] = CommandStatus.INQUEUE
-            print(f"\n[命令 {cmd_id+1} 已恢复]")
+            safe_print(f"\n[命令 {cmd_id+1} 已恢复]")
         else:
-            print(f"\n[命令 {cmd_id+1} 未暂停]")
+            safe_print(f"\n[命令 {cmd_id+1} 未暂停]")
 
 def _pause_all():
     cnt = 0
@@ -400,7 +503,7 @@ def _pause_all():
                 if st["process"]:
                     terminate_process(st["process"], cmd_states=st)
                 cnt += 1
-    print(f"\n[已暂停 {cnt} 个命令]")
+    safe_print(f"\n[已暂停 {cnt} 个命令]")
 
 def _resume_all():
     cnt = 0
@@ -409,14 +512,14 @@ def _resume_all():
             if st["status"] == CommandStatus.PAUSED:
                 st["status"] = CommandStatus.INQUEUE
                 cnt += 1
-    print(f"\n[已恢复 {cnt} 个命令]")
+    safe_print(f"\n[已恢复 {cnt} 个命令]")
 
 # ---------------------- 状态定期打印线程 ----------------------
 def status_updater(interval):
     while not stop_event.is_set() and not keyboard_interrupt_flag.is_set():
         time.sleep(interval)
         if not stop_event.is_set() and not keyboard_interrupt_flag.is_set():
-            print(format_command_status())
+            safe_print(format_command_status())
 
 # ---------------------- 核心：执行单条指令 ----------------------
 def execute_command(cmd_id, cmd, total_retries):
@@ -450,7 +553,7 @@ def execute_command(cmd_id, cmd, total_retries):
                 st["start_time"] = datetime.datetime.now()
 
         if retry:
-            print(f"{prefix}重试 ({retry}/{total_retries})")
+            safe_print(f"{prefix}重试 ({retry}/{total_retries})")
 
         # 启动子进程
         popen_kwargs = {
@@ -459,37 +562,68 @@ def execute_command(cmd_id, cmd, total_retries):
             "stderr": subprocess.STDOUT,
             "bufsize": 1
         }
-        if platform.system() != "Windows":
-            popen_kwargs["preexec_fn"] = os.setsid
-        else:
+        
+        # 设置子进程环境变量，确保使用UTF-8编码
+        env = os.environ.copy()
+        if platform.system() == "Windows":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            # Windows: 设置环境变量强制使用UTF-8
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONLEGACYWINDOWSSTDIO"] = "1"
+        else:
+            popen_kwargs["preexec_fn"] = os.setsid
+            # Unix: 确保UTF-8 locale
+            env["LC_ALL"] = "C.UTF-8"
+            env["LANG"] = "C.UTF-8"
+        
+        popen_kwargs["env"] = env
         process = subprocess.Popen(cmd, **popen_kwargs)
 
         with command_lock:
             st["process"] = process
             st["pid"] = process.pid
             if debug_mode:
-                print(f"{prefix}[DEBUG] PID={process.pid}")
+                safe_print(f"{prefix}[DEBUG] PID={process.pid}")
 
         # 实时读取输出
+        encoding_errors = 0  # 计数编码错误，避免误判
         try:
             while True:
                 if stop_event.is_set() or keyboard_interrupt_flag.is_set():
                     break
                 with command_lock:
                     if st["status"] == CommandStatus.PAUSED:
-                        print(f"{prefix}被暂停，稍后重启")
+                        safe_print(f"{prefix}被暂停，稍后重启")
                         break
-                line = process.stdout.readline()
-                if not line and process.poll() is not None:
+                
+                try:
+                    line = process.stdout.readline()
+                    if not line and process.poll() is not None:
+                        break
+                    if line:
+                        safe_write(f"{prefix}{line.decode(errors='replace')}")
+                except UnicodeDecodeError as e:
+                    # 子进程输出解码错误，不影响命令执行状态
+                    encoding_errors += 1
+                    if debug_mode:
+                        safe_print(f"{prefix}[DEBUG] 输出解码错误: {e}")
+                    safe_write(f"{prefix}[输出包含无法解码的字符]\n")
+                except Exception as e:
+                    # 其他读取错误
+                    if debug_mode:
+                        safe_print(f"{prefix}[DEBUG] 读取输出异常: {e}")
                     break
-                if line:
-                    sys.stdout.write(f"{prefix}{line.decode(errors='replace')}")
-                    sys.stdout.flush()
                 else:
-                    time.sleep(0.05)
+                    if not line:
+                        time.sleep(0.05)
         except KeyboardInterrupt:
             pass
+        except Exception as e:
+            if debug_mode:
+                safe_print(f"{prefix}[DEBUG] 输出监听异常: {e}")
+        
+        if encoding_errors > 0 and debug_mode:
+            safe_print(f"{prefix}[DEBUG] 共遇到 {encoding_errors} 个编码错误（不影响命令执行状态）")
 
         # 若因暂停跳出，则重启循环
         with command_lock:
@@ -506,13 +640,13 @@ def execute_command(cmd_id, cmd, total_retries):
             st["process"] = None
 
         if rc == 0:
-            print(f"{prefix}成功")
+            safe_print(f"{prefix}成功")
             with command_lock:
                 st["status"] = CommandStatus.COMPLETED
                 st["end_time"] = datetime.datetime.now()
             return True
         else:
-            print(f"{prefix}失败，退出码 {rc}")
+            safe_print(f"{prefix}失败，退出码 {rc}")
             retry += 1
             with command_lock:
                 st["retry_count"] = retry
@@ -533,12 +667,12 @@ def run_sequence_blocks(blocks, commands, total_retries):
         if stop_event.is_set() or keyboard_interrupt_flag.is_set():
             break
         if blk["require_prev_success"] and not prev_success:
-            print(f"\n[跳过后续逻辑块 {i}，因前一块执行失败]")
+            safe_print(f"\n[跳过后续逻辑块 {i}，因前一块执行失败]")
             break
 
         cmd_indices = blk["cmds"]
         idx_str = ','.join(str(x+1) for x in cmd_indices)
-        print(f"\n[逻辑块 {i}: 执行指令 {idx_str}]")
+        safe_print(f"\n[逻辑块 {i}: 执行指令 {idx_str}]")
 
         with ThreadPoolExecutor(max_workers=len(cmd_indices)) as exe:
             futures = [
@@ -569,7 +703,7 @@ def run_sequence_blocks(blocks, commands, total_retries):
 
 # ---------------------- 主程序 ----------------------
 def signal_handler(sig, frame):
-    print("\n\n[收到 Ctrl+C，正在退出...]")
+    safe_print("\n\n[收到 Ctrl+C，正在退出...]")
     keyboard_interrupt_flag.set()
     stop_event.set()
     terminate_all_processes()
@@ -582,9 +716,12 @@ def main():
     args = parse_args()
     global debug_mode
     debug_mode = args.debug
+    
+    # 初始化控制台编码
+    init_console_encoding()
 
     # 收集命令
-    print("输入命令（每行一条），两次回车结束：")
+    safe_print("输入命令（每行一条），两次回车结束：")
     commands = []
     try:
         while True:
@@ -593,11 +730,11 @@ def main():
                 break
             commands.append(line)
     except KeyboardInterrupt:
-        print("\n输入被中断，退出")
+        safe_print("\n输入被中断，退出")
         sys.exit(1)
 
     if not commands:
-        print("未输入有效命令，退出")
+        safe_print("未输入有效命令，退出")
         return
 
     # 初始化 command_states
@@ -608,7 +745,7 @@ def main():
             "start_time": None, "end_time": None, "pid": None
         }
 
-    print(format_command_list(commands))
+    safe_print(format_command_list(commands))
 
     # 启动后台线程
     threading.Thread(target=input_listener, daemon=True).start()
@@ -624,10 +761,10 @@ def main():
                     args.sequence, len(commands))
                 logical_blocks = blocks
             except SequenceParseError as e:
-                print(f"[sequence 解析错误] {e}")
+                safe_print(f"[sequence 解析错误] {e}")
                 sys.exit(1)
             if debug_mode:
-                print("[DEBUG] 解析后的逻辑块：", blocks)
+                safe_print("[DEBUG] 解析后的逻辑块：", blocks)
             run_sequence_blocks(blocks, commands, args.total_retries)
         else:
             # 原先的“最大并发”模式
@@ -650,13 +787,13 @@ def main():
         stop_event.set()
 
     # 总结结果
-    print(format_command_status())
+    safe_print(format_command_status())
     with command_lock:
         succ = sum(st["status"] == CommandStatus.COMPLETED
                    for st in command_states.values())
         fail = sum(st["status"] == CommandStatus.FAILED
                    for st in command_states.values())
-    print(f"\n执行结束：成功 {succ}/{len(commands)}，失败 {fail}/{len(commands)}")
+    safe_print(f"\n执行结束：成功 {succ}/{len(commands)}，失败 {fail}/{len(commands)}")
 
 if __name__ == "__main__":
     main()
