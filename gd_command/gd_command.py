@@ -121,8 +121,9 @@ def parse_size_to_bytes(size_str: str) -> int:
 
 def extract_transferred_amount(line: str) -> Optional[str]:
     """Extract the transferred amount from Transferred line."""
-    # Updated regex to handle various formats including "0 B"
-    match = re.search(r'Transferred:\s+([0-9.]+\s*[A-Za-z]*)', line)
+    # Only match lines with storage units (B, KiB, MiB, GiB, TiB, etc.)
+    # This excludes file count lines like "Transferred:            4 / 702, 1%"
+    match = re.search(r'Transferred:\s+([0-9.]+\s*(?:B|KiB|MiB|GiB|TiB|PiB|KB|MB|GB|TB|PB))\s*/', line)
     if match:
         return match.group(1).strip()
     return None
@@ -185,6 +186,7 @@ def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0, trans
         
         line_buffer = b''
         current_line = ''
+        last_debug_time = 0  # Track last debug output time
         
         while True:
             byte = process.stdout.read(1)
@@ -216,11 +218,18 @@ def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0, trans
                                 # Calculate daily transferred amount using tracker
                                 if transfer_tracker:
                                     daily_bytes = transfer_tracker.get_daily_transferred(current_bytes)
-                                    print(f"DEBUG: rclone total '{transferred_str}' = {current_bytes} bytes, daily = {daily_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
                                     check_bytes = daily_bytes
                                 else:
-                                    print(f"DEBUG: Transferred '{transferred_str}' = {current_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
                                     check_bytes = current_bytes
+                                
+                                # Print debug info every 5 seconds
+                                current_time = time.time()
+                                if current_time - last_debug_time >= 5:
+                                    if transfer_tracker:
+                                        print(f"DEBUG: rclone total '{transferred_str}' = {current_bytes} bytes, daily = {daily_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
+                                    else:
+                                        print(f"DEBUG: Transferred '{transferred_str}' = {current_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
+                                    last_debug_time = current_time
                                 
                                 if check_bytes >= max_transfer_bytes:
                                     if transfer_tracker:
@@ -247,7 +256,7 @@ def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0, trans
                         sys.stdout.write(line)
                         sys.stdout.flush()
                         
-                        # Check transfer limit
+                        # Check transfer limit (but don't print debug for \r updates)
                         if max_transfer_bytes > 0:
                             transferred_str = extract_transferred_amount(line)
                             if transferred_str:
@@ -256,10 +265,8 @@ def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0, trans
                                 # Calculate daily transferred amount using tracker
                                 if transfer_tracker:
                                     daily_bytes = transfer_tracker.get_daily_transferred(current_bytes)
-                                    print(f"\nDEBUG: rclone total '{transferred_str}' = {current_bytes} bytes, daily = {daily_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
                                     check_bytes = daily_bytes
                                 else:
-                                    print(f"\nDEBUG: Transferred '{transferred_str}' = {current_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
                                     check_bytes = current_bytes
                                 
                                 if check_bytes >= max_transfer_bytes:
