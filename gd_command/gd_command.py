@@ -18,6 +18,41 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 
 
+class TransferTracker:
+    """Tracks daily transfer amounts within UTC date windows."""
+    
+    def __init__(self):
+        self.current_utc_date = None
+        self.daily_baseline = 0
+    
+    def get_daily_transferred(self, current_transferred_bytes: int) -> int:
+        """
+        Calculate actual daily transferred amount, handling UTC date changes.
+        Returns the amount transferred within the current UTC date window.
+        """
+        today_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        
+        if self.current_utc_date is None:
+            # First initialization
+            self.current_utc_date = today_utc
+            self.daily_baseline = current_transferred_bytes
+            print(f"DEBUG: Initialized transfer tracker for UTC date {today_utc}, baseline = {current_transferred_bytes} bytes", file=sys.stderr)
+            return 0  # No transfer counted yet on first initialization
+        
+        if self.current_utc_date != today_utc:
+            # Detected UTC date change (crossed UTC 00:00)
+            print(f"DEBUG: Detected UTC date change: {self.current_utc_date} -> {today_utc}", file=sys.stderr)
+            print(f"DEBUG: Resetting daily transfer tracking, new baseline = {current_transferred_bytes} bytes", file=sys.stderr)
+            
+            self.current_utc_date = today_utc
+            self.daily_baseline = current_transferred_bytes
+            return 0  # Reset to 0 for new day
+        
+        # Calculate daily transferred amount
+        daily_transferred = current_transferred_bytes - self.daily_baseline
+        return max(0, daily_transferred)  # Ensure non-negative
+
+
 def setup_utf8_encoding():
     """Set up UTF-8 encoding for different platforms and shells."""
     system = platform.system().lower()
@@ -132,7 +167,7 @@ def calculate_seconds_until_utc_midnight() -> int:
     return int(seconds_until)
 
 
-def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0) -> tuple[int, bool]:
+def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0, transfer_tracker: TransferTracker = None) -> tuple[int, bool]:
     """
     Run command and monitor its output with optional transfer limit.
     Returns (exit_code, was_terminated_by_limit).
@@ -177,9 +212,21 @@ def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0) -> tu
                             transferred_str = extract_transferred_amount(line)
                             if transferred_str:
                                 current_bytes = parse_size_to_bytes(transferred_str)
-                                print(f"DEBUG: Transferred '{transferred_str}' = {current_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
-                                if current_bytes >= max_transfer_bytes:
-                                    print(f"\nMax transfer limit reached: {transferred_str}")
+                                
+                                # Calculate daily transferred amount using tracker
+                                if transfer_tracker:
+                                    daily_bytes = transfer_tracker.get_daily_transferred(current_bytes)
+                                    print(f"DEBUG: rclone total '{transferred_str}' = {current_bytes} bytes, daily = {daily_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
+                                    check_bytes = daily_bytes
+                                else:
+                                    print(f"DEBUG: Transferred '{transferred_str}' = {current_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
+                                    check_bytes = current_bytes
+                                
+                                if check_bytes >= max_transfer_bytes:
+                                    if transfer_tracker:
+                                        print(f"\nDaily transfer limit reached: {daily_bytes} bytes")
+                                    else:
+                                        print(f"\nMax transfer limit reached: {transferred_str}")
                                     process.terminate()
                                     return 1, True  # Terminated by limit
                     else:
@@ -205,9 +252,21 @@ def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0) -> tu
                             transferred_str = extract_transferred_amount(line)
                             if transferred_str:
                                 current_bytes = parse_size_to_bytes(transferred_str)
-                                print(f"\nDEBUG: Transferred '{transferred_str}' = {current_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
-                                if current_bytes >= max_transfer_bytes:
-                                    print(f"\nMax transfer limit reached: {transferred_str}")
+                                
+                                # Calculate daily transferred amount using tracker
+                                if transfer_tracker:
+                                    daily_bytes = transfer_tracker.get_daily_transferred(current_bytes)
+                                    print(f"\nDEBUG: rclone total '{transferred_str}' = {current_bytes} bytes, daily = {daily_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
+                                    check_bytes = daily_bytes
+                                else:
+                                    print(f"\nDEBUG: Transferred '{transferred_str}' = {current_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
+                                    check_bytes = current_bytes
+                                
+                                if check_bytes >= max_transfer_bytes:
+                                    if transfer_tracker:
+                                        print(f"\nDaily transfer limit reached: {daily_bytes} bytes")
+                                    else:
+                                        print(f"\nMax transfer limit reached: {transferred_str}")
                                     process.terminate()
                                     return 1, True  # Terminated by limit
                     else:
@@ -256,12 +315,15 @@ def main():
             print(f"Invalid max-transfer value: {args.max_transfer}", file=sys.stderr)
             return 1
     
+    # Initialize transfer tracker for daily limit tracking
+    transfer_tracker = TransferTracker() if max_transfer_bytes > 0 else None
+    
     # Run the command with monitoring in a loop until natural completion
     attempt = 1
     while True:
         print(f"\n=== Attempt {attempt} - Starting at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} ===")
         
-        return_code, was_terminated_by_limit = run_command_with_monitoring(args.shell, max_transfer_bytes)
+        return_code, was_terminated_by_limit = run_command_with_monitoring(args.shell, max_transfer_bytes, transfer_tracker)
         
         if not was_terminated_by_limit:
             # Natural completion (success, error, or user interrupt)
