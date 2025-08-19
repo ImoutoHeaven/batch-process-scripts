@@ -46,7 +46,7 @@ def parse_size_to_bytes(size_str: str) -> int:
     # Remove any extra whitespace
     size_str = size_str.strip()
     
-    # Define conversion factors
+    # Define conversion factors (including both binary and decimal units)
     units = {
         'B': 1,
         'KiB': 1024,
@@ -54,17 +54,26 @@ def parse_size_to_bytes(size_str: str) -> int:
         'GiB': 1024 ** 3,
         'TiB': 1024 ** 4,
         'PiB': 1024 ** 5,
+        'KB': 1000,
+        'MB': 1000 ** 2,
+        'GB': 1000 ** 3,
+        'TB': 1000 ** 4,
+        'PB': 1000 ** 5,
     }
     
-    # Extract number and unit
-    match = re.match(r'([0-9.]+)\s*([A-Za-z]+)', size_str)
+    # Extract number and unit - more flexible regex
+    match = re.match(r'([0-9.]+)\s*([A-Za-z]*)', size_str)
     if not match:
         return 0
     
     try:
         value = float(match.group(1))
-        unit = match.group(2)
+        unit = match.group(2).strip()
         
+        # If no unit specified, assume bytes
+        if not unit:
+            unit = 'B'
+            
         if unit in units:
             return int(value * units[unit])
     except (ValueError, IndexError):
@@ -75,9 +84,10 @@ def parse_size_to_bytes(size_str: str) -> int:
 
 def extract_transferred_amount(line: str) -> Optional[str]:
     """Extract the transferred amount from Transferred line."""
-    match = re.search(r'Transferred:\s+([0-9.]+\s*[A-Za-z]+)', line)
+    # Updated regex to handle various formats including "0 B"
+    match = re.search(r'Transferred:\s+([0-9.]+\s*[A-Za-z]*)', line)
     if match:
-        return match.group(1)
+        return match.group(1).strip()
     return None
 
 
@@ -124,48 +134,27 @@ def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0) -> in
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            bufsize=0
-        )
-        
-        transferred_bytes = 0
-        
-        while True:
-            # Read one byte at a time to ensure real-time output
-            output = process.stdout.read(1)
-            if not output:
-                break
-                
-            # Decode safely
-            char = safe_decode(output)
-            sys.stdout.write(char)
-            sys.stdout.flush()
-            
-            # Check if we have a complete line
-            if char == '\n':
-                # Get the last line from buffer (this is a simplified approach)
-                # In a more robust implementation, we'd maintain a line buffer
-                continue
-        
-        # Alternative approach: read line by line
-        process = subprocess.Popen(
-            command,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
             bufsize=1,
             universal_newlines=False
         )
         
         line_buffer = b''
+        current_line = ''
         
         while True:
             byte = process.stdout.read(1)
             if not byte:
+                # Process finished, handle any remaining buffer
+                if line_buffer.strip():
+                    line = safe_decode(line_buffer.strip())
+                    print(line)
                 break
                 
             line_buffer += byte
             
-            if byte == b'\n' or byte == b'\r':
+            # Handle both \r (carriage return) and \n (newline)
+            if byte == b'\n':
+                # Complete line with newline
                 if line_buffer.strip():
                     line = safe_decode(line_buffer.strip())
                     
@@ -178,12 +167,40 @@ def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0) -> in
                             transferred_str = extract_transferred_amount(line)
                             if transferred_str:
                                 current_bytes = parse_size_to_bytes(transferred_str)
+                                print(f"DEBUG: Transferred '{transferred_str}' = {current_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
                                 if current_bytes >= max_transfer_bytes:
                                     print(f"\nMax transfer limit reached: {transferred_str}")
                                     process.terminate()
                                     return 1
                     else:
                         # Print non-progress lines as-is
+                        print(line)
+                
+                line_buffer = b''
+                
+            elif byte == b'\r':
+                # Handle carriage return (progress updates)
+                if line_buffer.strip():
+                    line = safe_decode(line_buffer.strip())
+                    
+                    # For progress lines, overwrite the current line
+                    if is_progress_line(line):
+                        # Clear current line and print new progress
+                        sys.stdout.write('\r' + ' ' * 100 + '\r')  # Clear line
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                        
+                        # Check transfer limit
+                        if max_transfer_bytes > 0:
+                            transferred_str = extract_transferred_amount(line)
+                            if transferred_str:
+                                current_bytes = parse_size_to_bytes(transferred_str)
+                                print(f"\nDEBUG: Transferred '{transferred_str}' = {current_bytes} bytes, limit = {max_transfer_bytes} bytes", file=sys.stderr)
+                                if current_bytes >= max_transfer_bytes:
+                                    print(f"\nMax transfer limit reached: {transferred_str}")
+                                    process.terminate()
+                                    return 1
+                    else:
                         print(line)
                 
                 line_buffer = b''
