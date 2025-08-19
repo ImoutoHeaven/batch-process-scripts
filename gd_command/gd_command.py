@@ -13,6 +13,8 @@ import sys
 import os
 import re
 import platform
+import time
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 
 
@@ -122,10 +124,18 @@ def safe_decode(data: bytes) -> str:
     return data.decode('utf-8', errors='replace')
 
 
-def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0) -> int:
+def calculate_seconds_until_utc_midnight() -> int:
+    """Calculate seconds until next UTC midnight."""
+    now_utc = datetime.now(timezone.utc)
+    next_midnight = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    seconds_until = (next_midnight - now_utc).total_seconds()
+    return int(seconds_until)
+
+
+def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0) -> tuple[int, bool]:
     """
     Run command and monitor its output with optional transfer limit.
-    Returns the exit code of the command.
+    Returns (exit_code, was_terminated_by_limit).
     """
     try:
         # Start the process
@@ -171,7 +181,7 @@ def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0) -> in
                                 if current_bytes >= max_transfer_bytes:
                                     print(f"\nMax transfer limit reached: {transferred_str}")
                                     process.terminate()
-                                    return 1
+                                    return 1, True  # Terminated by limit
                     else:
                         # Print non-progress lines as-is
                         print(line)
@@ -199,7 +209,7 @@ def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0) -> in
                                 if current_bytes >= max_transfer_bytes:
                                     print(f"\nMax transfer limit reached: {transferred_str}")
                                     process.terminate()
-                                    return 1
+                                    return 1, True  # Terminated by limit
                     else:
                         print(line)
                 
@@ -207,15 +217,15 @@ def run_command_with_monitoring(command: str, max_transfer_bytes: int = 0) -> in
         
         # Wait for process to complete
         return_code = process.wait()
-        return return_code
+        return return_code, False  # Natural completion
         
     except KeyboardInterrupt:
         if 'process' in locals():
             process.terminate()
-        return 130
+        return 130, False  # User interrupted
     except Exception as e:
         print(f"Error running command: {e}", file=sys.stderr)
-        return 1
+        return 1, False  # Error occurred
 
 
 def main():
@@ -246,10 +256,48 @@ def main():
             print(f"Invalid max-transfer value: {args.max_transfer}", file=sys.stderr)
             return 1
     
-    # Run the command with monitoring
-    return_code = run_command_with_monitoring(args.shell, max_transfer_bytes)
-    
-    return return_code
+    # Run the command with monitoring in a loop until natural completion
+    attempt = 1
+    while True:
+        print(f"\n=== Attempt {attempt} - Starting at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} ===")
+        
+        return_code, was_terminated_by_limit = run_command_with_monitoring(args.shell, max_transfer_bytes)
+        
+        if not was_terminated_by_limit:
+            # Natural completion (success, error, or user interrupt)
+            print(f"\nCommand completed naturally with exit code: {return_code}")
+            return return_code
+        
+        # Was terminated by transfer limit - wait until next UTC midnight
+        seconds_until_midnight = calculate_seconds_until_utc_midnight()
+        next_midnight_utc = datetime.now(timezone.utc) + timedelta(seconds=seconds_until_midnight)
+        
+        print(f"\nTransfer limit reached. Waiting until next UTC midnight...")
+        print(f"Next execution at: {next_midnight_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        print(f"Sleeping for {seconds_until_midnight} seconds ({seconds_until_midnight//3600}h {(seconds_until_midnight%3600)//60}m)")
+        
+        try:
+            # Sleep with periodic status updates every 5 seconds
+            start_sleep_time = time.time()
+            while True:
+                current_time = time.time()
+                elapsed = current_time - start_sleep_time
+                remaining = seconds_until_midnight - elapsed
+                
+                if remaining <= 0:
+                    break
+                    
+                print(f"Sleeping for {int(remaining)} seconds ({int(remaining)//3600}h {(int(remaining)%3600)//60}m {int(remaining)%60}s)")
+                
+                # Sleep for min(5 seconds, remaining time)
+                sleep_duration = min(5, remaining)
+                time.sleep(sleep_duration)
+                
+        except KeyboardInterrupt:
+            print("\nInterrupted by user during sleep. Exiting...")
+            return 130
+            
+        attempt += 1
 
 
 if __name__ == '__main__':
