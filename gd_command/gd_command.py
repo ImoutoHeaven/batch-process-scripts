@@ -143,11 +143,15 @@ def main():
             # 核心解析逻辑
             if line.startswith("Transferred:"):
                 # 匹配数据传输行: Transferred: 1.195 TiB / ...
-                # 这个正则更精确，避免匹配到文件数量那一行
-                match = re.search(r"Transferred:\s*([\d\.]+\s*[TGMKPiB]+)\s*/", line, re.IGNORECASE)
+                # 修正正则表达式以正确匹配完整的单位格式
+                match = re.search(r"Transferred:\s*([\d\.]+\s*(?:TiB|GiB|MiB|KiB|TB|GB|MB|KB|B))\s*/", line, re.IGNORECASE)
                 if match:
                     try:
-                        current_total_bytes_this_run = parse_size(match.group(1))
+                        size_str = match.group(1)
+                        current_total_bytes_this_run = parse_size(size_str)
+                        
+                        # 添加调试信息
+                        print(f"[调试] 解析传输量: '{size_str}' -> {current_total_bytes_this_run} 字节")
                         
                         # 计算自上次报告以来新增的传输量
                         delta = current_total_bytes_this_run - last_reported_bytes_this_run
@@ -155,6 +159,7 @@ def main():
                         if delta > 0:
                             bytes_transferred_today += delta
                             last_reported_bytes_this_run = current_total_bytes_this_run
+                            print(f"[调试] 今日累计传输: {bytes_transferred_today / (1024**2):.2f} MiB")
 
                         # 检查是否达到限额
                         if bytes_transferred_today >= max_bytes_per_day:
@@ -167,8 +172,11 @@ def main():
                             limit_reached = True
                             break # 退出输出读取循环
                     except ValueError as e:
-                        # 如果解析失败，打印警告但继续
-                        print(f"[警告] 无法解析传输行: '{line}'. 错误: {e}", file=sys.stderr)
+                        # 解析失败时立即退出
+                        print(f"[错误] 无法解析传输行: '{line}'. 错误: {e}", file=sys.stderr)
+                        print("解析失败，立即退出脚本。", file=sys.stderr)
+                        process.terminate()
+                        sys.exit(1)
 
         # --- 处理子进程结束后的逻辑 ---
         # 等待进程完全终止并获取返回码
