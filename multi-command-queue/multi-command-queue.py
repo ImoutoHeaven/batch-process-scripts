@@ -134,9 +134,11 @@ command_lock = threading.Lock()           # 更新 command_states 的互斥锁
 stop_event = threading.Event()            # 全局停止标志
 keyboard_interrupt_flag = threading.Event()
 debug_mode = False
+execution_args = {}                       # 存储执行参数
 
 # {id: {command, status, process, retry_count, start_time, end_time, pid}}
 command_states = {}
+resume_queue = queue.Queue()              # 恢复的命令队列
 
 # 逻辑块信息 (用于 sequence 模式显示)
 logical_blocks = []
@@ -425,6 +427,27 @@ def format_command_status():
         
         return "\n".join(lines)
 
+# ---------------------- 用户输入处理 ----------------------
+def _process_user_input(user_input):
+    """处理用户输入命令"""
+    if user_input == "exit":
+        safe_print("\n[停止所有命令并退出]")
+        stop_event.set()
+        terminate_all_processes()
+    elif user_input == "status":
+        safe_print(format_command_status())
+    elif user_input.startswith(("pause", "resume")):
+        _handle_pause_resume(user_input)
+    elif user_input == "debug":
+        global debug_mode
+        debug_mode = not debug_mode
+        safe_print(f"\n[调试模式: {'启用' if debug_mode else '关闭'}]")
+    else:
+        # 处理无效输入
+        if user_input.strip():  # 只有非空输入才提示
+            safe_print(f"\n[未知命令: '{user_input}']")
+            safe_print("[可用命令: pause [id], resume [id], status, debug, exit]")
+
 # ---------------------- 输入监听线程 ----------------------
 def input_listener():
     while not stop_event.is_set() and not keyboard_interrupt_flag.is_set():
@@ -432,19 +455,11 @@ def input_listener():
             user_input = input().strip().lower()
             input_queue.put(user_input)
 
+            # 立即处理exit命令以确保快速响应
             if user_input == "exit":
-                safe_print("\n[停止所有命令并退出]")
                 stop_event.set()
                 terminate_all_processes()
                 break
-            elif user_input == "status":
-                safe_print(format_command_status())
-            elif user_input.startswith(("pause", "resume")):
-                _handle_pause_resume(user_input)
-            elif user_input == "debug":
-                global debug_mode
-                debug_mode = not debug_mode
-                safe_print(f"\n[调试模式: {'启用' if debug_mode else '关闭'}]")
         except EOFError:
             break
         except KeyboardInterrupt:
@@ -490,7 +505,10 @@ def _resume_cmd(cmd_id):
         st = command_states[cmd_id]
         if st["status"] == CommandStatus.PAUSED:
             st["status"] = CommandStatus.INQUEUE
+            resume_queue.put(cmd_id)
             safe_print(f"\n[命令 {cmd_id+1} 已恢复]")
+        elif st["status"] in [CommandStatus.COMPLETED, CommandStatus.FAILED]:
+            safe_print(f"\n[命令 {cmd_id+1} 已结束，无法恢复]")
         else:
             safe_print(f"\n[命令 {cmd_id+1} 未暂停]")
 
@@ -508,11 +526,64 @@ def _pause_all():
 def _resume_all():
     cnt = 0
     with command_lock:
-        for st in command_states.values():
+        for cmd_id, st in command_states.items():
             if st["status"] == CommandStatus.PAUSED:
                 st["status"] = CommandStatus.INQUEUE
+                resume_queue.put(cmd_id)
                 cnt += 1
     safe_print(f"\n[已恢复 {cnt} 个命令]")
+
+def _process_resume_queue(executor=None):
+    """处理恢复队列中的命令，重新提交到执行器"""
+    import concurrent.futures
+
+    resumed_commands = []
+    while not resume_queue.empty():
+        try:
+            cmd_id = resume_queue.get_nowait()
+            resumed_commands.append(cmd_id)
+        except queue.Empty:
+            break
+
+    if resumed_commands and executor:
+        # 获取全局变量来传递给execute_command
+        args = _get_execution_args()
+        for cmd_id in resumed_commands:
+            with command_lock:
+                st = command_states[cmd_id]
+                if st["status"] == CommandStatus.INQUEUE:
+                    cmd = st["command"]
+                    # 重新提交到执行器
+                    if debug_mode:
+                        safe_print(f"[DEBUG] 重新提交命令 {cmd_id+1} 到执行器")
+                    executor.submit(execute_command, cmd_id, cmd, args['total_retries'])
+
+def _get_execution_args():
+    """获取当前执行的参数"""
+    return execution_args
+
+def _process_resume_queue_sequence(executor, commands, total_retries):
+    """在sequence模式中处理恢复队列，返回新的futures"""
+    resumed_commands = []
+    while not resume_queue.empty():
+        try:
+            cmd_id = resume_queue.get_nowait()
+            resumed_commands.append(cmd_id)
+        except queue.Empty:
+            break
+
+    new_futures = []
+    for cmd_id in resumed_commands:
+        with command_lock:
+            st = command_states[cmd_id]
+            if st["status"] == CommandStatus.INQUEUE:
+                cmd = commands[cmd_id]
+                if debug_mode:
+                    safe_print(f"[DEBUG] 在sequence模式中重新提交命令 {cmd_id+1}")
+                future = executor.submit(execute_command, cmd_id, cmd, total_retries)
+                new_futures.append(future)
+
+    return new_futures
 
 # ---------------------- 状态定期打印线程 ----------------------
 def status_updater(interval):
@@ -544,10 +615,17 @@ def execute_command(cmd_id, cmd, total_retries):
           and not stop_event.is_set() \
           and not keyboard_interrupt_flag.is_set():
 
+        # 检查暂停状态并等待恢复
+        while True:
+            with command_lock:
+                if st["status"] != CommandStatus.PAUSED:
+                    break
+            # 暂停期间定期检查状态变化
+            time.sleep(0.1)
+            if stop_event.is_set() or keyboard_interrupt_flag.is_set():
+                return False
+
         with command_lock:
-            if st["status"] == CommandStatus.PAUSED:
-                time.sleep(0.5)
-                continue
             st["status"] = CommandStatus.RUNNING
             if st["start_time"] is None:
                 st["start_time"] = datetime.datetime.now()
@@ -593,7 +671,7 @@ def execute_command(cmd_id, cmd, total_retries):
                     break
                 with command_lock:
                     if st["status"] == CommandStatus.PAUSED:
-                        safe_print(f"{prefix}被暂停，稍后重启")
+                        safe_print(f"{prefix}被暂停")
                         break
                 
                 try:
@@ -688,9 +766,14 @@ def run_sequence_blocks(blocks, commands, total_retries):
                     for fut in futures:
                         fut.cancel()
                     break
-                # 清掉 input_queue 防胀
+                # 处理用户输入
                 while not input_queue.empty():
-                    input_queue.get()
+                    user_input = input_queue.get()
+                    _process_user_input(user_input)
+
+                # 处理恢复的命令
+                new_futures = _process_resume_queue_sequence(exe, commands, total_retries)
+                futures.extend(new_futures)
 
         with command_lock:
             prev_success = all(
@@ -714,8 +797,9 @@ if platform.system() == "Windows":
 
 def main():
     args = parse_args()
-    global debug_mode
+    global debug_mode, execution_args
     debug_mode = args.debug
+    execution_args['total_retries'] = args.total_retries
     
     # 初始化控制台编码
     init_console_encoding()
@@ -779,8 +863,13 @@ def main():
                         futures, timeout=1.0,
                         return_when=FIRST_COMPLETED)
                     futures = not_done
+                    # 处理用户输入
                     while not input_queue.empty():
-                        input_queue.get()
+                        user_input = input_queue.get()
+                        _process_user_input(user_input)
+
+                    # 处理恢复的命令
+                    _process_resume_queue(exe)
     except KeyboardInterrupt:
         pass
     finally:
