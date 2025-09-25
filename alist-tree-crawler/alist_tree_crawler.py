@@ -20,7 +20,7 @@ import aiofiles
 class AlistTreeCrawler:
     def __init__(self, site_url: str, max_depth: int = 30, output_file: str = "tree.log",
                  max_retries: int = 20, tps_limit: int = 5, break_threshold: int = 2000,
-                 break_duration: int = 8):
+                 break_duration: int = 8, start_path: str = "/"):
         self.site_url = site_url.rstrip('/')
         self.max_depth = max_depth
         self.output_file = output_file
@@ -28,6 +28,7 @@ class AlistTreeCrawler:
         self.tps_limit = tps_limit
         self.break_threshold = break_threshold
         self.break_duration = break_duration
+        self.start_path = start_path.strip() if start_path.strip() else "/"
 
         # 并发控制
         self.semaphore = asyncio.Semaphore(tps_limit)
@@ -105,6 +106,25 @@ class AlistTreeCrawler:
             self.failed_requests += 1
             print(f"请求失败，已达最大重试次数: {path}")
             return None
+
+    async def validate_start_path(self) -> bool:
+        """
+        验证起始路径是否存在
+
+        Returns:
+            bool: 路径是否存在
+        """
+        print(f"验证起始路径: {self.start_path}")
+        data = await self.make_api_request(self.start_path)
+        if data is None:
+            return False
+
+        # 检查是否成功获取到路径内容
+        if 'content' not in data:
+            return False
+
+        print(f"起始路径验证成功")
+        return True
 
     async def take_break(self):
         """
@@ -209,6 +229,7 @@ class AlistTreeCrawler:
     async def crawl_recursive(self):
         """递归爬取整个文件系统"""
         print(f"开始爬取: {self.site_url}")
+        print(f"起始路径: {self.start_path}")
         print(f"最大深度: {self.max_depth}")
         print(f"输出文件: {self.output_file}")
         print(f"TPS限制: {self.tps_limit}")
@@ -216,15 +237,20 @@ class AlistTreeCrawler:
         print(f"休息机制: 每处理 {self.break_threshold} 个项目休息 {self.break_duration} 秒")
         print("-" * 50)
 
+        # 验证起始路径是否存在
+        if not await self.validate_start_path():
+            raise ValueError(f"指定的起始路径不存在或无法访问: {self.start_path}")
+
         # 写入文件头
         header = f"Alist Tree Structure - {self.site_url}\n"
         header += f"Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        header += f"Start Path: {self.start_path}\n"
         header += f"Max Depth: {self.max_depth}\n"
         header += "=" * 60 + "\n\n"
         await self.output_file_handle.write(header)
 
-        # 从根目录开始，使用队列进行广度优先遍历
-        queue = [('/', 0)]  # (path, depth)
+        # 从指定路径开始，使用队列进行广度优先遍历
+        queue = [(self.start_path, 0)]  # (path, depth)
 
         while queue:
             # 批量处理当前层级
@@ -280,6 +306,7 @@ async def main():
     parser.add_argument('--tps', type=int, default=5, help='TPS限制 (默认: 5)')
     parser.add_argument('--break-threshold', type=int, default=2000, help='连续处理项目数阈值，达到后休息 (默认: 2000)')
     parser.add_argument('--break-duration', type=int, default=8, help='休息时长（秒） (默认: 8)')
+    parser.add_argument('--path', default='/', help='起始爬取路径 (默认: /)')
 
     args = parser.parse_args()
 
@@ -291,7 +318,8 @@ async def main():
             max_retries=args.low_level_retries,
             tps_limit=args.tps,
             break_threshold=args.break_threshold,
-            break_duration=args.break_duration
+            break_duration=args.break_duration,
+            start_path=args.path
         ) as crawler:
             await crawler.crawl_recursive()
 
