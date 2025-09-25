@@ -138,10 +138,6 @@ class AlistTreeCrawler:
         self.processed_items += 1
         self.continuous_processed_count += 1
 
-        # 检查是否需要休息
-        if self.continuous_processed_count >= self.break_threshold:
-            await self.take_break()
-
     async def crawl_directory(self, path: str, depth: int = 0) -> List[str]:
         """
         爬取指定目录
@@ -182,6 +178,9 @@ class AlistTreeCrawler:
         directories.sort(key=lambda x: x.get('name', ''))
         files.sort(key=lambda x: x.get('name', ''))
 
+        # 记录本次处理前的计数
+        items_before = self.continuous_processed_count
+
         # 先输出所有文件
         for file_item in files:
             name = file_item.get('name', 'Unknown')
@@ -199,6 +198,11 @@ class AlistTreeCrawler:
             else:
                 subdir_path = path + '/' + name
             subdirs.append(subdir_path)
+
+        # 检查是否需要休息（在处理完当前API响应的所有内容后）
+        items_processed_this_request = self.continuous_processed_count - items_before
+        if items_processed_this_request > 0 and self.continuous_processed_count >= self.break_threshold:
+            await self.take_break()
 
         return subdirs
 
