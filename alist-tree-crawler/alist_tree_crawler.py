@@ -19,12 +19,15 @@ import aiofiles
 
 class AlistTreeCrawler:
     def __init__(self, site_url: str, max_depth: int = 30, output_file: str = "tree.log",
-                 max_retries: int = 20, tps_limit: int = 5):
+                 max_retries: int = 20, tps_limit: int = 5, break_threshold: int = 2000,
+                 break_duration: int = 8):
         self.site_url = site_url.rstrip('/')
         self.max_depth = max_depth
         self.output_file = output_file
         self.max_retries = max_retries
         self.tps_limit = tps_limit
+        self.break_threshold = break_threshold
+        self.break_duration = break_duration
 
         # 并发控制
         self.semaphore = asyncio.Semaphore(tps_limit)
@@ -38,6 +41,7 @@ class AlistTreeCrawler:
         self.total_requests = 0
         self.failed_requests = 0
         self.processed_items = 0
+        self.continuous_processed_count = 0
 
     async def __aenter__(self):
         """异步上下文管理器入口"""
@@ -102,6 +106,19 @@ class AlistTreeCrawler:
             print(f"请求失败，已达最大重试次数: {path}")
             return None
 
+    async def take_break(self):
+        """
+        执行休息，防止服务器过载
+        """
+        print(f"\n已连续处理 {self.continuous_processed_count} 个项目，休息 {self.break_duration} 秒以防止服务器过载...")
+
+        for remaining in range(self.break_duration, 0, -1):
+            print(f"\r休息中... {remaining} 秒后继续", end="", flush=True)
+            await asyncio.sleep(1)
+
+        print("\r休息完成，继续处理..." + " " * 20)
+        self.continuous_processed_count = 0
+
     async def write_tree_item(self, name: str, is_dir: bool, depth: int, is_last: bool = False):
         """
         写入树形结构项目到输出文件
@@ -119,6 +136,11 @@ class AlistTreeCrawler:
         await self.output_file_handle.write(line)
         await self.output_file_handle.flush()  # 实时写入
         self.processed_items += 1
+        self.continuous_processed_count += 1
+
+        # 检查是否需要休息
+        if self.continuous_processed_count >= self.break_threshold:
+            await self.take_break()
 
     async def crawl_directory(self, path: str, depth: int = 0) -> List[str]:
         """
@@ -187,6 +209,7 @@ class AlistTreeCrawler:
         print(f"输出文件: {self.output_file}")
         print(f"TPS限制: {self.tps_limit}")
         print(f"重试次数: {self.max_retries}")
+        print(f"休息机制: 每处理 {self.break_threshold} 个项目休息 {self.break_duration} 秒")
         print("-" * 50)
 
         # 写入文件头
@@ -251,6 +274,8 @@ async def main():
     parser.add_argument('--out', default='tree.log', help='输出文件名 (默认: tree.log)')
     parser.add_argument('--low-level-retries', type=int, default=20, help='API请求重试次数 (默认: 20)')
     parser.add_argument('--tps', type=int, default=5, help='TPS限制 (默认: 5)')
+    parser.add_argument('--break-threshold', type=int, default=2000, help='连续处理项目数阈值，达到后休息 (默认: 2000)')
+    parser.add_argument('--break-duration', type=int, default=8, help='休息时长（秒） (默认: 8)')
 
     args = parser.parse_args()
 
@@ -260,7 +285,9 @@ async def main():
             max_depth=args.max_depth,
             output_file=args.out,
             max_retries=args.low_level_retries,
-            tps_limit=args.tps
+            tps_limit=args.tps,
+            break_threshold=args.break_threshold,
+            break_duration=args.break_duration
         ) as crawler:
             await crawler.crawl_recursive()
 
