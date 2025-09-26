@@ -20,7 +20,7 @@ import aiofiles
 class AlistTreeCrawler:
     def __init__(self, site_url: str, max_depth: int = 30, output_file: str = "tree.log",
                  max_retries: int = 20, tps_limit: int = 5, break_threshold: int = 2000,
-                 break_duration: int = 8, start_path: str = "/"):
+                 break_duration: int = 8, start_path: str = "/", password: str = ""):
         self.site_url = site_url.rstrip('/')
         self.max_depth = max_depth
         self.output_file = output_file
@@ -29,6 +29,7 @@ class AlistTreeCrawler:
         self.break_threshold = break_threshold
         self.break_duration = break_duration
         self.start_path = start_path.strip() if start_path.strip() else "/"
+        self.password = password
 
         # 并发控制
         self.semaphore = asyncio.Semaphore(tps_limit)
@@ -77,7 +78,7 @@ class AlistTreeCrawler:
         }
         payload = {
             'path': path,
-            'password': '',
+            'password': self.password,
             'page': 1,
             'per_page': 0,  # 获取所有项目
             'refresh': False
@@ -307,6 +308,7 @@ async def main():
     parser.add_argument('--break-threshold', type=int, default=2000, help='连续处理项目数阈值，达到后休息 (默认: 2000)')
     parser.add_argument('--break-duration', type=int, default=8, help='休息时长（秒） (默认: 8)')
     parser.add_argument('--path', default='/', help='起始爬取路径 (默认: /)')
+    parser.add_argument('--password', default='', help='访问密码 (默认: 空)')
 
     args = parser.parse_args()
 
@@ -319,7 +321,8 @@ async def main():
             tps_limit=args.tps,
             break_threshold=args.break_threshold,
             break_duration=args.break_duration,
-            start_path=args.path
+            start_path=args.path,
+            password=args.password
         ) as crawler:
             await crawler.crawl_recursive()
 
