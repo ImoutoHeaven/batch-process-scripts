@@ -85,6 +85,7 @@ class AlistTreeCrawler:
         }
 
         async with self.semaphore:  # 限制并发数
+            last_error_message = ""
             for attempt in range(self.max_retries):
                 try:
                     self.total_requests += 1
@@ -94,15 +95,21 @@ class AlistTreeCrawler:
                             if data.get('code') == 200:
                                 return data.get('data')
                             else:
-                                print(f"API错误 {path}: {data.get('message', 'Unknown error')}")
+                                last_error_message = data.get('message', 'Unknown error')
+                                print(f"API错误 {path}: {last_error_message} (尝试 {attempt + 1}/{self.max_retries})")
                         else:
-                            print(f"HTTP错误 {path}: {response.status}")
+                            print(f"HTTP错误 {path}: {response.status} (尝试 {attempt + 1}/{self.max_retries})")
 
                 except Exception as e:
                     print(f"请求异常 {path} (尝试 {attempt + 1}/{self.max_retries}): {e}")
 
                 if attempt < self.max_retries - 1:
-                    await asyncio.sleep(2)  # 固定2秒重试间隔
+                    # 针对 object not found 错误使用递增间隔
+                    if "object not found" in last_error_message.lower():
+                        retry_delay = min(5 * (attempt + 1), 120)
+                    else:
+                        retry_delay = 2
+                    await asyncio.sleep(retry_delay)
 
             self.failed_requests += 1
             print(f"请求失败，已达最大重试次数: {path}")
