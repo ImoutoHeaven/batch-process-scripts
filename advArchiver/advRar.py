@@ -448,6 +448,53 @@ def safe_move(src, dst, debug=False):
         return False
 
 
+TEMP_COMMENT_FILES = []
+
+
+def register_temp_comment_file(path):
+    """记录临时注释文件路径，便于退出时清理"""
+    if path and path not in TEMP_COMMENT_FILES:
+        TEMP_COMMENT_FILES.append(path)
+
+
+def cleanup_temp_comment_files():
+    """在程序结束时删除创建的临时注释文件"""
+    while TEMP_COMMENT_FILES:
+        tmp_path = TEMP_COMMENT_FILES.pop()
+        try:
+            if safe_exists(tmp_path):
+                safe_remove(tmp_path)
+        except Exception:
+            pass
+
+
+atexit.register(cleanup_temp_comment_files)
+
+
+def create_comment_temp_file(comment_text, debug=False):
+    """为内联注释内容创建临时文件"""
+    try:
+        tmp_file = tempfile.NamedTemporaryFile(
+            mode='w',
+            encoding='utf-8',
+            delete=False,
+            prefix='advRar_comment_',
+            suffix='.txt'
+        )
+        tmp_file.write(comment_text)
+        tmp_file.flush()
+        tmp_path = tmp_file.name
+        tmp_file.close()
+        register_temp_comment_file(tmp_path)
+        if debug:
+            print(f"创建临时注释文件: {tmp_path}")
+        return tmp_path
+    except Exception as e:
+        if debug:
+            print(f"创建临时注释文件失败: {e}")
+        return None
+
+
 def safe_glob(pattern, debug=False):
     """安全的文件匹配（glob）"""
     try:
@@ -832,6 +879,8 @@ def parse_arguments():
     parser.add_argument('--no-lock', action='store_true', help='不使用全局锁（谨慎使用）')
     parser.add_argument('--lock-timeout', type=int, default=30, help='锁定超时时间（最大重试次数）')
     parser.add_argument('--out', help='指定压缩后文件的输出目录路径')
+    parser.add_argument('-c', '--comments', help='为生成的压缩包添加注释内容')
+    parser.add_argument('-cp', '--comments-path', help='从指定文本文件读取压缩包注释')
 
     # 并发线程数（新增）
     parser.add_argument('-t', '--threads', type=int, default=1,
@@ -862,6 +911,9 @@ def parse_arguments():
     # 线程数校验
     if args.threads < 1:
         parser.error("--threads 必须 >= 1")
+
+    if args.comments and args.comments_path:
+        parser.error("不能同时指定 --comments 和 --comments-path")
 
     return args
 
@@ -1080,7 +1132,14 @@ def prepare_folder_path_for_rar(folder_path, debug=False):
     return safe_path
 
 
-def build_rar_switches(profile, password, delete_files=False):
+def build_comment_switch(comment_file_path, debug=False):
+    """构建RAR注释参数"""
+    safe_comment_path = safe_path_for_operation(comment_file_path, debug)
+    quoted_comment_path = quote_path_for_rar(safe_comment_path)
+    return f'-z{quoted_comment_path}'
+
+
+def build_rar_switches(profile, password, delete_files=False, comment_switch=None):
     """
     构建 RAR 命令开关参数。
     变更点：
@@ -1129,6 +1188,9 @@ def build_rar_switches(profile, password, delete_files=False):
     # 密码
     if password:
         switches.extend([f'-p{password}', '-hp'])
+
+    if comment_switch:
+        switches.append(comment_switch)
 
     return switches
 
@@ -1315,7 +1377,7 @@ def process_file(file_path, args, base_path):
 
     try:
         # 构建 RAR 命令
-        rar_switches = build_rar_switches(args.profile, args.password, args.delete)
+        rar_switches = build_rar_switches(args.profile, args.password, args.delete, args.comment_switch)
         rar_cmd = [get_rar_command(), 'a', *rar_switches]
 
         temp_rar_path = os.path.join(temp_dir, "temp_archive.rar")
@@ -1378,7 +1440,7 @@ def process_folder(folder_path, args, base_path):
         return
 
     try:
-        rar_switches = build_rar_switches(args.profile, args.password, args.delete)
+        rar_switches = build_rar_switches(args.profile, args.password, args.delete, args.comment_switch)
         rar_switches.insert(0, '-r')  # 文件夹需递归
 
         rar_cmd = [get_rar_command(), 'a', *rar_switches]
@@ -1439,6 +1501,31 @@ def main():
     stats.log("程序开始执行")
 
     args = parse_arguments()
+
+    # 预处理注释参数
+    comment_file_path = None
+    if getattr(args, 'comments_path', None):
+        comment_file_path = safe_abspath(args.comments_path, args.debug)
+        if not safe_isfile(comment_file_path, args.debug):
+            error_msg = f"错误: 注释文件不存在或不可访问 - {args.comments_path}"
+            stats.log(error_msg)
+            print(error_msg)
+            sys.exit(1)
+    elif getattr(args, 'comments', None):
+        temp_comment = create_comment_temp_file(args.comments, args.debug)
+        if not temp_comment:
+            error_msg = "错误: 无法创建临时注释文件"
+            stats.log(error_msg)
+            print(error_msg)
+            sys.exit(1)
+        comment_file_path = safe_abspath(temp_comment, args.debug)
+
+    if comment_file_path:
+        args.comment_switch = build_comment_switch(comment_file_path, args.debug)
+        if args.debug:
+            stats.log(f"使用注释文件: {comment_file_path}")
+    else:
+        args.comment_switch = None
 
     # 验证参数组合
     if args.skip_files and args.skip_folders:
