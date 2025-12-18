@@ -31,6 +31,68 @@ import stat
 # Global verbose flag
 VERBOSE = False
 
+# If True, temporary directories are forcibly deleted even when non-empty.
+# Default keeps non-empty temp dirs to avoid silent data loss and to aid debugging.
+FORCE_CLEAN_TMP = False
+
+# Track active subprocesses so SIGINT/SIGTERM can terminate them promptly.
+_active_subprocesses = set()
+_active_subprocesses_lock = threading.Lock()
+
+def _register_active_subprocess(proc: subprocess.Popen):
+    with _active_subprocesses_lock:
+        _active_subprocesses.add(proc)
+
+def _unregister_active_subprocess(proc: subprocess.Popen):
+    with _active_subprocesses_lock:
+        _active_subprocesses.discard(proc)
+
+def _terminate_process_tree(proc: subprocess.Popen, timeout_s: float = 2.0):
+    """Best-effort terminate/kill process (and its process group/session when possible)."""
+    try:
+        if proc.poll() is not None:
+            return
+
+        if os.name != 'nt':
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        else:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+        deadline = time.time() + max(0.0, timeout_s)
+        while proc.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+
+        if proc.poll() is None:
+            if os.name != 'nt':
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+def terminate_active_subprocesses():
+    with _active_subprocesses_lock:
+        procs = list(_active_subprocesses)
+    for proc in procs:
+        _terminate_process_tree(proc)
 
 # Global interrupt flag for multi-threaded execution
 _interrupt_flag = threading.Event()
@@ -39,6 +101,7 @@ def set_interrupt_flag():
     """Set the global interrupt flag to signal all threads to stop"""
     global _interrupt_flag
     _interrupt_flag.set()
+    terminate_active_subprocesses()
     if VERBOSE:
         print("  DEBUG: Global interrupt flag set")
 
@@ -802,6 +865,8 @@ class ArchiveProcessor:
                 safe_makedirs(target_dir, debug=VERBOSE)
 
                 target_file = os.path.join(target_dir, os.path.basename(volume))
+                if safe_exists(target_file, VERBOSE):
+                    target_file = ensure_unique_name(target_file, uuid.uuid4().hex[:8])
                 safe_move(volume, target_file, VERBOSE)
                 print(f"  Moved: {volume} -> {target_file}")
             except KeyboardInterrupt:
@@ -886,12 +951,17 @@ class ArchiveProcessor:
             if VERBOSE:
                 print(f"  DEBUG: Using provided password (or empty password)")
 
-        # Step 4: Create temporary directory with thread-safe unique name
+        # Step 4: Create temporary directory with thread-safe unique name (under output staging dir)
         timestamp = str(int(time.time() * 1000))
         thread_id = threading.get_ident()
         unique_id = str(uuid.uuid4().hex[:8])
         unique_suffix = f"{timestamp}_{thread_id}_{unique_id}"
-        tmp_dir = f"tmp_{unique_suffix}"
+        
+        base_path = self.args.path if safe_isdir(self.args.path, VERBOSE) else os.path.dirname(self.args.path)
+        output_base = os.path.abspath(self.args.output) if self.args.output else os.path.abspath(base_path)
+        safe_makedirs(output_base, debug=VERBOSE)
+        staging_root = get_staging_dir(output_base, debug=VERBOSE)
+        tmp_dir = os.path.join(staging_root, f"tmp_{unique_suffix}")
 
         if VERBOSE:
             print(f"  DEBUG: 创建临时目录: {tmp_dir}")
@@ -920,7 +990,39 @@ class ArchiveProcessor:
             if success:
                 print(f"  Successfully extracted to temporary directory")
 
-                # Step 7: Apply success policy BEFORE decompress policy
+                extracted_files, extracted_dirs = count_items_in_dir(tmp_dir)
+                if extracted_files == 0 and extracted_dirs == 0:
+                    print(f"  Error: Extractor reported success but produced no output: {archive_path}")
+                    if self.args.fail_policy == 'move' and self.args.fail_to:
+                        self.move_volumes_with_structure(all_volumes, os.path.abspath(self.args.fail_to))
+                    self.failed_archives.append(archive_path)
+                    return False
+
+                # Check for interrupt before decompress policy
+                check_interrupt()
+
+                # Step 7: Apply decompress policy (must succeed before success_policy)
+                try:
+                    self.apply_decompress_policy(archive_path, tmp_dir, unique_suffix)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    print(f"  Error: Failed while moving extracted contents to output: {e}")
+                    if self.args.fail_policy == 'move' and self.args.fail_to:
+                        self.move_volumes_with_structure(all_volumes, os.path.abspath(self.args.fail_to))
+                    self.failed_archives.append(archive_path)
+                    return False
+
+                # Verify tmp_dir is drained (no files left behind). If not, treat as failure and keep tmp.
+                remaining_files, _remaining_dirs = count_items_in_dir(tmp_dir)
+                if remaining_files > 0:
+                    print(f"  Error: Output move incomplete; keeping temp dir for inspection: {tmp_dir}")
+                    if self.args.fail_policy == 'move' and self.args.fail_to:
+                        self.move_volumes_with_structure(all_volumes, os.path.abspath(self.args.fail_to))
+                    self.failed_archives.append(archive_path)
+                    return False
+
+                # Step 8: Apply success policy AFTER output is verified
                 if self.args.success_policy == 'delete':
                     if VERBOSE:
                         print(f"  DEBUG: 应用删除成功策略")
@@ -935,12 +1037,6 @@ class ArchiveProcessor:
                     if VERBOSE:
                         print(f"  DEBUG: 应用移动成功策略")
                     self.move_volumes_with_structure(all_volumes, os.path.abspath(self.args.success_to))
-
-                # Check for interrupt before decompress policy
-                check_interrupt()
-
-                # Step 8: Apply decompress policy
-                self.apply_decompress_policy(archive_path, tmp_dir, unique_suffix)
 
                 self.successful_archives.append(archive_path)
                 return True
@@ -1097,14 +1193,10 @@ class ArchiveProcessor:
             safe_makedirs(archive_folder, debug=VERBOSE)
 
             # Move all items to archive folder
-            try:
-                for item in os.listdir(tmp_dir):
-                    src_item = os.path.join(tmp_dir, item)
-                    dest_item = os.path.join(archive_folder, item)
-                    safe_move(src_item, dest_item, VERBOSE)
-            except Exception as e:
-                if VERBOSE:
-                    print(f"  DEBUG: collect策略移动失败: {e}")
+            for item in os.listdir(tmp_dir):
+                src_item = os.path.join(tmp_dir, item)
+                dest_item = os.path.join(archive_folder, item)
+                safe_move(src_item, dest_item, VERBOSE)
 
             print(f"  Extracted to: {archive_folder} ({total_items} items >= {threshold})")
         else:
@@ -1206,8 +1298,6 @@ class ArchiveProcessor:
         # 处理decode-auto策略
         elif policy == 'decode-auto':
             try:
-                # 首先检查依赖库是否可用
-                enable_llm = getattr(self.args, 'enable_llm', False)
                 try:
                     import zipfile
                     decode_model = getattr(self.args, 'traditional_zip_decode_model', 'chardet')
@@ -1215,48 +1305,32 @@ class ArchiveProcessor:
                         from charset_normalizer import detect
                     else:
                         import chardet
-                    if enable_llm:
-                        from transformers import pipeline
                 except ImportError as e:
                     if VERBOSE:
-                        print(f"  DEBUG: decode-auto所需库不可用，跳过传统ZIP策略: {e}")
-                        if enable_llm and ('transformers' in str(e) or 'torch' in str(e)):
-                            print(f"  DEBUG: 请安装transformers库: pip install transformers torch")
-                    result['should_continue'] = False
-                    result['reason'] = f'decode-auto依赖库不可用，跳过处理'
+                        print(f"  DEBUG: decode-auto所需库不可用，将使用默认解压: {e}")
+                    result['reason'] = 'decode-auto依赖库不可用，使用默认解压'
                     return result
                 
                 # 混合编码检测
                 chardet_confidence_threshold = getattr(self.args, 'traditional_zip_decode_confidence', 90) / 100.0
-                llm_confidence_threshold = getattr(self.args, 'llm_confidence', 95) / 100.0
                 
                 encoding_result = guess_zip_encoding(
                     archive_path, 
-                    enable_llm=enable_llm,
                     chardet_confidence_threshold=chardet_confidence_threshold,
-                    llm_confidence_threshold=llm_confidence_threshold,
                     decode_model=decode_model
                 )
                 
                 if not encoding_result['success']:
                     if VERBOSE:
-                        print(f"  DEBUG: 混合编码检测失败，跳过处理")
-                    result['should_continue'] = False  
-                    result['reason'] = '混合编码检测失败'
+                        print(f"  DEBUG: 编码检测失败，将使用默认解压")
+                    result['reason'] = '自动编码检测失败，使用默认解压'
                     return result
                 
                 # 显示检测结果信息
                 detected_confidence = encoding_result['confidence']
                 
                 if VERBOSE:
-                    if enable_llm and 'llm_confidence' in encoding_result:
-                        print(f"  DEBUG: 混合检测成功 - chardet置信度: {encoding_result.get('detection_confidence', 0):.2%}, "
-                              f"LLM置信度: {encoding_result.get('llm_confidence', 0):.2%}, "
-                              f"综合置信度: {detected_confidence:.2%}")
-                    else:
-                        print(f"  DEBUG: chardet检测成功 - 置信度: {detected_confidence:.2%}")
-                
-                # 注意：置信度检查已在guess_zip_encoding内部完成，这里不需要再检查
+                    print(f"  DEBUG: 编码检测结果 - 置信度: {detected_confidence:.2%}")
                 
                 # 转换编码为7z参数
                 detected_encoding = encoding_result['encoding']
@@ -1264,9 +1338,8 @@ class ArchiveProcessor:
                 
                 if not zip_decode_param:
                     if VERBOSE:
-                        print(f"  DEBUG: 无法映射检测到的编码到7z参数: {detected_encoding}")
-                    result['should_continue'] = False
-                    result['reason'] = f'无法映射编码{detected_encoding}到7z参数'
+                        print(f"  DEBUG: 无法映射编码到7z参数，将使用默认解压: {detected_encoding}")
+                    result['reason'] = f'无法映射编码{detected_encoding}到7z参数，使用默认解压'
                     return result
                 
                 if VERBOSE:
@@ -1287,8 +1360,7 @@ class ArchiveProcessor:
             except Exception as e:
                 if VERBOSE:
                     print(f"  DEBUG: decode-auto处理异常: {e}")
-                result['should_continue'] = False
-                result['reason'] = f'自动编码检测异常，跳过处理: {e}'
+                result['reason'] = f'自动编码检测异常，使用默认解压: {e}'
                 return result
         
         # 处理asis策略
@@ -1520,14 +1592,29 @@ class ArchiveProcessor:
         volume_type: '7z', 'rar4', 'zip'
         返回匹配的分卷文件列表
         """
-        patterns = {
-            '7z': f"{base_filename}.7z.[^.]+",
-            'rar4': f"{base_filename}.r[^.]+", 
-            'zip': f"{base_filename}.z[^.]+"
+        escaped = re.escape(base_filename)
+        regex_map = {
+            # 7z multi-volume: .7z.001 / .7z.0001 ...
+            '7z': re.compile(rf'^{escaped}\.7z\.\d{{3,}}$', re.IGNORECASE),
+            # RAR4 volumes: .r00 / .r01 ...
+            'rar4': re.compile(rf'^{escaped}\.r\d{{2}}$', re.IGNORECASE),
+            # ZIP volumes: .z01 / .z02 ...
+            'zip': re.compile(rf'^{escaped}\.z\d{{2}}$', re.IGNORECASE),
         }
-        if volume_type not in patterns:
+        regex = regex_map.get(volume_type)
+        if regex is None:
             return []
-        return safe_glob(os.path.join(folder, patterns[volume_type]), preserve_char_classes=True)
+
+        try:
+            files = os.listdir(folder)
+        except Exception:
+            return []
+
+        matched = []
+        for name in files:
+            if regex.match(name):
+                matched.append(os.path.join(folder, name))
+        return sorted(matched)
 
     def _has_volume_files(self, base_filename, folder, volume_type):
         """检查是否存在指定类型的分卷文件"""
@@ -1707,16 +1794,6 @@ class ArchiveProcessor:
             self.args.traditional_zip_decode_confidence = 90
             if VERBOSE:
                 print(f"  DEBUG: 设置默认值 traditional_zip_decode_confidence = 90")
-        
-        if not hasattr(self.args, 'enable_llm'):
-            self.args.enable_llm = False
-            if VERBOSE:
-                print(f"  DEBUG: 设置默认值 enable_llm = False")
-        
-        if not hasattr(self.args, 'llm_confidence'):
-            self.args.llm_confidence = 95
-            if VERBOSE:
-                print(f"  DEBUG: 设置默认值 llm_confidence = 95")
 
     def build_password_candidates(self):
         """
@@ -1793,269 +1870,141 @@ class ArchiveProcessor:
             print(f"  DEBUG: 重新排序密码候选列表，总数: {len(self.password_candidates)}")
 
 
-# ==================== 编码检测和验证函数 ====================
+# ==================== 编码检测函数 ====================
 
-def verify_encoding_with_llm(zip_path, encoding, confidence_threshold):
+def _decode_zip_names(filename_bytes, encoding):
+    try:
+        return [b.decode(encoding, errors='replace') for b in filename_bytes]
+    except LookupError:
+        return None
+
+def _score_decoded_names(texts):
+    score = 0.0
+    for s in texts:
+        if not s:
+            continue
+        replacements = s.count('\ufffd')
+        controls = sum(1 for ch in s if ord(ch) < 32 and ch not in '\t\n\r')
+        cjk = sum(1 for ch in s if ('\u3400' <= ch <= '\u4dbf') or ('\u4e00' <= ch <= '\u9fff'))
+        kana = sum(1 for ch in s if '\u3040' <= ch <= '\u30ff')
+        hangul = sum(1 for ch in s if '\uac00' <= ch <= '\ud7a3')
+        non_ascii = sum(1 for ch in s if ord(ch) >= 128)
+
+        score += (cjk + kana + hangul) * 2.0
+        score += non_ascii * 0.2
+        score -= replacements * 20.0
+        score -= controls * 5.0
+    return score
+
+def guess_zip_encoding(zip_path, chardet_confidence_threshold=0.9, decode_model='chardet'):
     """
-    用指定编码解码ZIP文件名，通过LLM进行语言验证
-    
-    Args:
-        zip_path: ZIP文件路径
-        encoding: chardet检测到的编码
-        confidence_threshold: LLM置信度阈值 (0.0-1.0)
-        
-    Returns:
-        dict: 包含 language, confidence, success 的字典
+    传统 ZIP 编码检测（无 LLM）：
+    - 首选 chardet/charset_normalizer 的输出（当 confidence >= threshold）
+    - 否则在常见候选（CP936/CP932/CP950/UTF-8 等）中用启发式评分选择
     """
     import zipfile
-    
-    result = {'language': None,
-              'confidence': 0.0,
-              'success': False}
-    
-    try:
-        # 1. 用指定编码解码所有文件名
-        decoded_texts = []
-        safe_zip_path = safe_path_for_operation(zip_path, VERBOSE)
-        
-        with zipfile.ZipFile(safe_zip_path, 'r') as zf:
-            for info in zf.infolist():
-                if info.flag_bits & 0x800:  # 跳过UTF-8条目
-                    continue
-                    
-                raw_name = getattr(info, 'orig_filename', None) or info.filename
-                
-                # 统一转 bytes
-                if isinstance(raw_name, str):
-                    raw_name = raw_name.encode('cp437', 'surrogateescape')
-                
-                # 用指定编码解码
-                try:
-                    decoded_text = raw_name.decode(encoding)
-                    decoded_texts.append(decoded_text)
-                except UnicodeDecodeError:
-                    if VERBOSE:
-                        print(f"  DEBUG: 无法用 {encoding} 解码文件名: {raw_name}")
-                    continue
-        
-        if not decoded_texts:
-            if VERBOSE:
-                print(f"  DEBUG: 无法用编码 {encoding} 解码任何文件名")
-            return result
-        
-        # 2. 发送给LLM进行语言检测
-        llm_result = detect_language_with_llm(decoded_texts)
-        
-        if llm_result['success']:
-            result.update({
-                'language': llm_result['language'],
-                'confidence': llm_result['confidence'],
-                'success': True
-            })
-            
-            if VERBOSE:
-                print(f"  DEBUG: LLM语言验证结果 - 语言: {llm_result['language']}, 置信度: {llm_result['confidence']:.3f}")
-        
-    except Exception as e:
-        if VERBOSE:
-            print(f"  DEBUG: LLM编码验证异常: {e}")
-    
-    return result
 
-
-def detect_language_with_llm(text_samples):
-    """
-    使用 LLM 模型检测文本语言（纯语言检测，不推断编码）
-    
-    Args:
-        text_samples: list of str, 文本样本列表
-    
-    Returns:
-        dict: 包含 language, confidence, success 的字典
-    """
-    result = {'language': None,
-              'confidence': 0.0,
-              'success': False}
-    
-    try:
-        from transformers import pipeline
-        
-        # 如果模型不存在会自动下载
-        model_ckpt = "papluca/xlm-roberta-base-language-detection"
-        if VERBOSE:
-            print(f"  DEBUG: 正在加载LLM模型 {model_ckpt}...")
-        
-        try:
-            pipe = pipeline("text-classification", model=model_ckpt)
-            if VERBOSE:
-                print(f"  DEBUG: LLM模型加载成功")
-        except Exception as download_error:
-            if VERBOSE:
-                print(f"  DEBUG: LLM模型下载/加载失败: {download_error}")
-                print(f"  DEBUG: 可能的原因: 网络连接问题、磁盘空间不足、或模型仓库不可用")
-            result['success'] = False
-            return result
-        
-        # 合并样本文本
-        combined_text = '\n'.join(text_samples[:10])  # 限制样本数量避免过长
-        if len(combined_text) > 1000:  # 限制文本长度
-            combined_text = combined_text[:1000]
-        
-        # 执行语言检测
-        detection_result = pipe(combined_text, top_k=1, truncation=True)
-        
-        if detection_result and len(detection_result) > 0:
-            detected_lang = detection_result[0]['label']
-            confidence = detection_result[0]['score']
-            
-            result.update({
-                'language': detected_lang,
-                'confidence': confidence,
-                'success': True
-            })
-            
-            if VERBOSE:
-                print(f"  DEBUG: LLM语言检测结果 - 语言: {detected_lang}, 置信度: {confidence:.3f}")
-                
-    except ImportError as e:
-        if VERBOSE:
-            print(f"  DEBUG: transformers库不可用，请安装: pip install transformers torch")
-        result['success'] = False
-    except Exception as e:
-        if VERBOSE:
-            print(f"  DEBUG: LLM语言检测异常: {e}")
-        result['success'] = False
-    
-    return result
-
-
-
-
-def guess_zip_encoding(zip_path, enable_llm=False, chardet_confidence_threshold=0.9, llm_confidence_threshold=0.95, decode_model='chardet'):
-    """
-    混合编码检测：chardet + LLM验证
-    
-    改进要点
-    --------
-    1. 统一通过 `safe_path_for_operation()` 处理超长 / Unicode 路径。  
-    2. **保证** 参与 `b'\\n'.join()` 的全部元素都是 `bytes`，  
-       - `ZipInfo.orig_filename` 可能是 *str*，需转 CP437。  
-       - 若属性不存在则退回 `info.filename`（同样转 bytes）。  
-    3. 当所有条目均已设置 UTF‑8 标志时直接返回 `success=False`，避免误报。
-    4. 混合检测模式：先用chardet检测，再用LLM验证语言一致性。
-    
-    Args:
-        zip_path: ZIP 文件路径
-        enable_llm: 是否启用LLM二次验证
-        chardet_confidence_threshold: chardet置信度阈值 (0.0-1.0)
-        llm_confidence_threshold: LLM置信度阈值 (0.0-1.0)
-        decode_model: 编码检测库 ('chardet' 或 'charset_normalizer')
-    """
-    import zipfile
-    if decode_model == 'charset_normalizer':
-        from charset_normalizer import detect
-    else:
-        import chardet
-
-    result = {'encoding': None,
-              'language': None,
-              'confidence': 0.0,
-              'success':   False}
+    result = {
+        'encoding': None,
+        'confidence': 0.0,
+        'success': False,
+    }
 
     if VERBOSE:
-        print(f"  DEBUG: 开始混合编码检测: {zip_path}")
+        print(f"  DEBUG: 开始ZIP编码检测: {zip_path}")
 
-    safe_zip_path   = safe_path_for_operation(zip_path, VERBOSE)
-    filename_bytes  = []
+    safe_zip_path = safe_path_for_operation(zip_path, VERBOSE)
+    filename_bytes = []
 
     try:
         with zipfile.ZipFile(safe_zip_path, 'r') as zf:
             for info in zf.infolist():
-                if info.flag_bits & 0x800:          # 已是 UTF‑8 条目
+                if info.flag_bits & 0x800:
                     continue
-
                 raw_name = getattr(info, 'orig_filename', None) or info.filename
-
-                # 统一转 bytes（若本身已是 bytes 则按原值）
                 if isinstance(raw_name, str):
                     raw_name = raw_name.encode('cp437', 'surrogateescape')
-
                 filename_bytes.append(raw_name)
 
-        if not filename_bytes:                      # 无传统编码条目
+        if not filename_bytes:
             if VERBOSE:
                 print("  DEBUG: 全部条目已采用 UTF‑8 – 非传统ZIP")
             return result
 
-        # 步骤1: 使用指定库检测编码
         sample = b'\n'.join(filename_bytes)
-        
-        # 统一使用 detect() 方法（两个库都兼容）
-        if decode_model == 'charset_normalizer':
-            detection_result = detect(sample)
-            library_name = "charset_normalizer"
-        else:
-            detection_result = chardet.detect(sample)
-            library_name = "chardet"
-            
-        if not detection_result or not detection_result.get('encoding'):
+        detected_encoding = None
+        detected_confidence = 0.0
+        library_name = None
+
+        try:
+            if decode_model == 'charset_normalizer':
+                from charset_normalizer import detect as cn_detect
+                detection_result = cn_detect(sample)
+                library_name = "charset_normalizer"
+            else:
+                import chardet
+                detection_result = chardet.detect(sample)
+                library_name = "chardet"
+
+            if detection_result and detection_result.get('encoding'):
+                detected_encoding = detection_result['encoding']
+                detected_confidence = float(detection_result.get('confidence', 0.0) or 0.0)
+        except Exception as e:
             if VERBOSE:
-                print(f"  DEBUG: {library_name}检测失败")
-            return result
-            
-        detected_confidence = detection_result.get('confidence', 0.0)
-        detected_encoding = detection_result['encoding']
-        
-        if VERBOSE:
+                print(f"  DEBUG: 编码检测库异常，将回退启发式: {e}")
+
+        if VERBOSE and library_name:
             print(f"  DEBUG: {library_name}检测结果 - 编码: {detected_encoding}, 置信度: {detected_confidence:.3f}")
-        
-        # 步骤2: 置信度检查
-        if detected_confidence < chardet_confidence_threshold:
-            if VERBOSE:
-                print(f"  DEBUG: 检测置信度过低 ({detected_confidence:.3f} < {chardet_confidence_threshold:.3f})，跳过")
+
+        candidates = []
+        if detected_encoding:
+            candidates.append(detected_encoding)
+        candidates.extend(['cp936', 'gbk', 'gb18030', 'cp932', 'shift_jis', 'cp950', 'big5', 'utf-8'])
+
+        seen = set()
+        uniq_candidates = []
+        for enc in candidates:
+            if not enc:
+                continue
+            key = enc.lower()
+            if key not in seen:
+                seen.add(key)
+                uniq_candidates.append(enc)
+
+        scored = []
+        for enc in uniq_candidates:
+            texts = _decode_zip_names(filename_bytes, enc)
+            if texts is None:
+                continue
+            score = _score_decoded_names(texts)
+            scored.append((score, enc))
+
+        if not scored:
             return result
-        
-        # 步骤3: 如果不启用LLM，直接返回检测结果
-        if not enable_llm:
-            result.update({
-                'encoding': detected_encoding,
-                'language': detection_result.get('language'),  # 兼容的方式获取语言信息
-                'confidence': detected_confidence,
-                'success': True
-            })
-            if VERBOSE:
-                print(f"  DEBUG: 使用{library_name}结果，无LLM验证")
-            return result
-        
-        # 步骤4: 用检测到的编码解码文本，发送给LLM验证
-        llm_result = verify_encoding_with_llm(zip_path, detected_encoding, llm_confidence_threshold)
-        
-        if llm_result['success'] and llm_result['confidence'] >= llm_confidence_threshold:
-            # LLM验证通过，返回混合结果
-            result.update({
-                'encoding': detected_encoding,
-                'language': llm_result['language'],
-                'detection_confidence': detected_confidence,
-                'llm_confidence': llm_result['confidence'],
-                'confidence': min(detected_confidence, llm_result['confidence']),  # 取较小值作为总体置信度
-                'success': True
-            })
-            if VERBOSE:
-                print(f"  DEBUG: LLM验证通过 - 语言: {llm_result['language']}, 置信度: {llm_result['confidence']:.3f}")
-        else:
-            # LLM验证失败，认为整体检测失败
-            if VERBOSE:
-                if not llm_result['success']:
-                    print("  DEBUG: LLM验证失败")
-                else:
-                    print(f"  DEBUG: LLM置信度过低 ({llm_result['confidence']:.3f} < {llm_confidence_threshold:.3f})")
-            result = {'success': False}
-            
+
+        scored.sort(reverse=True, key=lambda x: x[0])
+        best_score, best_enc = scored[0]
+
+        # If detector is confident enough, prefer it unless heuristic strongly disagrees.
+        chosen_enc = best_enc
+        if detected_encoding and detected_confidence >= chardet_confidence_threshold:
+            det_texts = _decode_zip_names(filename_bytes, detected_encoding)
+            if det_texts is not None:
+                det_score = _score_decoded_names(det_texts)
+                if det_score >= best_score - 5.0:
+                    chosen_enc = detected_encoding
+
+        result.update({
+            'encoding': chosen_enc,
+            'confidence': detected_confidence,
+            'success': True,
+        })
+        return result
+
     except Exception as exc:
         if VERBOSE:
             print(f"  DEBUG: ZIP编码检测异常: {exc}")
-
-    return result
+        return result
 
 
 
@@ -3264,19 +3213,20 @@ def safe_rmtree(path, debug=False):
         return False
 
 
-def safe_move(src, dst, debug=False):
-    """安全的文件/目录移动/重命名"""
+def safe_move(src, dst, debug=False, overwrite=False):
+    """安全的文件/目录移动/重命名（默认不覆盖目标）。"""
+    safe_src = safe_path_for_operation(src, debug)
+    safe_dst = safe_path_for_operation(dst, debug)
+
+    if safe_exists(dst, debug):
+        if not overwrite:
+            raise FileExistsError(f"Destination exists: {dst}")
+        if safe_isfile(dst, debug):
+            safe_remove(dst, debug)
+        else:
+            safe_rmtree(dst, debug)
+
     try:
-        safe_src = safe_path_for_operation(src, debug)
-        safe_dst = safe_path_for_operation(dst, debug)
-
-        # 如果目标已存在，先删除
-        if safe_exists(dst, debug):
-            if safe_isfile(dst, debug):
-                safe_remove(dst, debug)
-            else:
-                safe_rmtree(dst, debug)
-
         shutil.move(safe_src, safe_dst)
         if debug:
             print(f"  DEBUG: 成功移动: {src} -> {dst}")
@@ -3284,7 +3234,7 @@ def safe_move(src, dst, debug=False):
     except Exception as e:
         if debug:
             print(f"  DEBUG: 移动失败 {src} -> {dst}: {e}")
-        return False
+        raise
 
 
 def safe_walk(top, debug=False):
@@ -3622,75 +3572,93 @@ def safe_decode(byte_data, encoding='utf-8', fallback_encodings=None):
 
 def safe_subprocess_run(cmd, **kwargs):
     """
-    Wrapper around subprocess.run with encoding‑safe decoding.
+    subprocess.run 兼容封装：
+    - 输出按需解码（避免乱码/异常）
+    - 支持 SIGINT/SIGTERM 时尽快终止子进程（用于多线程场景）
     """
     kwargs = kwargs.copy()
+
+    check = kwargs.pop('check', False)
+    timeout = kwargs.pop('timeout', None)
+    input_data = kwargs.pop('input', None)
+
+    capture_output = kwargs.pop('capture_output', False)
+    if capture_output:
+        kwargs.setdefault('stdout', subprocess.PIPE)
+        kwargs.setdefault('stderr', subprocess.PIPE)
+
     for flag in ('text', 'encoding', 'universal_newlines'):
         kwargs.pop(flag, None)
 
-    # 调用方如果没有要求捕获输出，则不做解码工作
-    capture_out = ('stdout' in kwargs and kwargs['stdout'] == subprocess.PIPE) \
-                  or ('capture_output' in kwargs and kwargs['capture_output'])
-    capture_err = ('stderr' in kwargs and kwargs['stderr'] == subprocess.PIPE) \
-                  or ('capture_output' in kwargs and kwargs['capture_output'])
+    capture_out = kwargs.get('stdout') == subprocess.PIPE
+    capture_err = kwargs.get('stderr') == subprocess.PIPE
 
+    patched_cmd = _patch_cmd_paths(cmd)
+
+    # Ensure subprocess has its own process group/session so we can terminate it reliably.
+    if os.name == 'nt':
+        creationflags = kwargs.pop('creationflags', 0)
+        creationflags |= getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+        kwargs['creationflags'] = creationflags
+    else:
+        kwargs.setdefault('start_new_session', True)
+
+    proc = subprocess.Popen(patched_cmd, **kwargs)
+    _register_active_subprocess(proc)
     try:
-        patched_cmd = _patch_cmd_paths(cmd)
-        res = subprocess.run(patched_cmd, **kwargs)
-        if capture_out and isinstance(res.stdout, bytes):
-            res.stdout = safe_decode(res.stdout)
-        if capture_err and isinstance(res.stderr, bytes):
-            res.stderr = safe_decode(res.stderr)
-        return res
-    except Exception as exc:
-        if VERBOSE:
-            print(f"  DEBUG: subprocess error: {exc}")
-        # 构造兼容对象
-        class Dummy:
-            def __init__(self, err):
-                self.returncode, self.stdout, self.stderr = 1, '', str(err)
-        return Dummy(exc)
+        start = time.time()
+        stdout_b = None
+        stderr_b = None
+
+        while True:
+            check_interrupt()
+
+            if timeout is not None:
+                elapsed = time.time() - start
+                remaining = timeout - elapsed
+                if remaining <= 0:
+                    _terminate_process_tree(proc)
+                    raise subprocess.TimeoutExpired(patched_cmd, timeout)
+                step = min(0.2, remaining)
+            else:
+                step = 0.2
+
+            try:
+                stdout_b, stderr_b = proc.communicate(input=input_data, timeout=step)
+                break
+            except subprocess.TimeoutExpired:
+                input_data = None  # only send stdin once
+                continue
+
+        stdout_s = safe_decode(stdout_b) if (capture_out and isinstance(stdout_b, (bytes, bytearray))) else stdout_b
+        stderr_s = safe_decode(stderr_b) if (capture_err and isinstance(stderr_b, (bytes, bytearray))) else stderr_b
+
+        completed = subprocess.CompletedProcess(patched_cmd, proc.returncode, stdout_s, stderr_s)
+        if check and completed.returncode != 0:
+            raise subprocess.CalledProcessError(
+                completed.returncode,
+                completed.args,
+                output=completed.stdout,
+                stderr=completed.stderr,
+            )
+        return completed
+    finally:
+        _unregister_active_subprocess(proc)
 
 
 
 def safe_popen_communicate(cmd, **kwargs):
     """
-    Wrapper around subprocess.Popen + communicate
-    ‑‑ 增强日志打印，避免因 command 元素非 str 而触发 TypeError。
+    Compatibility wrapper returning (stdout, stderr, returncode).
+    Uses safe_subprocess_run so the subprocess can be terminated on interrupt.
     """
     kwargs_copy = kwargs.copy()
     for flag in ('text', 'encoding', 'universal_newlines'):
         kwargs_copy.pop(flag, None)
-
-    def _cmd_to_str(c):
-        return ' '.join(map(str, c)) if isinstance(c, (list, tuple)) else str(c)
-
-    try:
-        if VERBOSE:
-            print(f"  DEBUG: 执行Popen命令: {_cmd_to_str(cmd)}")
-
-        proc = subprocess.Popen(cmd,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                **kwargs_copy)
-
-        stdout_b, stderr_b = proc.communicate()
-        stdout_s = safe_decode(stdout_b) if stdout_b else ""
-        stderr_s = safe_decode(stderr_b) if stderr_b else ""
-
-        if VERBOSE:
-            print(f"  DEBUG: Popen返回码: {proc.returncode}")
-            if stdout_s:
-                print(f"  DEBUG: stdout摘要: {stdout_s[:200]}")
-            if stderr_s:
-                print(f"  DEBUG: stderr摘要: {stderr_s[:200]}")
-
-        return stdout_s, stderr_s, proc.returncode
-
-    except Exception as exc:
-        if VERBOSE:
-            print(f"  DEBUG: Popen error: {exc}")
-        return "", str(exc), 1
+    res = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs_copy)
+    stdout_s = res.stdout if isinstance(res.stdout, str) else (safe_decode(res.stdout) if res.stdout else "")
+    stderr_s = res.stderr if isinstance(res.stderr, str) else (safe_decode(res.stderr) if res.stderr else "")
+    return stdout_s or "", stderr_s or "", res.returncode
 
 
 
@@ -4077,12 +4045,8 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
         return success
 
     except KeyboardInterrupt:
-        # Clean up tmp_dir if it was created before interrupt
-        if safe_exists(tmp_dir, VERBOSE):
-            try:
-                safe_rmtree(tmp_dir, VERBOSE)
-            except:
-                pass
+        # Keep temp dir for inspection (or delete if --force-clean-tmp).
+        clean_temp_dir(tmp_dir)
         raise
     except Exception as e:
         if VERBOSE:
@@ -4218,27 +4182,52 @@ def remove_ascii_non_meaningful_chars(text):
 
     return ''.join(result)
 
+def get_staging_dir(root_dir, debug=False):
+    """Get (and create) a staging directory under the given root_dir."""
+    staging_dir = os.path.join(root_dir, '.staging_advDecompress')
+    safe_makedirs(staging_dir, debug=debug)
+    return staging_dir
 
 def clean_temp_dir(temp_dir):
-    """Safely remove temporary directory and confirm it's empty first."""
+    """Clean temp directory.
+
+    Default behavior is conservative: never delete non-empty directories (prevents silent data loss).
+    Use --force-clean-tmp to force-delete non-empty temp directories.
+    """
+    if not safe_exists(temp_dir, VERBOSE):
+        return
+
     try:
-        if safe_exists(temp_dir, VERBOSE):
-            # Check if directory is empty
-            try:
-                if not os.listdir(temp_dir):
-                    safe_rmdir(temp_dir, VERBOSE)
-                    if VERBOSE:
-                        print(f"  DEBUG: 删除空临时目录: {temp_dir}")
-                else:
-                    # If not empty, force remove (this shouldn't happen in normal flow)
-                    safe_rmtree(temp_dir, VERBOSE)
-                    if VERBOSE:
-                        print(f"  WARNING: 临时目录非空，强制删除: {temp_dir}")
-            except Exception as e:
-                if VERBOSE:
-                    print(f"  DEBUG: 删除临时目录失败: {temp_dir}, {e}")
+        safe_temp_dir = safe_path_for_operation(temp_dir, VERBOSE)
+        # If there are no files anywhere under temp_dir, it's safe to delete the whole tree.
+        has_files = False
+        try:
+            for _root, _dirs, files in os.walk(safe_temp_dir):
+                if files:
+                    has_files = True
+                    break
+        except Exception:
+            has_files = True
+
+        if not has_files:
+            safe_rmtree(temp_dir, VERBOSE)
+            if VERBOSE:
+                print(f"  DEBUG: 删除无文件的临时目录树: {temp_dir}")
+            return
+
+        if FORCE_CLEAN_TMP:
+            safe_rmtree(temp_dir, VERBOSE)
+            if VERBOSE:
+                print(f"  WARNING: 临时目录非空，已强制删除: {temp_dir}")
+            return
+
+        suffix = f"{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        keep_dir = f"{temp_dir}.NOT_EMPTY_KEEP_{suffix}"
+        keep_dir_safe = safe_path_for_operation(keep_dir, VERBOSE)
+        os.rename(safe_temp_dir, keep_dir_safe)
+        print(f"  WARNING: 临时目录非空，已保留以便排查: {keep_dir}")
     except Exception as e:
-        print(f"Warning: Could not remove temporary directory {temp_dir}: {e}")
+        print(f"Warning: Could not clean temporary directory {temp_dir}: {e}")
 
 
 def is_zip_format(archive_path):
@@ -4508,8 +4497,9 @@ def apply_only_file_content_policy(tmp_dir, output_dir, archive_name, unique_suf
         apply_separate_policy_internal(tmp_dir, output_dir, archive_name, unique_suffix)
         return
 
-    # 2. 创建content临时目录
-    content_dir = f"content_{unique_suffix}"
+    # 2. 创建content临时目录（放在输出目录的 staging 下，避免跨盘移动）
+    staging_root = get_staging_dir(output_dir, debug=VERBOSE)
+    content_dir = os.path.join(staging_root, f"content_{unique_suffix}")
 
     try:
         safe_makedirs(content_dir, debug=VERBOSE)
@@ -4559,8 +4549,7 @@ def apply_only_file_content_policy(tmp_dir, output_dir, archive_name, unique_suf
 
     finally:
         # 7. 清理content目录
-        if safe_exists(content_dir, VERBOSE):
-            safe_rmtree(content_dir, VERBOSE)
+        clean_temp_dir(content_dir)
 
 
 def apply_file_content_with_folder_policy(tmp_dir, output_dir, archive_name, unique_suffix):
@@ -4586,8 +4575,9 @@ def apply_file_content_with_folder_policy(tmp_dir, output_dir, archive_name, uni
         apply_separate_policy_internal(tmp_dir, output_dir, archive_name, unique_suffix)
         return
 
-    # 2. 创建content临时目录
-    content_dir = f"content_{unique_suffix}"
+    # 2. 创建content临时目录（放在输出目录的 staging 下，避免跨盘移动）
+    staging_root = get_staging_dir(output_dir, debug=VERBOSE)
+    content_dir = os.path.join(staging_root, f"content_{unique_suffix}")
 
     try:
         safe_makedirs(content_dir, debug=VERBOSE)
@@ -4636,8 +4626,7 @@ def apply_file_content_with_folder_policy(tmp_dir, output_dir, archive_name, uni
 
     finally:
         # 7. 清理content目录
-        if safe_exists(content_dir, VERBOSE):
-            safe_rmtree(content_dir, VERBOSE)
+        clean_temp_dir(content_dir)
 
 
 def apply_separate_policy_internal(tmp_dir, output_dir, archive_name, unique_suffix):
@@ -4645,7 +4634,8 @@ def apply_separate_policy_internal(tmp_dir, output_dir, archive_name, unique_suf
     # Check for interrupt at start
     check_interrupt()
     
-    separate_dir = f"separate_{unique_suffix}"
+    staging_root = get_staging_dir(output_dir, debug=VERBOSE)
+    separate_dir = os.path.join(staging_root, f"separate_{unique_suffix}")
 
     try:
         safe_makedirs(separate_dir, debug=VERBOSE)
@@ -4656,20 +4646,12 @@ def apply_separate_policy_internal(tmp_dir, output_dir, archive_name, unique_suf
         safe_makedirs(archive_folder, debug=VERBOSE)
 
         # Move contents from tmp to archive folder
-        try:
-            for item in os.listdir(tmp_dir):
-                # Check for interrupt before each item move
-                check_interrupt()
-                
-                src_item = os.path.join(tmp_dir, item)
-                dest_item = os.path.join(archive_folder, item)
-                safe_move(src_item, dest_item, VERBOSE)
-        except KeyboardInterrupt:
-            # Re-raise interrupt
-            raise
-        except Exception as e:
-            if VERBOSE:
-                print(f"  DEBUG: 移动内容失败: {e}")
+        for item in os.listdir(tmp_dir):
+            # Check for interrupt before each item move
+            check_interrupt()
+            src_item = os.path.join(tmp_dir, item)
+            dest_item = os.path.join(archive_folder, item)
+            safe_move(src_item, dest_item, VERBOSE)
 
         # Check for interrupt before final move
         check_interrupt()
@@ -4681,17 +4663,8 @@ def apply_separate_policy_internal(tmp_dir, output_dir, archive_name, unique_suf
 
         print(f"  Extracted to: {final_archive_path}")
 
-    except KeyboardInterrupt:
-        # Clean up temporary directory on interrupt
-        if safe_exists(separate_dir, VERBOSE):
-            try:
-                safe_rmtree(separate_dir, VERBOSE)
-            except:
-                pass
-        raise
     finally:
-        if safe_exists(separate_dir, VERBOSE):
-            safe_rmtree(separate_dir, VERBOSE)
+        clean_temp_dir(separate_dir)
 
 def apply_file_content_with_folder_separate_policy(tmp_dir, output_dir, archive_name, unique_suffix):
     """
@@ -4716,8 +4689,9 @@ def apply_file_content_with_folder_separate_policy(tmp_dir, output_dir, archive_
         apply_separate_policy_internal(tmp_dir, output_dir, archive_name, unique_suffix)
         return
 
-    # 2. 创建content临时目录
-    content_dir = f"content_{unique_suffix}"
+    # 2. 创建content临时目录（放在输出目录的 staging 下，避免跨盘移动）
+    staging_root = get_staging_dir(output_dir, debug=VERBOSE)
+    content_dir = os.path.join(staging_root, f"content_{unique_suffix}")
 
     try:
         safe_makedirs(content_dir, debug=VERBOSE)
@@ -4777,8 +4751,7 @@ def apply_file_content_with_folder_separate_policy(tmp_dir, output_dir, archive_
 
     finally:
         # 7. 清理content目录
-        if safe_exists(content_dir, VERBOSE):
-            safe_rmtree(content_dir, VERBOSE)
+        clean_temp_dir(content_dir)
             
 
 def apply_only_file_content_direct_policy(tmp_dir, output_dir, archive_name, unique_suffix):
@@ -4801,8 +4774,9 @@ def apply_only_file_content_direct_policy(tmp_dir, output_dir, archive_name, uni
         apply_only_file_content_policy(tmp_dir, output_dir, archive_name, unique_suffix)
         return
 
-    # 2. 临时 content 目录
-    content_dir = f"content_{unique_suffix}"
+    # 2. 临时 content 目录（放在输出目录的 staging 下，避免跨盘移动）
+    staging_root = get_staging_dir(output_dir, debug=VERBOSE)
+    content_dir = os.path.join(staging_root, f"content_{unique_suffix}")
     safe_makedirs(content_dir, debug=VERBOSE)
 
     try:
@@ -4856,8 +4830,7 @@ def apply_only_file_content_direct_policy(tmp_dir, output_dir, archive_name, uni
 
     finally:
         # 清理临时 content_dir
-        if safe_exists(content_dir, VERBOSE):
-            safe_rmtree(content_dir, VERBOSE)
+        clean_temp_dir(content_dir)
 
 
 def apply_file_content_collect_policy(tmp_dir, output_dir, archive_name, threshold, unique_suffix):
@@ -4925,8 +4898,9 @@ def apply_file_content_collect_policy(tmp_dir, output_dir, archive_name, thresho
                 print(f"  Extracted to: {output_dir} ({total_items} items < {threshold})")
         return
 
-    # 2. 创建content临时目录
-    content_dir = f"content_{unique_suffix}"
+    # 2. 创建content临时目录（放在输出目录的 staging 下，避免跨盘移动）
+    staging_root = get_staging_dir(output_dir, debug=VERBOSE)
+    content_dir = os.path.join(staging_root, f"content_{unique_suffix}")
 
     try:
         safe_makedirs(content_dir, debug=VERBOSE)
@@ -5023,9 +4997,8 @@ def apply_file_content_collect_policy(tmp_dir, output_dir, archive_name, thresho
                 print(f"  Extracted using file-content-{threshold}-collect policy to: {output_dir} ({total_items} items < {threshold})")
 
     finally:
-        # 6. 清理content目录和tmp目录
-        if safe_exists(content_dir, VERBOSE):
-            safe_rmtree(content_dir, VERBOSE)
+        # 6. 清理content目录
+        clean_temp_dir(content_dir)
 
 
 # ==================== 结束新增解压策略 ====================
@@ -5043,17 +5016,17 @@ def check_rar_available():
         if VERBOSE:
             print(f"  DEBUG: 检查rar命令可用性")
         
-        # Try to run rar command to check if it's available
-        result = safe_subprocess_run(['rar'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Fast path: in PATH?
+        if shutil.which('rar') is None:
+            if VERBOSE:
+                print(f"  DEBUG: rar命令未找到 (shutil.which)")
+            return False
 
-        # rar command typically returns non-zero when run without arguments
-        # but if it's found, we should get some output
-        available = True  # If command runs without FileNotFoundError, it's available
-
+        # Try to run rar command to check it can start
+        safe_subprocess_run(['rar'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if VERBOSE:
-            print(f"  DEBUG: rar命令{'可用' if available else '不可用'}")
-
-        return available
+            print(f"  DEBUG: rar命令可用")
+        return True
 
     except FileNotFoundError:
         if VERBOSE:
@@ -5249,8 +5222,9 @@ def apply_file_content_auto_folder_collect_len_policy(tmp_dir, output_dir, archi
     if VERBOSE:
         print(f"  DEBUG: 确定的deepest_folder_name: {deepest_folder_name}")
 
-    # 3. 创建content临时目录
-    content_dir = f"content_{unique_suffix}"
+    # 3. 创建content临时目录（放在输出目录的 staging 下，避免跨盘移动）
+    staging_root = get_staging_dir(output_dir, debug=VERBOSE)
+    content_dir = os.path.join(staging_root, f"content_{unique_suffix}")
 
     try:
         safe_makedirs(content_dir, debug=VERBOSE)
@@ -5353,8 +5327,7 @@ def apply_file_content_auto_folder_collect_len_policy(tmp_dir, output_dir, archi
 
     finally:
         # 8. 清理content目录
-        if safe_exists(content_dir, VERBOSE):
-            safe_rmtree(content_dir, VERBOSE)
+        clean_temp_dir(content_dir)
 
 
 def apply_file_content_auto_folder_collect_meaningful_policy(tmp_dir, output_dir, archive_name, threshold, unique_suffix):
@@ -5426,8 +5399,9 @@ def apply_file_content_auto_folder_collect_meaningful_policy(tmp_dir, output_dir
     if VERBOSE:
         print(f"  DEBUG: 确定的deepest_folder_name: {deepest_folder_name}")
 
-    # 3. 创建content临时目录
-    content_dir = f"content_{unique_suffix}"
+    # 3. 创建content临时目录（放在输出目录的 staging 下，避免跨盘移动）
+    staging_root = get_staging_dir(output_dir, debug=VERBOSE)
+    content_dir = os.path.join(staging_root, f"content_{unique_suffix}")
 
     try:
         safe_makedirs(content_dir, debug=VERBOSE)
@@ -5535,13 +5509,13 @@ def apply_file_content_auto_folder_collect_meaningful_policy(tmp_dir, output_dir
 
     finally:
         # 8. 清理content目录
-        if safe_exists(content_dir, VERBOSE):
-            safe_rmtree(content_dir, VERBOSE)
+        clean_temp_dir(content_dir)
 
 
 def main():
     """Main function."""
     global VERBOSE
+    global FORCE_CLEAN_TMP
 
     # Setup UTF-8 environment early
     setup_windows_utf8()
@@ -5596,7 +5570,7 @@ def main():
         default=90,
         help='Minimum confidence percentage for auto-detection (default: 90). '
              'Only used with --traditional-zip-policy decode-auto. '
-             'Files with detection confidence below this threshold will be skipped.'
+             'Used as a hint when selecting among candidate encodings (lower = more willing to accept the detector output).'
     )
 
     parser.add_argument(
@@ -5606,21 +5580,6 @@ def main():
         help='Library to use for encoding detection (default: chardet). '
              'chardet: Traditional chardet library. '
              'charset_normalizer: Modern charset-normalizer library with better accuracy.'
-    )
-
-    parser.add_argument(
-        '-el', '--enable-llm',
-        action='store_true',
-        help='Enable LLM verification after chardet detection in decode-auto mode. '
-             'LLM will verify the language consistency of decoded text.'
-    )
-
-    parser.add_argument(
-        '-lc', '--llm-confidence',
-        type=int,
-        default=95,
-        help='Minimum confidence percentage for LLM language verification (default: 95). '
-             'Only used when --enable-llm is specified.'
     )
 
     parser.add_argument(
@@ -5670,6 +5629,12 @@ def main():
         '-n', '--dry-run',
         action='store_true',
         help='Preview mode - do not actually extract'
+    )
+
+    parser.add_argument(
+        '--force-clean-tmp',
+        action='store_true',
+        help='Force-delete non-empty temp/staging directories (unsafe; disables default keep-on-failure behavior).'
     )
 
     parser.add_argument(
@@ -5776,6 +5741,7 @@ def main():
 
     # Set global verbose flag
     VERBOSE = args.verbose
+    FORCE_CLEAN_TMP = bool(getattr(args, 'force_clean_tmp', False))
 
     # 设置信号处理器
     if hasattr(signal, 'SIGINT'):
@@ -5853,35 +5819,6 @@ def main():
             if args.traditional_zip_decode_confidence < 0 or args.traditional_zip_decode_confidence > 100:
                 print(f"Error: --traditional-zip-decode-confidence must be between 0 and 100")
                 return 1
-            
-            # 验证LLM置信度参数范围
-            if args.llm_confidence < 0 or args.llm_confidence > 100:
-                print(f"Error: --llm-confidence must be between 0 and 100")
-                return 1
-            
-            # 检查依赖库是否可用（仅对decode-auto策略）
-            if policy == 'decode-auto':
-                try:
-                    import zipfile
-                    if args.traditional_zip_decode_model == 'charset_normalizer':
-                        from charset_normalizer import detect
-                    else:
-                        import chardet
-                    if args.enable_llm:
-                        from transformers import pipeline
-                except ImportError as e:
-                    if 'chardet' in str(e):
-                        print(f"Error: chardet library is required for --traditional-zip-policy decode-auto: {e}")
-                        print("Please install: pip install chardet")
-                    elif 'charset_normalizer' in str(e):
-                        print(f"Error: charset_normalizer library is required for --traditional-zip-decode-model charset_normalizer: {e}")
-                        print("Please install: pip install charset-normalizer")
-                    elif args.enable_llm and ('transformers' in str(e) or 'torch' in str(e)):
-                        print(f"Error: transformers library is required for --enable-llm: {e}")
-                        print("Please install: pip install transformers torch")
-                    else:
-                        print(f"Error: Required library not available: {e}")
-                    return 1
 
         # Validate decompress policy
         if args.decompress_policy not in ['separate', 'direct', 'only-file-content', 'file-content-with-folder', 'file-content-with-folder-separate', 'only-file-content-direct']:

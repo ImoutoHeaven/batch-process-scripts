@@ -1,6 +1,6 @@
 # advDecompress
 
-一个跨平台（Windows 10 / Debian 12 等）高级批量解压脚本，支持递归扫描目录、自动识别并处理多种归档格式（7z / RAR / ZIP / 自解压 EXE 等），同时提供多线程、传统 ZIP 编码修复、LLM 语言校验、RAR CLI 优先、灵活的解压策略、全局锁等丰富功能，方便在大规模文件清理、备份整理、资源归档等场景下使用。
+一个跨平台（Windows 10 / Debian 12 等）高级批量解压脚本，支持递归扫描目录、自动识别并处理多种归档格式（7z / RAR / ZIP / 自解压 EXE 等），同时提供多线程、传统 ZIP 编码修复、RAR CLI 优先、灵活的解压策略、全局锁等丰富功能，方便在大规模文件清理、备份整理、资源归档等场景下使用。
 
 > **许可：** 本项目采用 MIT 许可证。
 
@@ -11,7 +11,7 @@
 * **格式丰富**：内建 7-Zip（须自行安装）作为主解压引擎，可选调用 RAR CLI 处理 RAR/SFX。
 * **递归扫描**：可按深度范围过滤子目录，自动判断单卷 / 多卷、SFX、传统编码 ZIP 等复杂情况。
 * **灵活策略**：内置 10+ 种解压策略，可根据文件数量、目录深度等自动选择输出结构。
-* **传统 ZIP 支持**：自动/手动转码（Shift-JIS、GBK…），可用 LLM 二次校验，彻底解决乱码问题。
+* **传统 ZIP 支持**：自动/手动转码（Shift-JIS、GBK…），尽量解决乱码问题。
 * **多线程 & 全局锁**：支持并发解压，配合锁文件避免多实例冲突。
 * **成功/失败后处理**：成功或失败的归档可选择删除 / 保留 / 移动到指定目录。
 * **扩展名修复**：智能检测文件头并修复错误扩展名，支持大小阈值过滤以提升处理效率。
@@ -32,10 +32,7 @@
    # 或
    pip install charset-normalizer
 
-   # 若启用 LLM 语言校验，请再安装
-   pip install torch transformers
    ```
-   启用 LLM 时脚本将在首次运行时自动下载所需模型，无需额外配置。
 
 ---
 
@@ -63,8 +60,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `-tzt`, `--traditional-zip-to` | 当策略为 `move` 时，传统 ZIP 移动目录 | - |
 | `-tzdc`, `--traditional-zip-decode-confidence` | `decode-auto` 最低置信度(%) | 90 |
 | `-tzdm`, `--traditional-zip-decode-model` | 编码检测模型：`chardet` / `charset_normalizer` | `chardet` |
-| `-el`, `--enable-llm` | 启用 LLM 语言校验 | 关闭 |
-| `-lc`, `--llm-confidence` | LLM 校验最低置信度(%) | 95 |
+| `--force-clean-tmp` | 强制删除非空临时/中转目录（不安全，不建议） | 关闭 |
 | `-er`, `--enable-rar` | 优先使用 RAR CLI 解压 RAR/SFX | 关闭 |
 | `-t`, `--threads` | 并行解压线程数 | 1 |
 | `-dp`, `--decompress-policy` | 解压策略（下节详述） | `2-collect` |
