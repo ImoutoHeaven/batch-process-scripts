@@ -76,6 +76,16 @@ class TestTxnPrimitives(unittest.TestCase):
             os.makedirs(b)
             self.assertTrue(self.m.same_volume(a, b))
 
+    def test_find_file_content_empty_dir_chain(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = os.path.join(td, "tmp")
+            deepest = os.path.join(root, "a", "b", "c")
+            os.makedirs(deepest)
+            info = self.m.find_file_content(root, debug=False)
+            self.assertTrue(info["found"])
+            self.assertEqual(os.path.normpath(info["path"]), os.path.normpath(deepest))
+            self.assertEqual(info["items"], [])
+
     def test_file_lock_exclusive_posix(self):
         if os.name == "nt":
             self.skipTest("POSIX-only lock behavior")

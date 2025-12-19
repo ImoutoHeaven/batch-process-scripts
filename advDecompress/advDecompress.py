@@ -3898,7 +3898,7 @@ def _plan_file_content_with_folder_separate_moves(txn, *, conflict_mode):
         _txn_snapshot(txn)
 
     file_content = find_file_content(incoming_dir, VERBOSE)
-    if not file_content.get("found") or not file_content.get("items"):
+    if not file_content.get("found"):
         # Fallback to a pure separate commit (still transactional/atomic-ish).
         placement["final_dir"] = archive_container_dir
         _txn_snapshot(txn)
@@ -3918,7 +3918,7 @@ def _plan_file_content_with_folder_separate_moves(txn, *, conflict_mode):
     safe_makedirs(final_archive_dir, debug=VERBOSE)
 
     plans = []
-    for item in sorted(file_content["items"], key=lambda x: x["name"]):
+    for item in sorted((file_content.get("items") or []), key=lambda x: x["name"]):
         src = item["path"]
         dst = os.path.join(final_archive_dir, item["name"])
         if safe_exists(dst, VERBOSE):
@@ -5370,6 +5370,16 @@ def find_file_content(tmp_dir, debug=False):
 
         if debug:
             print(f"  DEBUG: 深度{depth}: 文件{file_count} 目录{dir_count} 项目{len(items)}")
+
+        # Empty directory: treat it as the innermost file_content (rule #3), producing empty output.
+        if file_count == 0 and dir_count == 0:
+            result["found"] = True
+            result["depth"] = depth
+            result["items"] = []
+            result["path"] = current
+            result["parent_folder_path"] = current
+            result["parent_folder_name"] = os.path.basename(current)
+            break
 
         if file_count > 0 or dir_count >= 2:
             result["found"] = True
