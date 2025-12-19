@@ -3573,6 +3573,7 @@ class FileLock:
                     else:
                         import msvcrt
 
+                        f.seek(0)
                         msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
 
                     self._file = f
@@ -3724,11 +3725,18 @@ def _replay_wal(wal_path):
 
     safe_wal = safe_path_for_operation(wal_path, VERBOSE)
     with open(safe_wal, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
+        for raw_line in f:
+            line = raw_line.strip()
             if not line:
                 continue
-            r = json.loads(line)
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                # Most common crash pattern: the last WAL record is half-written.
+                # Treat it as EOF instead of corruption.
+                if not raw_line.endswith("\n"):
+                    break
+                raise
             if r.get("t") == "MOVE_PLAN":
                 plans_by_id[int(r["id"])] = r
             elif r.get("t") == "MOVE_DONE":
@@ -3806,7 +3814,7 @@ def _resolve_policy_under_lock(txn, conflict_mode):
     if policy == "file-content-with-folder-separate":
         return "file-content-with-folder-separate"
 
-    m = re.match(r"^(\\d+)-collect$", policy)
+    m = re.match(r"^(\d+)-collect$", policy)
     if m:
         threshold = int(m.group(1))
         files, dirs = count_items_in_dir(txn["paths"]["incoming_dir"])
@@ -3879,31 +3887,45 @@ def _plan_separate_dir_move(txn):
 def _plan_file_content_with_folder_separate_moves(txn, *, conflict_mode):
     output_dir = txn["output_dir"]
     incoming_dir = txn["paths"]["incoming_dir"]
-    archive_stem = get_archive_base_name(txn["archive_path"])
+    archive_name = get_archive_base_name(txn["archive_path"])
     suffix_token = txn["txn_id"][:8]
 
-    separate_dir = txn.get("placement", {}).get("separate_dir")
-    if not separate_dir:
-        separate_dir = _choose_unique_dir(output_dir, archive_stem, suffix_token)
-        txn.setdefault("placement", {})["separate_dir"] = separate_dir
+    placement = txn.setdefault("placement", {})
+    archive_container_dir = placement.get("archive_container_dir")
+    if not archive_container_dir:
+        archive_container_dir = _choose_unique_dir(output_dir, archive_name, suffix_token)
+        placement["archive_container_dir"] = archive_container_dir
         _txn_snapshot(txn)
 
-    safe_makedirs(separate_dir, debug=VERBOSE)
+    file_content = find_file_content(incoming_dir, VERBOSE)
+    if not file_content.get("found") or not file_content.get("items"):
+        # Fallback to a pure separate commit (still transactional/atomic-ish).
+        placement["final_dir"] = archive_container_dir
+        _txn_snapshot(txn)
+        return [{"t": "MOVE_PLAN", "id": _txn_next_move_id(txn), "src": incoming_dir, "dst": archive_container_dir}]
+
+    deepest_folder_name = get_deepest_folder_name(file_content, incoming_dir, archive_name)
+    placement["deepest_folder_name"] = deepest_folder_name
+
+    if archive_name == deepest_folder_name:
+        final_archive_dir = archive_container_dir
+    else:
+        final_archive_dir = os.path.join(archive_container_dir, deepest_folder_name)
+
+    placement["final_archive_dir"] = final_archive_dir
+    _txn_snapshot(txn)
+
+    safe_makedirs(final_archive_dir, debug=VERBOSE)
 
     plans = []
-    for name in sorted(os.listdir(incoming_dir)):
-        src = os.path.join(incoming_dir, name)
-        if safe_isfile(src, VERBOSE):
-            dst = os.path.join(output_dir, name)
-        else:
-            dst = os.path.join(separate_dir, name)
-
+    for item in sorted(file_content["items"], key=lambda x: x["name"]):
+        src = item["path"]
+        dst = os.path.join(final_archive_dir, item["name"])
         if safe_exists(dst, VERBOSE):
             if conflict_mode == "suffix":
                 dst = _ensure_unique_path(dst, suffix_token)
             else:
                 raise FileExistsError(f"Conflict: {dst}")
-
         plans.append({"t": "MOVE_PLAN", "id": _txn_next_move_id(txn), "src": src, "dst": dst})
 
     return plans
@@ -3985,12 +4007,15 @@ def _resume_placing_from_wal(txn, *, wal_fsync_every, degrade_cross_volume=False
     return True
 
 
-def _assert_incoming_empty(txn):
+def _drain_incoming_dir(txn):
     incoming_dir = txn["paths"]["incoming_dir"]
     if not safe_exists(incoming_dir, VERBOSE):
         return
-    if os.listdir(incoming_dir):
-        raise RuntimeError(f"incoming_dir not empty: {incoming_dir}")
+    for _root, _dirs, files in safe_walk(incoming_dir, VERBOSE):
+        if files:
+            raise RuntimeError(f"incoming_dir contains files after placing: {incoming_dir}")
+    # Only empty directories remain -> delete the whole tree so recovery won't fail on non-empty dirs.
+    safe_rmtree(incoming_dir, VERBOSE)
 
 
 def _commit_incoming(txn, *, degrade_cross_volume=False):
@@ -4036,6 +4061,8 @@ def _finalize_sources_success(txn, *, args):
         safe_makedirs(trash_dir, debug=VERBOSE)
 
         for v in volumes:
+            if not safe_exists(v, VERBOSE):
+                continue
             if strict and not same_volume(v, output_dir):
                 raise RuntimeError(f"Source volume not on same volume as output_dir (strict): {v}")
 
@@ -4057,6 +4084,8 @@ def _finalize_sources_success(txn, *, args):
         safe_makedirs(dest_dir, debug=VERBOSE)
 
         for v in volumes:
+            if not safe_exists(v, VERBOSE):
+                continue
             if strict and not same_volume(v, dest_dir):
                 raise RuntimeError(f"success_to not on same volume as source (strict): {v}")
             dst = os.path.join(dest_dir, os.path.basename(v))
@@ -4080,6 +4109,8 @@ def _finalize_sources_failure(volumes, *, args, txn=None):
 
     strict = not bool(getattr(args, "degrade_cross_volume", False))
     for v in volumes:
+        if not safe_exists(v, VERBOSE):
+            continue
         if strict and not same_volume(v, dest_dir):
             raise RuntimeError(f"fail_to not on same volume as source (strict): {v}")
         dst = os.path.join(dest_dir, os.path.basename(v))
@@ -4152,10 +4183,11 @@ def _recover_output_dir(output_dir, *, args):
         try:
             _place_and_finalize_txn(txn, args=args, recovery=True)
         except Exception as e:
-            try:
-                _txn_fail(txn, "RECOVER_FAILED", e)
-            except Exception:
-                pass
+            if txn.get("state") not in (TXN_STATE_FAILED, TXN_STATE_ABORTED):
+                try:
+                    _txn_fail(txn, "RECOVER_FAILED", e)
+                except Exception:
+                    pass
             print(f"  Warning: Recover failed for txn={txn.get('txn_id')}: {e}")
 
 
@@ -4294,6 +4326,26 @@ def _place_and_finalize_txn(txn, *, args, recovery=False):
         return
 
     try:
+        # Crash-safe heuristic: if we crashed before snapshotting EXTRACTED/INCOMING_COMMITTED,
+        # try to infer the correct state from presence of staging/incoming directories.
+        if txn.get("state") == TXN_STATE_INIT:
+            staging_extracted = txn["paths"]["staging_extracted"]
+            incoming_dir = txn["paths"]["incoming_dir"]
+            if safe_exists(incoming_dir, VERBOSE):
+                files, dirs = count_items_in_dir(incoming_dir)
+                if files + dirs <= 0:
+                    raise RuntimeError("init_incomplete: incoming_dir is empty")
+                txn["state"] = TXN_STATE_INCOMING_COMMITTED
+                _txn_snapshot(txn)
+            elif safe_exists(staging_extracted, VERBOSE):
+                files, dirs = count_items_in_dir(staging_extracted)
+                if files + dirs <= 0:
+                    raise RuntimeError("init_incomplete: staging_extracted is empty")
+                txn["state"] = TXN_STATE_EXTRACTED
+                _txn_snapshot(txn)
+            else:
+                raise RuntimeError("init_incomplete: missing both staging_extracted and incoming_dir")
+
         if txn.get("state") == TXN_STATE_EXTRACTED:
             _commit_incoming(txn, degrade_cross_volume=args.degrade_cross_volume)
 
@@ -4320,7 +4372,7 @@ def _place_and_finalize_txn(txn, *, args, recovery=False):
                     degrade_cross_volume=args.degrade_cross_volume,
                 )
 
-            _assert_incoming_empty(txn)
+            _drain_incoming_dir(txn)
             txn["state"] = TXN_STATE_PLACED
             _txn_snapshot(txn)
 
@@ -4339,8 +4391,12 @@ def _place_and_finalize_txn(txn, *, args, recovery=False):
             txn["state"] = TXN_STATE_CLEANED
             _txn_snapshot(txn)
 
-        txn["state"] = TXN_STATE_DONE
-        _txn_snapshot(txn)
+        if txn.get("state") == TXN_STATE_CLEANED:
+            txn["state"] = TXN_STATE_DONE
+            _txn_snapshot(txn)
+
+        if txn.get("state") not in (TXN_STATE_DONE, TXN_STATE_FAILED, TXN_STATE_ABORTED):
+            raise RuntimeError(f"unhandled_txn_state: {txn.get('state')}")
     except KeyboardInterrupt as e:
         _txn_fail(txn, "ABORTED", e)
         raise
@@ -5285,167 +5341,53 @@ def find_file_content(tmp_dir, debug=False):
     if debug:
         print(f"  DEBUG: 开始查找file_content: {tmp_dir}")
 
-    def get_items_at_depth(path, current_depth=1):
-        """获取指定深度的所有项目"""
+    # Fast path: walk down the "single-dir shell" until we hit a layer with:
+    # - any file, or
+    # - 2+ sub-directories,
+    # otherwise the deepest layer (rule #3).
+    current = tmp_dir
+    depth = 1
+    while True:
         try:
-            items = []
-            if current_depth == 1:
-                # 直接列出当前目录内容
-                for item in os.listdir(path):
-                    item_path = os.path.join(path, item)
-                    items.append({
-                        'name': item,
-                        'path': item_path,
-                        'is_dir': safe_isdir(item_path, debug)
-                    })
-            else:
-                # 递归查找指定深度的项目
-                for root, dirs, files in safe_walk(path, debug):
-                    rel_path = os.path.relpath(root, path)
-                    depth = len([p for p in rel_path.split(os.sep) if p and p != '.'])
-
-                    if depth == current_depth - 1:
-                        # 这一层的目录，添加其子项目
-                        for dir_name in dirs:
-                            dir_path = os.path.join(root, dir_name)
-                            items.append({
-                                'name': dir_name,
-                                'path': dir_path,
-                                'is_dir': True
-                            })
-                        for file_name in files:
-                            file_path = os.path.join(root, file_name)
-                            items.append({
-                                'name': file_name,
-                                'path': file_path,
-                                'is_dir': False
-                            })
-            return items
+            safe_current = safe_path_for_operation(current, debug)
+            names = os.listdir(safe_current)
         except Exception as e:
             if debug:
-                print(f"  DEBUG: 获取深度{current_depth}项目失败: {e}")
-            return []
-
-    # 从深度1开始递归查找
-    max_search_depth = 10  # 避免无限递归
-
-    for depth in range(1, max_search_depth + 1):
-        items = get_items_at_depth(tmp_dir, depth)
-
-        if debug:
-            print(f"  DEBUG: 深度{depth}: 找到{len(items)}个项目")
-            for item in items[:5]:  # 只显示前5个
-                print(f"    {item['name']} ({'文件夹' if item['is_dir'] else '文件'})")
-
-        if len(items) >= 2:
-            # 找到file_content
-            result['found'] = True
-            result['depth'] = depth
-            result['items'] = items
-
-            # 计算file_content所在的父目录路径和名称
-            if depth == 1:
-                result['path'] = tmp_dir
-                result['parent_folder_path'] = tmp_dir
-                result['parent_folder_name'] = os.path.basename(tmp_dir)
-            else:
-                # 需要找到深度为depth-1的目录
-                for root, dirs, files in safe_walk(tmp_dir, debug):
-                    rel_path = os.path.relpath(root, tmp_dir)
-                    if rel_path == '.':
-                        current_depth = 0
-                    else:
-                        current_depth = len([p for p in rel_path.split(os.sep) if p])
-
-                    if current_depth == depth - 1:
-                        result['path'] = root
-                        result['parent_folder_path'] = root
-                        result['parent_folder_name'] = os.path.basename(root)
-                        break
-
-            if debug:
-                print(f"  DEBUG: 找到file_content在深度{depth}")
-                print(f"  DEBUG: file_content路径: {result['path']}")
-                print(f"  DEBUG: 父文件夹路径: {result['parent_folder_path']}")
-                print(f"  DEBUG: 父文件夹名称: {result['parent_folder_name']}")
+                print(f"  DEBUG: 列出目录失败: {current}: {e}")
             break
 
-        if not items:
-            # 没有更深的项目了
+        items = []
+        file_count = 0
+        dir_count = 0
+        for name in names:
+            p = os.path.join(current, name)
+            is_dir = safe_isdir(p, debug)
+            items.append({"name": name, "path": p, "is_dir": is_dir})
+            if is_dir:
+                dir_count += 1
+            else:
+                file_count += 1
+
+        if debug:
+            print(f"  DEBUG: 深度{depth}: 文件{file_count} 目录{dir_count} 项目{len(items)}")
+
+        if file_count > 0 or dir_count >= 2:
+            result["found"] = True
+            result["depth"] = depth
+            result["items"] = items
+            result["path"] = current
+            result["parent_folder_path"] = current
+            result["parent_folder_name"] = os.path.basename(current)
             break
 
-    if not result['found']:
-        # 特殊情况：没有找到满足条件的file_content
-        # 找最深层的单个项目作为file_content
-        if debug:
-            print(f"  DEBUG: 没有找到标准file_content，查找最深层项目")
+        if dir_count == 1 and file_count == 0:
+            only_dir = next(i for i in items if i["is_dir"])
+            current = only_dir["path"]
+            depth += 1
+            continue
 
-        deepest_items = []
-        max_depth = 0
-        deepest_parent_path = tmp_dir
-
-        for root, dirs, files in safe_walk(tmp_dir, debug):
-            rel_path = os.path.relpath(root, tmp_dir)
-            if rel_path == '.':
-                depth = 0
-            else:
-                depth = len([p for p in rel_path.split(os.sep) if p])
-
-            if depth > max_depth:
-                max_depth = depth
-                deepest_items = []
-                deepest_parent_path = root
-
-                # 添加当前层的文件
-                for file_name in files:
-                    file_path = os.path.join(root, file_name)
-                    deepest_items.append({
-                        'name': file_name,
-                        'path': file_path,
-                        'is_dir': False
-                    })
-
-                # 添加当前层的空目录
-                for dir_name in dirs:
-                    dir_path = os.path.join(root, dir_name)
-                    # 检查这个目录是否有子内容
-                    has_content = False
-                    try:
-                        for sub_root, sub_dirs, sub_files in safe_walk(dir_path, debug):
-                            if sub_dirs or sub_files:
-                                has_content = True
-                                break
-                    except:
-                        pass
-
-                    if not has_content:
-                        deepest_items.append({
-                            'name': dir_name,
-                            'path': dir_path,
-                            'is_dir': True
-                        })
-            elif depth == max_depth:
-                # 添加到当前最深层
-                for file_name in files:
-                    file_path = os.path.join(root, file_name)
-                    deepest_items.append({
-                        'name': file_name,
-                        'path': file_path,
-                        'is_dir': False
-                    })
-
-        if deepest_items:
-            result['found'] = True
-            result['depth'] = max_depth + 1
-            result['items'] = deepest_items
-            result['path'] = deepest_parent_path
-            result['parent_folder_path'] = deepest_parent_path
-            result['parent_folder_name'] = os.path.basename(deepest_parent_path)
-
-            if debug:
-                print(f"  DEBUG: 使用最深层项目作为file_content，深度{result['depth']}")
-                print(f"  DEBUG: 父文件夹路径: {result['parent_folder_path']}")
-                print(f"  DEBUG: 父文件夹名称: {result['parent_folder_name']}")
+        # Empty directory or other non-informative state.
+        break
 
     return result
 
@@ -5787,7 +5729,18 @@ def apply_only_file_content_direct_policy(tmp_dir, output_dir, archive_name, uni
         if conflict_found:
             if VERBOSE:
                 print(f"  DEBUG: 检测到文件冲突，回退only-file-content策略")
-            apply_only_file_content_policy(tmp_dir, output_dir, archive_name, unique_suffix)
+            # content_dir already holds the extracted file_content; fallback should operate on it,
+            # not on tmp_dir (which is now only empty shells).
+            final_archive_dir = os.path.join(output_dir, archive_name)
+            final_archive_dir = ensure_unique_name(final_archive_dir, unique_suffix)
+            safe_makedirs(final_archive_dir, debug=VERBOSE)
+
+            for item in os.listdir(content_dir):
+                src_path = os.path.join(content_dir, item)
+                dst_path = os.path.join(final_archive_dir, item)
+                safe_move(src_path, dst_path, VERBOSE)
+
+            print(f"  Extracted using only-file-content policy to: {final_archive_dir} (conflicts detected)")
             return
 
         # 4. 无冲突 -> 合并/移动到 output_dir
@@ -6743,7 +6696,7 @@ def main():
         '--fsync-files',
         choices=['auto', 'none'],
         default='auto',
-        help='Durability fsync strategy (default: auto).'
+        help='Durability fsync strategy (default: auto). auto: fsync WAL + txn.json only (does not fsync output files).'
     )
 
     parser.add_argument(

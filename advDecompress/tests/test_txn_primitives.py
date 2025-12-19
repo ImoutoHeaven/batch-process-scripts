@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 import importlib.util
+import types
 from multiprocessing import Process, Pipe
 
 
@@ -44,11 +45,28 @@ class TestTxnPrimitives(unittest.TestCase):
                 for r in records:
                     f.write(json.dumps(r) + "\n")
 
+            # Simulate crash: last line half-written (should be treated as EOF).
+            with open(wal, "a", encoding="utf-8") as f:
+                f.write('{"t":"MOVE_DONE","id":')
+
             plans, done = self.m._replay_wal(wal)
             self.assertIn(1, plans)
             self.assertIn(2, plans)
             self.assertIn(1, done)
             self.assertNotIn(2, done)
+
+    def test_n_collect_matches_in_txn_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "out")
+            os.makedirs(out)
+            paths = {"incoming_dir": os.path.join(td, "incoming")}
+            os.makedirs(paths["incoming_dir"])
+            with open(os.path.join(paths["incoming_dir"], "x.txt"), "w", encoding="utf-8") as f:
+                f.write("x")
+
+            txn = {"policy_frozen": False, "policy": "2-collect", "paths": paths, "output_dir": out}
+            resolved = self.m._resolve_policy_under_lock(txn, conflict_mode="fail")
+            self.assertEqual(resolved, "direct")
 
     def test_same_volume_basic(self):
         with tempfile.TemporaryDirectory() as td:
@@ -110,7 +128,44 @@ class TestTxnPrimitives(unittest.TestCase):
             resolved = self.m._resolve_policy_under_lock(txn, conflict_mode="fail")
             self.assertEqual(resolved, "separate")
 
+    def test_init_txn_not_marked_done(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "out")
+            os.makedirs(out)
+            txn = self.m._txn_create(
+                archive_path=os.path.join(td, "a.7z"),
+                volumes=[],
+                output_dir=out,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_INIT
+            self.m._txn_snapshot(txn)
+
+            args = types.SimpleNamespace(
+                degrade_cross_volume=False,
+                conflict_mode="fail",
+                wal_fsync_every=1,
+                fsync_files="none",
+                success_policy="asis",
+                success_to=None,
+                fail_policy="asis",
+                fail_to=None,
+                keep_journal_days=7,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                no_durability=True,
+            )
+
+            with self.assertRaises(Exception):
+                self.m._place_and_finalize_txn(txn, args=args, recovery=True)
+
+            with open(txn["paths"]["txn_json"], "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertNotEqual(saved["state"], self.m.TXN_STATE_DONE)
+
 
 if __name__ == "__main__":
     unittest.main()
-

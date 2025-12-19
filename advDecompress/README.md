@@ -90,7 +90,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | 策略名 | 行为说明 |
 |---------|----------|
 | `separate` | 总在 `<归档名>/` 新建独立文件夹，避免与现有文件冲突。 |
-| `direct` | 尝试直接写入目标目录；若文件/文件夹冲突自动回退 `separate`。 |
+| `direct` | 尝试直接写入目标目录；事务化模式默认冲突即失败（可用 `--conflict-mode suffix` 自动改名），`--legacy` 才会回退 `separate`。 |
 | `collect` | （事务化模式）锁内基于冲突自动选择 `direct` 或 `separate`。 |
 | `only-file-content` | 仅提取最深层 **file_content**（通常是单一有效文件夹）至 `<归档名>/`。 |
 | `only-file-content-direct` | 同上，但若不存在冲突则直接落在目标目录。 |
@@ -105,6 +105,8 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 >
 > 事务化模式（默认）目前支持：`separate` / `direct` / `collect` / `N-collect` / `file-content-with-folder-separate`。  
 > 其他策略请使用 `--legacy`。
+>
+> Durability 边界：默认只对 `txn.wal` 与 `txn.json` 做 best-effort `fsync`，不逐文件刷盘输出内容。
 
 ---
 
