@@ -14,6 +14,7 @@ import struct
 import subprocess
 import argparse
 import shutil
+import json
 import time
 import threading
 import uuid
@@ -23,6 +24,10 @@ import platform
 import random
 import signal
 import atexit
+import errno
+import datetime
+import ctypes
+import ctypes.wintypes
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Union, Tuple
@@ -1092,6 +1097,10 @@ class ArchiveProcessor:
             self.apply_separate_policy(tmp_dir, final_output_dir, archive_base_name, unique_suffix)
 
         elif self.args.decompress_policy == 'direct':
+            self.apply_direct_policy(tmp_dir, final_output_dir, archive_base_name, unique_suffix)
+
+        elif self.args.decompress_policy == 'collect':
+            # Legacy behavior: treat "collect" as "direct", falling back to "separate" on conflict.
             self.apply_direct_policy(tmp_dir, final_output_dir, archive_base_name, unique_suffix)
 
         elif self.args.decompress_policy == 'only-file-content':
@@ -3425,6 +3434,976 @@ def signal_handler(signum, frame):
 
 # ==================== 结束锁机制 ====================
 
+# ==================== Transactional Mode (ACID-leaning) ====================
+
+TXN_VERSION = 2
+
+TXN_STATE_INIT = "INIT"
+TXN_STATE_EXTRACTED = "EXTRACTED"
+TXN_STATE_INCOMING_COMMITTED = "INCOMING_COMMITTED"
+TXN_STATE_PLACING = "PLACING"
+TXN_STATE_PLACED = "PLACED"
+TXN_STATE_DURABLE = "DURABLE"
+TXN_STATE_SOURCE_FINALIZED = "SOURCE_FINALIZED"
+TXN_STATE_CLEANED = "CLEANED"
+TXN_STATE_DONE = "DONE"
+TXN_STATE_FAILED = "FAILED"
+TXN_STATE_ABORTED = "ABORTED"
+
+
+def _now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _fsync_file(path, debug=False):
+    try:
+        safe_path = safe_path_for_operation(path, debug)
+        with open(safe_path, "rb") as f:
+            os.fsync(f.fileno())
+    except Exception:
+        return
+
+
+def _fsync_dir(path, debug=False):
+    if os.name == "nt":
+        return
+    try:
+        safe_path = safe_path_for_operation(path, debug)
+        fd = os.open(safe_path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception:
+        return
+
+
+def atomic_write_json(path, data, debug=False):
+    parent = os.path.dirname(path)
+    safe_makedirs(parent, debug=debug)
+    tmp = f"{path}.tmp"
+    safe_tmp = safe_path_for_operation(tmp, debug)
+    safe_final = safe_path_for_operation(path, debug)
+
+    with open(safe_tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, sort_keys=True, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(safe_tmp, safe_final)
+    _fsync_dir(parent, debug=debug)
+
+
+def _existing_ancestor(path):
+    p = os.path.abspath(path)
+    while True:
+        if os.path.exists(p):
+            return p
+        parent = os.path.dirname(p)
+        if parent == p:
+            return p
+        p = parent
+
+
+def _windows_volume_id(path):
+    path = os.path.abspath(path)
+    path = _existing_ancestor(path)
+
+    GetVolumePathNameW = ctypes.windll.kernel32.GetVolumePathNameW
+    GetVolumeInformationW = ctypes.windll.kernel32.GetVolumeInformationW
+
+    volume_path_buf = ctypes.create_unicode_buffer(260)
+    if not GetVolumePathNameW(path, volume_path_buf, len(volume_path_buf)):
+        raise OSError("GetVolumePathNameW failed")
+
+    volume_path = volume_path_buf.value
+    serial_number = ctypes.wintypes.DWORD()
+    max_component_length = ctypes.wintypes.DWORD()
+    file_system_flags = ctypes.wintypes.DWORD()
+    file_system_name_buf = ctypes.create_unicode_buffer(260)
+    volume_name_buf = ctypes.create_unicode_buffer(260)
+
+    if not GetVolumeInformationW(
+        volume_path,
+        volume_name_buf,
+        len(volume_name_buf),
+        ctypes.byref(serial_number),
+        ctypes.byref(max_component_length),
+        ctypes.byref(file_system_flags),
+        file_system_name_buf,
+        len(file_system_name_buf),
+    ):
+        raise OSError("GetVolumeInformationW failed")
+
+    return (volume_path.rstrip("\\/").lower(), int(serial_number.value))
+
+
+def same_volume(path_a, path_b):
+    a = _existing_ancestor(path_a)
+    b = _existing_ancestor(path_b)
+
+    if os.name != "nt":
+        return os.stat(a).st_dev == os.stat(b).st_dev
+
+    return _windows_volume_id(a) == _windows_volume_id(b)
+
+
+class FileLock:
+    def __init__(self, path, timeout_ms=30000, retry_ms=200, debug=False):
+        self.path = path
+        self.timeout_ms = int(timeout_ms)
+        self.retry_ms = int(retry_ms)
+        self.debug = debug
+        self._file = None
+
+    def acquire(self):
+        safe_makedirs(os.path.dirname(self.path), debug=self.debug)
+        safe_path = safe_path_for_operation(self.path, self.debug)
+        start = time.time()
+
+        f = open(safe_path, "a+b")
+        try:
+            while (time.time() - start) * 1000.0 < self.timeout_ms:
+                try:
+                    if os.name != "nt":
+                        import fcntl
+
+                        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:
+                        import msvcrt
+
+                        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+
+                    self._file = f
+                    return True
+                except (OSError, IOError):
+                    time.sleep(self.retry_ms / 1000.0)
+
+            try:
+                f.close()
+            except Exception:
+                pass
+            return False
+        except Exception:
+            try:
+                f.close()
+            except Exception:
+                pass
+            raise
+
+    def release(self):
+        if not self._file:
+            return
+        try:
+            if os.name != "nt":
+                import fcntl
+
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+            else:
+                import msvcrt
+
+                self._file.seek(0)
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
+
+    def __enter__(self):
+        if not self.acquire():
+            raise TimeoutError(f"Could not acquire lock: {self.path}")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
+
+
+def _work_root(output_dir):
+    return os.path.join(output_dir, ".advdecompress_work")
+
+
+def _txn_paths(output_dir, txn_id):
+    work_root = _work_root(output_dir)
+    return {
+        "work_root": work_root,
+        "staging_extracted": os.path.join(work_root, "staging", txn_id, "extracted"),
+        "incoming_dir": os.path.join(work_root, "incoming", txn_id, "incoming"),
+        "journal_dir": os.path.join(work_root, "journal", txn_id),
+        "txn_json": os.path.join(work_root, "journal", txn_id, "txn.json"),
+        "wal": os.path.join(work_root, "journal", txn_id, "txn.wal"),
+        "trash_dir": os.path.join(work_root, "trash", txn_id),
+        "lock_file": os.path.join(work_root, "locks", "output_dir.lock"),
+    }
+
+
+def _validate_environment_for_output_dir(output_dir, success_to, fail_to, *, strict_cross_volume=True, degrade_cross_volume=False):
+    safe_makedirs(output_dir, debug=VERBOSE)
+    work_root = _work_root(output_dir)
+    safe_makedirs(work_root, debug=VERBOSE)
+
+    if strict_cross_volume and not degrade_cross_volume:
+        if not same_volume(work_root, output_dir):
+            raise RuntimeError("work_root must be on same volume as output_dir")
+
+        if success_to and not same_volume(success_to, output_dir):
+            raise RuntimeError("success_to must be on same volume as output_dir in strict mode")
+        if fail_to and not same_volume(fail_to, output_dir):
+            raise RuntimeError("fail_to must be on same volume as output_dir in strict mode")
+
+    safe_makedirs(os.path.join(work_root, "staging"), debug=VERBOSE)
+    safe_makedirs(os.path.join(work_root, "incoming"), debug=VERBOSE)
+    safe_makedirs(os.path.join(work_root, "journal"), debug=VERBOSE)
+    safe_makedirs(os.path.join(work_root, "trash"), debug=VERBOSE)
+    safe_makedirs(os.path.join(work_root, "locks"), debug=VERBOSE)
+
+
+def _atomic_rename(src, dst, *, degrade_cross_volume=False, debug=False):
+    safe_src = safe_path_for_operation(src, debug)
+    safe_dst = safe_path_for_operation(dst, debug)
+    try:
+        os.rename(safe_src, safe_dst)
+    except OSError as e:
+        if e.errno == errno.EXDEV and degrade_cross_volume:
+            shutil.move(safe_src, safe_dst)
+            return
+        raise
+
+
+def _ensure_unique_path(dst, suffix_token, *, max_tries=10000):
+    if not safe_exists(dst, VERBOSE):
+        return dst
+    base, ext = os.path.splitext(dst)
+    for i in range(1, max_tries + 1):
+        candidate = f"{base}_{suffix_token}_{i}{ext}"
+        if not safe_exists(candidate, VERBOSE):
+            return candidate
+    raise RuntimeError(f"Could not find unique path for: {dst}")
+
+
+class WalWriter:
+    def __init__(self, path, fsync_every=256, debug=False):
+        self.path = path
+        self.fsync_every = int(fsync_every)
+        self.debug = debug
+        safe_makedirs(os.path.dirname(path), debug=debug)
+        safe_path = safe_path_for_operation(path, debug)
+        self._f = open(safe_path, "a", encoding="utf-8")
+        self._since_fsync = 0
+
+    def append(self, records, *, force_fsync=False):
+        for r in records:
+            self._f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            self._since_fsync += 1
+        self._f.flush()
+        if force_fsync or (self.fsync_every > 0 and self._since_fsync >= self.fsync_every):
+            os.fsync(self._f.fileno())
+            self._since_fsync = 0
+
+    def close(self, *, force_fsync=True):
+        try:
+            self._f.flush()
+            if force_fsync:
+                os.fsync(self._f.fileno())
+        finally:
+            try:
+                self._f.close()
+            except Exception:
+                pass
+
+
+def _replay_wal(wal_path):
+    plans_by_id = {}
+    done_set = set()
+
+    if not safe_exists(wal_path, VERBOSE):
+        return plans_by_id, done_set
+
+    safe_wal = safe_path_for_operation(wal_path, VERBOSE)
+    with open(safe_wal, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            if r.get("t") == "MOVE_PLAN":
+                plans_by_id[int(r["id"])] = r
+            elif r.get("t") == "MOVE_DONE":
+                done_set.add(int(r["id"]))
+
+    return plans_by_id, done_set
+
+
+def _txn_snapshot(txn):
+    atomic_write_json(txn["paths"]["txn_json"], txn, debug=VERBOSE)
+
+
+def _txn_fail(txn, error_type, message):
+    txn["state"] = TXN_STATE_FAILED if error_type != "ABORTED" else TXN_STATE_ABORTED
+    txn["error"] = {
+        "type": error_type,
+        "message": str(message),
+        "at": _now_iso(),
+    }
+    _txn_snapshot(txn)
+
+
+def _txn_create(*, archive_path, volumes, output_dir, policy, wal_fsync_every=256, snapshot_every=512, durability_enabled=True):
+    txn_id = uuid.uuid4().hex
+    paths = _txn_paths(output_dir, txn_id)
+
+    safe_makedirs(paths["journal_dir"], debug=VERBOSE)
+    safe_makedirs(os.path.dirname(paths["staging_extracted"]), debug=VERBOSE)
+    safe_makedirs(os.path.dirname(paths["incoming_dir"]), debug=VERBOSE)
+
+    txn = {
+        "version": TXN_VERSION,
+        "txn_id": txn_id,
+        "created_at": _now_iso(),
+        "archive_path": os.path.abspath(archive_path),
+        "volumes": [os.path.abspath(v) for v in volumes],
+        "output_dir": os.path.abspath(output_dir),
+        "policy": policy,
+        "resolved_policy": None,
+        "policy_frozen": False,
+        "state": TXN_STATE_INIT,
+        "paths": paths,
+        "wal": {"path": paths["wal"], "fsync_every": int(wal_fsync_every), "last_id": 0},
+        "moves": {"total": 0, "done": 0, "snapshot_every": int(snapshot_every)},
+        "durability": {"enabled": bool(durability_enabled)},
+        "placement": {},
+        "error": None,
+    }
+
+    _txn_snapshot(txn)
+    return txn
+
+
+def _direct_would_conflict(incoming_dir, output_dir):
+    for name in os.listdir(incoming_dir):
+        if safe_exists(os.path.join(output_dir, name), VERBOSE):
+            return True
+    return False
+
+
+def _resolve_policy_under_lock(txn, conflict_mode):
+    if txn.get("policy_frozen"):
+        raise AssertionError("policy is frozen after placing begins")
+
+    policy = txn["policy"]
+    if policy == "collect":
+        if _direct_would_conflict(txn["paths"]["incoming_dir"], txn["output_dir"]):
+            return "separate"
+        return "direct"
+
+    if policy == "direct":
+        return "direct"
+    if policy == "separate":
+        return "separate"
+    if policy == "file-content-with-folder-separate":
+        return "file-content-with-folder-separate"
+
+    m = re.match(r"^(\\d+)-collect$", policy)
+    if m:
+        threshold = int(m.group(1))
+        files, dirs = count_items_in_dir(txn["paths"]["incoming_dir"])
+        total = files + dirs
+        if total >= threshold:
+            return "separate"
+        if conflict_mode == "fail" and _direct_would_conflict(txn["paths"]["incoming_dir"], txn["output_dir"]):
+            return "separate"
+        return "direct"
+
+    raise RuntimeError(f"Transactional mode does not support policy: {policy}")
+
+
+def _freeze_policy(txn, resolved_policy):
+    txn["resolved_policy"] = resolved_policy
+    txn["policy_frozen"] = True
+    _txn_snapshot(txn)
+
+
+def _txn_next_move_id(txn):
+    txn["wal"]["last_id"] = int(txn["wal"].get("last_id") or 0) + 1
+    return txn["wal"]["last_id"]
+
+
+def _plan_direct_moves(txn, *, conflict_mode):
+    incoming_dir = txn["paths"]["incoming_dir"]
+    output_dir = txn["output_dir"]
+    suffix_token = txn["txn_id"][:8]
+    plans = []
+
+    for name in sorted(os.listdir(incoming_dir)):
+        src = os.path.join(incoming_dir, name)
+        dst = os.path.join(output_dir, name)
+        if safe_exists(dst, VERBOSE):
+            if conflict_mode == "suffix":
+                dst = _ensure_unique_path(dst, suffix_token)
+            else:
+                raise FileExistsError(f"Conflict: {dst}")
+        plans.append({"t": "MOVE_PLAN", "id": _txn_next_move_id(txn), "src": src, "dst": dst})
+
+    return plans
+
+
+def _choose_unique_dir(output_dir, stem, suffix_token):
+    candidate = os.path.join(output_dir, stem)
+    if not safe_exists(candidate, VERBOSE):
+        return candidate
+    for i in range(1, 10000):
+        candidate = os.path.join(output_dir, f"{stem}_{suffix_token}_{i}")
+        if not safe_exists(candidate, VERBOSE):
+            return candidate
+    raise RuntimeError(f"Could not choose unique dir for: {stem}")
+
+
+def _plan_separate_dir_move(txn):
+    output_dir = txn["output_dir"]
+    incoming_dir = txn["paths"]["incoming_dir"]
+    archive_stem = get_archive_base_name(txn["archive_path"])
+    suffix_token = txn["txn_id"][:8]
+
+    final_dir = txn.get("placement", {}).get("final_dir")
+    if not final_dir:
+        final_dir = _choose_unique_dir(output_dir, archive_stem, suffix_token)
+        txn.setdefault("placement", {})["final_dir"] = final_dir
+        _txn_snapshot(txn)
+
+    return [{"t": "MOVE_PLAN", "id": _txn_next_move_id(txn), "src": incoming_dir, "dst": final_dir}]
+
+
+def _plan_file_content_with_folder_separate_moves(txn, *, conflict_mode):
+    output_dir = txn["output_dir"]
+    incoming_dir = txn["paths"]["incoming_dir"]
+    archive_stem = get_archive_base_name(txn["archive_path"])
+    suffix_token = txn["txn_id"][:8]
+
+    separate_dir = txn.get("placement", {}).get("separate_dir")
+    if not separate_dir:
+        separate_dir = _choose_unique_dir(output_dir, archive_stem, suffix_token)
+        txn.setdefault("placement", {})["separate_dir"] = separate_dir
+        _txn_snapshot(txn)
+
+    safe_makedirs(separate_dir, debug=VERBOSE)
+
+    plans = []
+    for name in sorted(os.listdir(incoming_dir)):
+        src = os.path.join(incoming_dir, name)
+        if safe_isfile(src, VERBOSE):
+            dst = os.path.join(output_dir, name)
+        else:
+            dst = os.path.join(separate_dir, name)
+
+        if safe_exists(dst, VERBOSE):
+            if conflict_mode == "suffix":
+                dst = _ensure_unique_path(dst, suffix_token)
+            else:
+                raise FileExistsError(f"Conflict: {dst}")
+
+        plans.append({"t": "MOVE_PLAN", "id": _txn_next_move_id(txn), "src": src, "dst": dst})
+
+    return plans
+
+
+def _execute_plans(txn, plans, *, wal_writer, degrade_cross_volume=False):
+    if not plans:
+        return
+
+    wal_writer.append(plans, force_fsync=True)
+    txn["moves"]["total"] += len(plans)
+    _txn_snapshot(txn)
+
+    snapshot_every = int(txn["moves"].get("snapshot_every") or 512)
+
+    for p in plans:
+        _atomic_rename(p["src"], p["dst"], degrade_cross_volume=degrade_cross_volume, debug=VERBOSE)
+        wal_writer.append([{"t": "MOVE_DONE", "id": int(p["id"])}], force_fsync=False)
+        txn["moves"]["done"] += 1
+        if snapshot_every > 0 and txn["moves"]["done"] % snapshot_every == 0:
+            _txn_snapshot(txn)
+
+
+def _execute_policy_with_wal(txn, *, conflict_mode, wal_fsync_every, degrade_cross_volume=False):
+    resolved = txn.get("resolved_policy")
+    if not resolved:
+        raise RuntimeError("resolved_policy missing")
+
+    wal_writer = WalWriter(txn["paths"]["wal"], fsync_every=wal_fsync_every, debug=VERBOSE)
+    try:
+        if resolved == "separate":
+            plans = _plan_separate_dir_move(txn)
+            _execute_plans(txn, plans, wal_writer=wal_writer, degrade_cross_volume=degrade_cross_volume)
+        elif resolved == "direct":
+            plans = _plan_direct_moves(txn, conflict_mode=conflict_mode)
+            _execute_plans(txn, plans, wal_writer=wal_writer, degrade_cross_volume=degrade_cross_volume)
+        elif resolved == "file-content-with-folder-separate":
+            plans = _plan_file_content_with_folder_separate_moves(txn, conflict_mode=conflict_mode)
+            _execute_plans(txn, plans, wal_writer=wal_writer, degrade_cross_volume=degrade_cross_volume)
+        else:
+            raise RuntimeError(f"Unknown resolved_policy: {resolved}")
+    finally:
+        wal_writer.close(force_fsync=True)
+
+
+def _resume_placing_from_wal(txn, *, wal_fsync_every, degrade_cross_volume=False):
+    (plans_by_id, done_set) = _replay_wal(txn["paths"]["wal"])
+    if not plans_by_id:
+        return False
+
+    wal_writer = WalWriter(txn["paths"]["wal"], fsync_every=wal_fsync_every, debug=VERBOSE)
+    try:
+        for move_id in sorted(plans_by_id.keys()):
+            if move_id in done_set:
+                continue
+
+            p = plans_by_id[move_id]
+            src = p["src"]
+            dst = p["dst"]
+
+            src_exists = safe_exists(src, VERBOSE)
+            dst_exists = safe_exists(dst, VERBOSE)
+
+            if dst_exists and not src_exists:
+                wal_writer.append([{"t": "MOVE_DONE", "id": int(move_id)}], force_fsync=False)
+                continue
+
+            if src_exists and not dst_exists:
+                _atomic_rename(src, dst, degrade_cross_volume=degrade_cross_volume, debug=VERBOSE)
+                wal_writer.append([{"t": "MOVE_DONE", "id": int(move_id)}], force_fsync=False)
+                continue
+
+            if src_exists and dst_exists:
+                raise RuntimeError(f"Both src and dst exist for id={move_id}: {src} {dst}")
+            raise RuntimeError(f"Missing both src and dst for id={move_id}: {src} {dst}")
+    finally:
+        wal_writer.close(force_fsync=True)
+
+    return True
+
+
+def _assert_incoming_empty(txn):
+    incoming_dir = txn["paths"]["incoming_dir"]
+    if not safe_exists(incoming_dir, VERBOSE):
+        return
+    if os.listdir(incoming_dir):
+        raise RuntimeError(f"incoming_dir not empty: {incoming_dir}")
+
+
+def _commit_incoming(txn, *, degrade_cross_volume=False):
+    staging_extracted = txn["paths"]["staging_extracted"]
+    incoming_dir = txn["paths"]["incoming_dir"]
+
+    if safe_exists(incoming_dir, VERBOSE) and not safe_exists(staging_extracted, VERBOSE):
+        txn["state"] = TXN_STATE_INCOMING_COMMITTED
+        _txn_snapshot(txn)
+        return
+
+    if safe_exists(incoming_dir, VERBOSE) and safe_exists(staging_extracted, VERBOSE):
+        raise RuntimeError("Both staging_extracted and incoming_dir exist (inconsistent)")
+
+    if not safe_exists(staging_extracted, VERBOSE):
+        raise RuntimeError("Missing staging_extracted (inconsistent)")
+
+    safe_makedirs(os.path.dirname(incoming_dir), debug=VERBOSE)
+    _atomic_rename(staging_extracted, incoming_dir, degrade_cross_volume=degrade_cross_volume, debug=VERBOSE)
+    txn["state"] = TXN_STATE_INCOMING_COMMITTED
+    _txn_snapshot(txn)
+
+
+def _durability_barrier(txn, *, fsync_files="auto"):
+    if fsync_files == "none":
+        return
+    _fsync_file(txn["paths"]["wal"], debug=VERBOSE)
+    _fsync_file(txn["paths"]["txn_json"], debug=VERBOSE)
+
+
+def _finalize_sources_success(txn, *, args):
+    success_policy = args.success_policy
+    if success_policy == "asis":
+        return
+
+    volumes = txn["volumes"]
+    output_dir = txn["output_dir"]
+
+    strict = not bool(getattr(args, "degrade_cross_volume", False))
+
+    if success_policy == "delete":
+        trash_dir = txn["paths"]["trash_dir"]
+        safe_makedirs(trash_dir, debug=VERBOSE)
+
+        for v in volumes:
+            if strict and not same_volume(v, output_dir):
+                raise RuntimeError(f"Source volume not on same volume as output_dir (strict): {v}")
+
+            dst = os.path.join(trash_dir, os.path.basename(v))
+            if safe_exists(dst, VERBOSE):
+                dst = _ensure_unique_path(dst, txn["txn_id"][:8])
+            _atomic_rename(v, dst, degrade_cross_volume=getattr(args, "degrade_cross_volume", False), debug=VERBOSE)
+
+        safe_rmtree(trash_dir, VERBOSE)
+        return
+
+    if success_policy == "move":
+        if not args.success_to:
+            raise RuntimeError("success_to required for success_policy=move")
+
+        dest_base = os.path.abspath(args.success_to)
+        safe_makedirs(dest_base, debug=VERBOSE)
+        dest_dir = os.path.join(dest_base, txn["txn_id"])
+        safe_makedirs(dest_dir, debug=VERBOSE)
+
+        for v in volumes:
+            if strict and not same_volume(v, dest_dir):
+                raise RuntimeError(f"success_to not on same volume as source (strict): {v}")
+            dst = os.path.join(dest_dir, os.path.basename(v))
+            if safe_exists(dst, VERBOSE):
+                dst = _ensure_unique_path(dst, txn["txn_id"][:8])
+            _atomic_rename(v, dst, degrade_cross_volume=getattr(args, "degrade_cross_volume", False), debug=VERBOSE)
+        return
+
+    raise RuntimeError(f"Unknown success_policy: {success_policy}")
+
+
+def _finalize_sources_failure(volumes, *, args, txn=None):
+    if args.fail_policy != "move" or not args.fail_to:
+        return
+
+    dest_base = os.path.abspath(args.fail_to)
+    safe_makedirs(dest_base, debug=VERBOSE)
+
+    dest_dir = os.path.join(dest_base, (txn["txn_id"] if txn else uuid.uuid4().hex))
+    safe_makedirs(dest_dir, debug=VERBOSE)
+
+    strict = not bool(getattr(args, "degrade_cross_volume", False))
+    for v in volumes:
+        if strict and not same_volume(v, dest_dir):
+            raise RuntimeError(f"fail_to not on same volume as source (strict): {v}")
+        dst = os.path.join(dest_dir, os.path.basename(v))
+        if safe_exists(dst, VERBOSE):
+            dst = _ensure_unique_path(dst, (txn["txn_id"][:8] if txn else uuid.uuid4().hex[:8]))
+        _atomic_rename(v, dst, degrade_cross_volume=getattr(args, "degrade_cross_volume", False), debug=VERBOSE)
+
+
+def _cleanup_workdir(txn):
+    # remove staging/<txn_id> and incoming/<txn_id>, keep journal for GC
+    work_root = txn["paths"]["work_root"]
+    txn_id = txn["txn_id"]
+    safe_rmtree(os.path.join(work_root, "staging", txn_id), VERBOSE)
+    safe_rmtree(os.path.join(work_root, "incoming", txn_id), VERBOSE)
+
+
+def _garbage_collect(output_dir, *, keep_journal_days=7):
+    work_root = _work_root(output_dir)
+    journal_root = os.path.join(work_root, "journal")
+    if not safe_exists(journal_root, VERBOSE):
+        return
+
+    cutoff = time.time() - float(keep_journal_days) * 86400.0
+
+    for name in os.listdir(journal_root):
+        txn_dir = os.path.join(journal_root, name)
+        txn_json = os.path.join(txn_dir, "txn.json")
+        if not safe_exists(txn_json, VERBOSE):
+            continue
+        try:
+            mtime = os.path.getmtime(txn_dir)
+        except Exception:
+            continue
+        if mtime >= cutoff:
+            continue
+        try:
+            safe_txn_json = safe_path_for_operation(txn_json, VERBOSE)
+            with open(safe_txn_json, "r", encoding="utf-8") as f:
+                txn = json.load(f)
+            if txn.get("state") == TXN_STATE_DONE:
+                safe_rmtree(txn_dir, VERBOSE)
+        except Exception:
+            continue
+
+
+def _recover_output_dir(output_dir, *, args):
+    work_root = _work_root(output_dir)
+    journal_root = os.path.join(work_root, "journal")
+    if not safe_exists(journal_root, VERBOSE):
+        return
+
+    for txn_id in sorted(os.listdir(journal_root)):
+        txn_dir = os.path.join(journal_root, txn_id)
+        txn_json = os.path.join(txn_dir, "txn.json")
+        if not safe_exists(txn_json, VERBOSE):
+            continue
+
+        try:
+            safe_txn_json = safe_path_for_operation(txn_json, VERBOSE)
+            with open(safe_txn_json, "r", encoding="utf-8") as f:
+                txn = json.load(f)
+        except Exception as e:
+            print(f"  Warning: Could not load txn.json ({txn_json}): {e}")
+            continue
+
+        state = txn.get("state")
+        if state in (TXN_STATE_DONE, TXN_STATE_FAILED, TXN_STATE_ABORTED):
+            continue
+
+        try:
+            _place_and_finalize_txn(txn, args=args, recovery=True)
+        except Exception as e:
+            try:
+                _txn_fail(txn, "RECOVER_FAILED", e)
+            except Exception:
+                pass
+            print(f"  Warning: Recover failed for txn={txn.get('txn_id')}: {e}")
+
+
+def _discover_output_dirs_for_recovery(output_base):
+    output_dirs = set()
+    if not safe_exists(output_base, VERBOSE):
+        return []
+
+    for root, dirs, _files in os.walk(output_base):
+        if ".advdecompress_work" in dirs:
+            output_dirs.add(root)
+            dirs.remove(".advdecompress_work")
+        # Avoid walking into very deep staging trees unnecessarily
+        if ".staging_advDecompress" in dirs:
+            dirs.remove(".staging_advDecompress")
+
+    return sorted(output_dirs)
+
+
+def _recover_all_outputs(output_base, *, args):
+    for output_dir in _discover_output_dirs_for_recovery(output_base):
+        work_root = _work_root(output_dir)
+        lock_path = os.path.join(work_root, "locks", "output_dir.lock")
+        lock = FileLock(lock_path, timeout_ms=args.output_lock_timeout_ms, retry_ms=args.output_lock_retry_ms, debug=VERBOSE)
+        with lock:
+            _recover_output_dir(output_dir, args=args)
+            _garbage_collect(output_dir, keep_journal_days=args.keep_journal_days)
+
+
+def _compute_output_dir(args, archive_path):
+    base_path = args.path if safe_isdir(args.path, VERBOSE) else os.path.dirname(args.path)
+    try:
+        rel_path = os.path.relpath(os.path.dirname(archive_path), base_path)
+    except ValueError:
+        rel_path = ""
+    output_base = os.path.abspath(args.output) if args.output else os.path.abspath(base_path)
+    return os.path.join(output_base, rel_path) if rel_path and rel_path != "." else output_base
+
+
+def _extract_phase(processor, archive_path, *, args):
+    archive_path = os.path.abspath(archive_path)
+    print(f"Extracting: {archive_path}")
+
+    traditional_zip_result = processor.handle_traditional_zip_policy(archive_path)
+    if not traditional_zip_result.get("should_continue", True):
+        if VERBOSE:
+            print(f"  DEBUG: 传统ZIP策略处理完成: {traditional_zip_result.get('reason')}")
+        return {"kind": "skipped", "archive_path": archive_path, "reason": traditional_zip_result.get("reason")}
+
+    zip_decode_from_policy = traditional_zip_result.get("zip_decode")
+
+    if args.dry_run:
+        print(f"  [DRY RUN] Would process: {archive_path}")
+        return {"kind": "dry_run", "archive_path": archive_path}
+
+    check_interrupt()
+
+    output_dir = _compute_output_dir(args, archive_path)
+    _validate_environment_for_output_dir(
+        output_dir,
+        args.success_to if args.success_policy == "move" else None,
+        args.fail_to if args.fail_policy == "move" else None,
+        strict_cross_volume=not args.degrade_cross_volume,
+        degrade_cross_volume=args.degrade_cross_volume,
+    )
+
+    need_password_testing = bool(args.password_file)
+    encryption_status = "plain"
+    if need_password_testing:
+        check_interrupt()
+        encryption_status = check_encryption(archive_path)
+        if encryption_status is None:
+            print(f"  Warning: Cannot determine if {archive_path} is an archive")
+            return {"kind": "skipped", "archive_path": archive_path, "reason": "not_archive"}
+
+    correct_password = ""
+    if need_password_testing and encryption_status in ["encrypted_header", "encrypted_content"]:
+        check_interrupt()
+        correct_password = processor.find_correct_password(archive_path, encryption_status=encryption_status)
+        if correct_password is None:
+            print(f"  Error: No correct password found for {archive_path}")
+            volumes = processor.get_all_volumes(archive_path)
+            try:
+                _finalize_sources_failure(volumes, args=args)
+            except Exception as e:
+                print(f"  Warning: Could not apply fail policy move: {e}")
+            return {"kind": "failed", "archive_path": archive_path, "error": "no_password"}
+    else:
+        correct_password = args.password if args.password else ""
+
+    final_zip_decode = zip_decode_from_policy if zip_decode_from_policy is not None else getattr(args, "zip_decode", None)
+    enable_rar = getattr(args, "enable_rar", False)
+    if enable_rar and not check_rar_available():
+        print("  Warning: RAR command not available, falling back to 7z")
+        enable_rar = False
+
+    volumes = processor.get_all_volumes(archive_path)
+    txn = _txn_create(
+        archive_path=archive_path,
+        volumes=volumes,
+        output_dir=output_dir,
+        policy=args.decompress_policy,
+        wal_fsync_every=args.wal_fsync_every,
+        snapshot_every=args.snapshot_every,
+        durability_enabled=not args.no_durability,
+    )
+
+    try:
+        safe_makedirs(txn["paths"]["staging_extracted"], debug=VERBOSE)
+        success = try_extract(archive_path, correct_password, txn["paths"]["staging_extracted"], final_zip_decode, enable_rar, processor.sfx_detector)
+        check_interrupt()
+        if not success:
+            raise RuntimeError("extract_failed")
+
+        extracted_files, extracted_dirs = count_items_in_dir(txn["paths"]["staging_extracted"])
+        if extracted_files == 0 and extracted_dirs == 0:
+            raise RuntimeError("extract_empty_output")
+
+        txn["state"] = TXN_STATE_EXTRACTED
+        _txn_snapshot(txn)
+        return {"kind": "txn", "txn": txn}
+    except KeyboardInterrupt as e:
+        _txn_fail(txn, "ABORTED", e)
+        raise
+    except Exception as e:
+        _txn_fail(txn, "EXTRACT_FAILED", e)
+        try:
+            _finalize_sources_failure(volumes, args=args, txn=txn)
+        except Exception as e2:
+            print(f"  Warning: Could not apply fail policy move: {e2}")
+        return {"kind": "txn_failed", "txn": txn}
+
+
+def _place_and_finalize_txn(txn, *, args, recovery=False):
+    if txn.get("state") in (TXN_STATE_DONE, TXN_STATE_FAILED, TXN_STATE_ABORTED):
+        return
+
+    try:
+        if txn.get("state") == TXN_STATE_EXTRACTED:
+            _commit_incoming(txn, degrade_cross_volume=args.degrade_cross_volume)
+
+        if txn.get("state") == TXN_STATE_INCOMING_COMMITTED:
+            resolved = txn.get("resolved_policy")
+            if not resolved:
+                resolved = _resolve_policy_under_lock(txn, args.conflict_mode)
+                _freeze_policy(txn, resolved)
+            txn["state"] = TXN_STATE_PLACING
+            _txn_snapshot(txn)
+
+        if txn.get("state") == TXN_STATE_PLACING:
+            resumed = False
+            try:
+                resumed = _resume_placing_from_wal(txn, wal_fsync_every=args.wal_fsync_every, degrade_cross_volume=args.degrade_cross_volume)
+            except json.JSONDecodeError:
+                raise RuntimeError("wal_corrupted")
+
+            if not resumed:
+                _execute_policy_with_wal(
+                    txn,
+                    conflict_mode=args.conflict_mode,
+                    wal_fsync_every=args.wal_fsync_every,
+                    degrade_cross_volume=args.degrade_cross_volume,
+                )
+
+            _assert_incoming_empty(txn)
+            txn["state"] = TXN_STATE_PLACED
+            _txn_snapshot(txn)
+
+        if txn.get("state") == TXN_STATE_PLACED and txn.get("durability", {}).get("enabled"):
+            _durability_barrier(txn, fsync_files=args.fsync_files)
+            txn["state"] = TXN_STATE_DURABLE
+            _txn_snapshot(txn)
+
+        if txn.get("state") in (TXN_STATE_PLACED, TXN_STATE_DURABLE):
+            _finalize_sources_success(txn, args=args)
+            txn["state"] = TXN_STATE_SOURCE_FINALIZED
+            _txn_snapshot(txn)
+
+        if txn.get("state") == TXN_STATE_SOURCE_FINALIZED:
+            _cleanup_workdir(txn)
+            txn["state"] = TXN_STATE_CLEANED
+            _txn_snapshot(txn)
+
+        txn["state"] = TXN_STATE_DONE
+        _txn_snapshot(txn)
+    except KeyboardInterrupt as e:
+        _txn_fail(txn, "ABORTED", e)
+        raise
+    except Exception as e:
+        _txn_fail(txn, "PLACE_FAILED" if not recovery else "RECOVER_FAILED", e)
+        raise
+
+
+def _run_transactional(processor, archives, *, args):
+    output_base = os.path.abspath(args.output) if args.output else os.path.abspath(args.path if safe_isdir(args.path, VERBOSE) else os.path.dirname(args.path))
+    _recover_all_outputs(output_base, args=args)
+
+    results = []
+    if args.threads == 1:
+        for a in archives:
+            results.append(_extract_phase(processor, a, args=args))
+    else:
+        reset_interrupt_flag()
+        with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            futures = {executor.submit(_extract_phase, processor, a, args=args): a for a in archives}
+            for future in as_completed(futures):
+                check_interrupt()
+                results.append(future.result())
+
+    txns = []
+    for r in results:
+        if not r:
+            continue
+        if r.get("kind") == "txn":
+            txn = r["txn"]
+            if txn.get("state") == TXN_STATE_EXTRACTED:
+                txns.append(txn)
+        elif r.get("kind") == "skipped":
+            processor.skipped_archives.append(r["archive_path"])
+        elif r.get("kind") == "dry_run":
+            processor.skipped_archives.append(r["archive_path"])
+        elif r.get("kind") in ("failed", "txn_failed"):
+            processor.failed_archives.append(r.get("archive_path") or r.get("txn", {}).get("archive_path"))
+
+    groups = {}
+    for txn in txns:
+        groups.setdefault(txn["output_dir"], []).append(txn)
+
+    for output_dir, group in groups.items():
+        group.sort(key=lambda t: t.get("archive_path", ""))
+        work_root = _work_root(output_dir)
+        lock_path = os.path.join(work_root, "locks", "output_dir.lock")
+        lock = FileLock(lock_path, timeout_ms=args.output_lock_timeout_ms, retry_ms=args.output_lock_retry_ms, debug=VERBOSE)
+        with lock:
+            for txn in group:
+                try:
+                    _place_and_finalize_txn(txn, args=args)
+                    processor.successful_archives.append(txn["archive_path"])
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    print(f"Error placing {txn.get('archive_path')}: {e}")
+                    processor.failed_archives.append(txn.get("archive_path"))
+            _garbage_collect(output_dir, keep_journal_days=args.keep_journal_days)
+
+
+# ==================== End Transactional Mode ====================
+
 def setup_windows_utf8():
     """Setup UTF-8 encoding for Windows console operations"""
     if not sys.platform.startswith('win'):
@@ -5598,7 +6577,8 @@ def main():
     parser.add_argument(
         '-dp', '--decompress-policy',
         default='2-collect',
-        help='Decompress policy: separate/direct/only-file-content/file-content-with-folder/file-content-with-folder-separate/only-file-content-direct/N-collect/file-content-N-collect/file-content-auto-folder-N-collect-len/file-content-auto-folder-N-collect-meaningful (default: 2-collect)'
+        help='Decompress policy: separate/direct/collect/only-file-content/file-content-with-folder/file-content-with-folder-separate/only-file-content-direct/N-collect/file-content-N-collect/file-content-auto-folder-N-collect-len/file-content-auto-folder-N-collect-meaningful (default: 2-collect). '
+             'Transactional mode supports: separate/direct/collect/N-collect/file-content-with-folder-separate (use --legacy for others).'
     )
 
     parser.add_argument(
@@ -5707,6 +6687,65 @@ def main():
         help='锁定超时时间（最大重试次数）'
     )
 
+    # Transactional mode options (see plans.md)
+    parser.add_argument(
+        '--legacy',
+        action='store_true',
+        help='Use legacy non-transactional pipeline (no journal/recovery).'
+    )
+    parser.add_argument(
+        '--degrade-cross-volume',
+        action='store_true',
+        help='Allow cross-volume moves via copy+delete (reduces atomic/crash-safety guarantees).'
+    )
+    parser.add_argument(
+        '--conflict-mode',
+        choices=['fail', 'suffix'],
+        default='fail',
+        help='Transactional placing conflict behavior (default: fail).'
+    )
+    parser.add_argument(
+        '--output-lock-timeout-ms',
+        type=int,
+        default=30000,
+        help='Output_dir lock acquire timeout in ms (default: 30000).'
+    )
+    parser.add_argument(
+        '--output-lock-retry-ms',
+        type=int,
+        default=200,
+        help='Output_dir lock retry interval in ms (default: 200).'
+    )
+    parser.add_argument(
+        '--wal-fsync-every',
+        type=int,
+        default=256,
+        help='Fsync WAL after N appended records (default: 256).'
+    )
+    parser.add_argument(
+        '--snapshot-every',
+        type=int,
+        default=512,
+        help='Snapshot txn.json every N completed moves (default: 512).'
+    )
+    parser.add_argument(
+        '--keep-journal-days',
+        type=int,
+        default=7,
+        help='GC TTL (days) for DONE txn journals (default: 7).'
+    )
+    parser.add_argument(
+        '--no-durability',
+        action='store_true',
+        help='Disable durability barrier (fsync) before finalizing sources.'
+    )
+    parser.add_argument(
+        '--fsync-files',
+        choices=['auto', 'none'],
+        default='auto',
+        help='Durability fsync strategy (default: auto).'
+    )
+
     parser.add_argument(
         '-dr', '--depth-range',
         help='Depth range for recursive scanning. Format: "int1-int2" or "int". '
@@ -5750,8 +6789,8 @@ def main():
         signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        # 获取锁（除非用户指定不使用锁）
-        if not args.no_lock:
+        # Legacy pipeline uses a coarse global lock; transactional mode uses per-output_dir OS locks.
+        if args.legacy and not args.no_lock:
             if not acquire_lock(args.lock_timeout):
                 print("无法获取全局锁，程序退出")
                 return 1
@@ -5821,7 +6860,7 @@ def main():
                 return 1
 
         # Validate decompress policy
-        if args.decompress_policy not in ['separate', 'direct', 'only-file-content', 'file-content-with-folder', 'file-content-with-folder-separate', 'only-file-content-direct']:
+        if args.decompress_policy not in ['separate', 'direct', 'collect', 'only-file-content', 'file-content-with-folder', 'file-content-with-folder-separate', 'only-file-content-direct']:
             if re.match(r'^\d+-collect$', args.decompress_policy):
                 # Validate N-collect threshold
                 threshold = int(args.decompress_policy.split('-')[0])
@@ -5843,6 +6882,17 @@ def main():
                     return 1
             else:
                 print(f"Error: Invalid decompress policy: {args.decompress_policy}")
+                return 1
+
+        # Transactional mode policy restriction (WAL/recovery only implemented for these policies)
+        if not args.legacy:
+            txn_supported = (
+                args.decompress_policy in ["separate", "direct", "collect", "file-content-with-folder-separate"]
+                or re.match(r"^\d+-collect$", args.decompress_policy)
+            )
+            if not txn_supported:
+                print(f"Error: decompress-policy '{args.decompress_policy}' is not supported in transactional mode.")
+                print("       Use --legacy to run the old pipeline, or choose one of: separate/direct/collect/N-collect/file-content-with-folder-separate.")
                 return 1
 
         # Validate depth range parameter
@@ -5885,90 +6935,74 @@ def main():
         print(f"Found {len(archives)} archive(s) to process.")
 
         # Process archives
-        if args.threads == 1:
-            # Single-threaded processing
-            for archive in archives:
-                try:
-                    processor.process_archive(archive)
-                except KeyboardInterrupt:
-                    print("\nProcessing interrupted by user")
-                    raise
-        else:
-            # Multi-threaded processing
-            executor = ThreadPoolExecutor(max_workers=args.threads)
-            futures = {}
-            
-            try:
-                # Reset interrupt flag at start
-                reset_interrupt_flag()
-                
-                # Submit all tasks
-                futures = {executor.submit(processor.process_archive, archive): archive
-                          for archive in archives}
-                
-                # Process results
-                for future in as_completed(futures):
-                    archive = futures[future]
+        if args.legacy:
+            if args.threads == 1:
+                for archive in archives:
                     try:
-                        # Check for interrupt before getting result
-                        check_interrupt()
-                        future.result()
+                        processor.process_archive(archive)
                     except KeyboardInterrupt:
-                        # Interrupt detected - immediately shutdown executor
-                        print(f"\nKeyboard interrupt detected, stopping all tasks...")
-                        set_interrupt_flag()  # Ensure flag is set
-                        
-                        # Cancel all pending futures
-                        cancelled_count = 0
-                        for f in futures:
-                            if not f.done():
-                                if f.cancel():
-                                    cancelled_count += 1
-                        
-                        if VERBOSE:
-                            print(f"  DEBUG: Cancelled {cancelled_count} pending tasks")
-                        
-                        # Shutdown executor without waiting
-                        executor.shutdown(wait=False)
-                        
-                        # Re-raise to exit
+                        print("\nProcessing interrupted by user")
                         raise
-                    except Exception as e:
-                        # Check if this is a wrapped KeyboardInterrupt
-                        if "KeyboardInterrupt" in str(e) or "Interrupt requested" in str(e):
-                            print(f"\nInterrupt detected in worker thread")
+            else:
+                executor = ThreadPoolExecutor(max_workers=args.threads)
+                futures = {}
+
+                try:
+                    reset_interrupt_flag()
+
+                    futures = {executor.submit(processor.process_archive, archive): archive
+                              for archive in archives}
+
+                    for future in as_completed(futures):
+                        archive = futures[future]
+                        try:
+                            check_interrupt()
+                            future.result()
+                        except KeyboardInterrupt:
+                            print(f"\nKeyboard interrupt detected, stopping all tasks...")
                             set_interrupt_flag()
-                            
-                            # Cancel remaining tasks
+
+                            cancelled_count = 0
                             for f in futures:
                                 if not f.done():
-                                    f.cancel()
-                            
+                                    if f.cancel():
+                                        cancelled_count += 1
+
+                            if VERBOSE:
+                                print(f"  DEBUG: Cancelled {cancelled_count} pending tasks")
+
                             executor.shutdown(wait=False)
-                            raise KeyboardInterrupt("Worker thread interrupted")
-                        
-                        # Normal exception - log and continue
-                        print(f"Error processing {archive}: {e}")
-                        processor.failed_archives.append(archive)
-                
-                # Normal completion - shutdown executor
-                executor.shutdown(wait=True)
-                
-            except KeyboardInterrupt:
-                print("\nShutting down due to interrupt...")
-                # Make sure executor is shutdown
-                try:
-                    executor.shutdown(wait=False)
-                except:
-                    pass
-                raise
-            except Exception:
-                # Ensure executor is shutdown on any error
-                try:
-                    executor.shutdown(wait=False)
-                except:
-                    pass
-                raise
+                            raise
+                        except Exception as e:
+                            if "KeyboardInterrupt" in str(e) or "Interrupt requested" in str(e):
+                                print(f"\nInterrupt detected in worker thread")
+                                set_interrupt_flag()
+                                for f in futures:
+                                    if not f.done():
+                                        f.cancel()
+                                executor.shutdown(wait=False)
+                                raise KeyboardInterrupt("Worker thread interrupted")
+
+                            print(f"Error processing {archive}: {e}")
+                            processor.failed_archives.append(archive)
+
+                    executor.shutdown(wait=True)
+
+                except KeyboardInterrupt:
+                    print("\nShutting down due to interrupt...")
+                    try:
+                        executor.shutdown(wait=False)
+                    except Exception:
+                        pass
+                    raise
+                except Exception:
+                    try:
+                        executor.shutdown(wait=False)
+                    except Exception:
+                        pass
+                    raise
+        else:
+            _run_transactional(processor, archives, args=args)
 
         # Print summary
         print("\n" + "=" * 50)

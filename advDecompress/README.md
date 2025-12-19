@@ -74,6 +74,10 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `--skip-7z-multi` / `--skip-rar-multi` / `--skip-zip-multi` / `--skip-exe-multi` | 跳过对应多卷格式 | - |
 | `--no-lock` | 禁用全局锁（多实例慎用） | 关闭 |
 | `--lock-timeout` | 获取锁最大重试次数 | 30 |
+| `--legacy` | 使用旧版非事务化流程（不启用 journal / 恢复） | 关闭 |
+| `--degrade-cross-volume` | 允许跨卷降级 copy+delete（降低原子性） | 关闭 |
+| `--conflict-mode` | 事务化落位冲突策略：`fail` / `suffix` | `fail` |
+| `--keep-journal-days` | DONE 事务 journal 保留天数 | 7 |
 | `-dr`, `--depth-range` | 扫描深度范围，如 `0-2` / `1` | 全深度 |
 | `--fix-ext`, `-fe` | 启用扩展名修复（按文件头识别） | 关闭 |
 | `--safe-fix-ext`, `-sfe` | 启用安全扩展名修复（追加正确扩展名） | 关闭 |
@@ -87,6 +91,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 |---------|----------|
 | `separate` | 总在 `<归档名>/` 新建独立文件夹，避免与现有文件冲突。 |
 | `direct` | 尝试直接写入目标目录；若文件/文件夹冲突自动回退 `separate`。 |
+| `collect` | （事务化模式）锁内基于冲突自动选择 `direct` 或 `separate`。 |
 | `only-file-content` | 仅提取最深层 **file_content**（通常是单一有效文件夹）至 `<归档名>/`。 |
 | `only-file-content-direct` | 同上，但若不存在冲突则直接落在目标目录。 |
 | `file-content-with-folder` | 提取 **file_content**，并保留其父文件夹名。 |
@@ -97,6 +102,9 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `file-content-auto-folder-N-collect-meaningful` | 自动选取“最有意义”文件夹名（ASCII 过滤）后按阈值判断。 |
 
 > N 为正整数，例如 `5-collect`、`file-content-10-collect`、`file-content-auto-folder-3-collect-len` 等。
+>
+> 事务化模式（默认）目前支持：`separate` / `direct` / `collect` / `N-collect` / `file-content-with-folder-separate`。  
+> 其他策略请使用 `--legacy`。
 
 ---
 
