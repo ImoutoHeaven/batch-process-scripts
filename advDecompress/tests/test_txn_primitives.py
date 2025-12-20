@@ -289,6 +289,37 @@ class TestTxnPrimitives(unittest.TestCase):
             vols = processor.get_all_volumes(part2)
             self.assertEqual({os.path.abspath(p) for p in (main, part1, part2, part3)}, set(vols))
 
+    def test_exe_split_volume_detection(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "a")
+            exe = base + ".exe"
+            v1 = base + ".exe.001"
+            v2 = base + ".exe.002"
+
+            # Without base .exe, split parts shouldn't be treated as volume.
+            for p in (v1, v2):
+                with open(p, "wb") as f:
+                    f.write(b"")
+
+            args = SimpleNamespace(
+                verbose=False,
+                password=None,
+                password_file=None,
+                traditional_zip_policy="decode-auto",
+            )
+            processor = self.m.ArchiveProcessor(args)
+            self.assertEqual("notarchive", processor.is_archive_single_or_volume(v1))
+
+            # With base .exe present, .exe.001 is main volume, others are secondary.
+            with open(exe, "wb") as f:
+                f.write(b"")  # presence is enough for classifier
+            self.assertEqual("volume", processor.is_archive_single_or_volume(v1))
+            self.assertTrue(processor.is_main_volume(v1))
+            self.assertTrue(processor.is_secondary_volume(v2))
+
+            # Base name normalization should strip .exe.NNN
+            self.assertEqual("a", self.m.get_archive_base_name(v1))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -143,7 +143,7 @@ def parse_archive_filename(filename: str):
 
     if len(parts) >= 3:
         cand = parts[-2].lower()
-        if re.fullmatch(r'part\d+', cand) or cand == '7z':
+        if re.fullmatch(r'part\d+', cand) or cand in ('7z', 'exe'):
             file_ext_extend = cand
             base_filename = '.'.join(parts[:-2])
         else:
@@ -1405,6 +1405,11 @@ class ArchiveProcessor:
             return 'single'
         if ext.isdigit() and ext2 == '7z' and not safe_exists(os.path.join(folder, bf + '.exe')):
             return 'volume'
+        # 7-Zip SFX split volumes: name.exe.001 / name.exe.002 ...
+        if ext.isdigit() and ext2 == 'exe':
+            if safe_exists(os.path.join(folder, bf + '.exe')):
+                return 'volume'
+            return 'notarchive'
 
         # --- RAR5 (.partN.rar) ---
         if ext == 'rar' and re.fullmatch(r'part\d+', ext2):
@@ -1523,6 +1528,11 @@ class ArchiveProcessor:
            and not safe_exists(os.path.join(folder, bf + '.exe')):
             return True
 
+        # 7z SFX split 主卷: name.exe.001
+        if ext.isdigit() and ext2 == 'exe' and int(re.sub(r'^0+', '', ext) or '0') == 1:
+            if safe_exists(os.path.join(folder, bf + '.exe')):
+                return True
+
         # RAR5 主卷
         m_ext2 = re.fullmatch(r'part(\d+)', ext2)
         if ext == 'rar' and m_ext2:
@@ -1571,6 +1581,11 @@ class ArchiveProcessor:
         if ext.isdigit() and ext2 == '7z' and not safe_exists(os.path.join(folder, bf + '.exe')):
             return True
 
+        # 7z SFX split 从卷: name.exe.00N (N != 1)
+        if ext.isdigit() and ext2 == 'exe':
+            if safe_exists(os.path.join(folder, bf + '.exe')) and int(re.sub(r'^0+', '', ext) or '0') != 1:
+                return True
+
         # RAR5 纯分卷
         if ext == 'rar' and re.fullmatch(r'part\d+', ext2):
             if not safe_glob(os.path.join(folder, bf + '.part*.exe')):
@@ -1613,6 +1628,8 @@ class ArchiveProcessor:
             'rar4': re.compile(rf'^{escaped}\.r\d+$', re.IGNORECASE),
             # ZIP volumes: .z01 / .z02 / ... (allow >=1 digit; some tools may output .z001)
             'zip': re.compile(rf'^{escaped}\.z\d+$', re.IGNORECASE),
+            # 7z SFX split: name.exe.001 / name.exe.002 ...
+            'exe_split': re.compile(rf'^{escaped}\.exe\.\d+$', re.IGNORECASE),
         }
         regex = regex_map.get(volume_type)
         if regex is None:
@@ -1646,6 +1663,11 @@ class ArchiveProcessor:
         # 7z 纯
         if ext.isdigit() and ext2 == '7z' and not safe_exists(os.path.join(folder, bf + '.exe')):
             volumes |= set(self._get_volume_files(bf, folder, '7z'))
+
+        # 7z SFX split volumes (name.exe.001 etc)
+        elif ext.isdigit() and ext2 == 'exe' and safe_exists(os.path.join(folder, bf + '.exe')):
+            volumes.add(os.path.join(folder, bf + '.exe'))
+            volumes |= set(self._get_volume_files(bf, folder, 'exe_split'))
 
         # EXE SFX 统一处理（从 .exe 文件开始的所有 SFX 情况）
         elif ext == 'exe' and self.sfx_detector.is_sfx(file_path):
@@ -1765,7 +1787,7 @@ class ArchiveProcessor:
                 return True, "ZIP分卷文件被跳过 (--skip-zip-multi)"
         
         # EXE SFX分卷
-        elif filename_lower.endswith('.exe'):
+        elif filename_lower.endswith('.exe') or re.search(r'\.exe\.\d+$', filename_lower):
             if self.args.skip_exe_multi:
                 return True, "EXE分卷文件被跳过 (--skip-exe-multi)"
         
@@ -5101,6 +5123,11 @@ def get_archive_base_name(filepath):
         print(f"  DEBUG: 获取归档基础名称: {filename}")
 
     # Handle different archive types correctly
+    if re.search(r'\.exe\.\d+$', filename_lower):
+        # Split SFX volumes: strip .exe.NNN
+        base = re.sub(r'\.exe\.\d+$', '', filename, flags=re.IGNORECASE)
+        base = re.sub(r'\.part\d+$', '', base, flags=re.IGNORECASE)
+        return base
     if filename_lower.endswith('.exe'):
         # For SFX files, remove .exe and part indicators
         base = re.sub(r'\.exe$', '', filename, flags=re.IGNORECASE)
