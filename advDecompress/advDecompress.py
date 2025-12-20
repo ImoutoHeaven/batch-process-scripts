@@ -1416,10 +1416,14 @@ class ArchiveProcessor:
             return 'volume'
         if re.fullmatch(r'r\d+', ext):
             return 'volume'
+        if ext == 'rar':
+            return 'single'
 
         # --- ZIP ---
-        if ext == 'zip' and self._has_volume_files(bf, folder, 'zip'):
-            return 'volume'
+        if ext == 'zip':
+            if self._has_volume_files(bf, folder, 'zip'):
+                return 'volume'
+            return 'single'
         if re.fullmatch(r'z\d+', ext):
             return 'volume'
 

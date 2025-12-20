@@ -5,6 +5,8 @@ import unittest
 import importlib.util
 import types
 from multiprocessing import Process, Pipe
+from types import SimpleNamespace
+import zipfile
 
 
 def _load_advdecompress_module():
@@ -175,6 +177,37 @@ class TestTxnPrimitives(unittest.TestCase):
             with open(txn["paths"]["txn_json"], "r", encoding="utf-8") as f:
                 saved = json.load(f)
             self.assertNotEqual(saved["state"], self.m.TXN_STATE_DONE)
+
+    def test_find_archives_recognizes_single_zip(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive = os.path.join(td, "a.zip")
+            with zipfile.ZipFile(archive, "w") as z:
+                z.writestr("hello.txt", "hi")
+
+            args = SimpleNamespace(
+                verbose=False,
+                password=None,
+                password_file=None,
+                traditional_zip_policy="decode-auto",
+            )
+            processor = self.m.ArchiveProcessor(args)
+            found = processor.find_archives(td)
+            self.assertEqual([os.path.abspath(archive)], found)
+
+    def test_is_archive_single_or_volume_recognizes_single_rar(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive = os.path.join(td, "a.rar")
+            with open(archive, "wb") as f:
+                f.write(b"")  # extension-based detection
+
+            args = SimpleNamespace(
+                verbose=False,
+                password=None,
+                password_file=None,
+                traditional_zip_policy="decode-auto",
+            )
+            processor = self.m.ArchiveProcessor(args)
+            self.assertEqual("single", processor.is_archive_single_or_volume(archive))
 
 
 if __name__ == "__main__":
