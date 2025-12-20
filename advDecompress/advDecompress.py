@@ -1416,7 +1416,7 @@ class ArchiveProcessor:
             return 'volume'
         if re.fullmatch(r'r\d+', ext):
             return 'volume'
-        if ext == 'rar':
+        if ext == 'rar' and not ext2:
             return 'single'
 
         # --- ZIP ---

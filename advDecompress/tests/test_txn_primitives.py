@@ -209,6 +209,25 @@ class TestTxnPrimitives(unittest.TestCase):
             processor = self.m.ArchiveProcessor(args)
             self.assertEqual("single", processor.is_archive_single_or_volume(archive))
 
+    def test_rar_part_with_part_exe_not_treated_as_single(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "a")
+            exe = base + ".part1.exe"
+            part2 = base + ".part2.rar"
+            for p in (exe, part2):
+                with open(p, "wb") as f:
+                    f.write(b"")
+
+            args = SimpleNamespace(
+                verbose=False,
+                password=None,
+                password_file=None,
+                traditional_zip_policy="decode-auto",
+            )
+            processor = self.m.ArchiveProcessor(args)
+            kind = processor.is_archive_single_or_volume(part2)
+            self.assertNotEqual("single", kind)
+
     def test_get_all_volumes_zip_accepts_variable_digits(self):
         with tempfile.TemporaryDirectory() as td:
             base = os.path.join(td, "a")
