@@ -209,6 +209,67 @@ class TestTxnPrimitives(unittest.TestCase):
             processor = self.m.ArchiveProcessor(args)
             self.assertEqual("single", processor.is_archive_single_or_volume(archive))
 
+    def test_get_all_volumes_zip_accepts_variable_digits(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "a")
+            main = base + ".zip"
+            part1 = base + ".z01"
+            part2 = base + ".z001"
+            for p in (main, part1, part2):
+                with open(p, "wb") as f:
+                    f.write(b"")
+
+            args = SimpleNamespace(
+                verbose=False,
+                password=None,
+                password_file=None,
+                traditional_zip_policy="decode-auto",
+            )
+            processor = self.m.ArchiveProcessor(args)
+            vols = processor.get_all_volumes(part1)
+            self.assertEqual({os.path.abspath(p) for p in (main, part1, part2)}, set(vols))
+
+    def test_get_all_volumes_7z_accepts_short_digits(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "a")
+            part1 = base + ".7z.1"
+            part2 = base + ".7z.01"
+            part3 = base + ".7z.001"
+            for p in (part1, part2, part3):
+                with open(p, "wb") as f:
+                    f.write(b"")
+
+            args = SimpleNamespace(
+                verbose=False,
+                password=None,
+                password_file=None,
+                traditional_zip_policy="decode-auto",
+            )
+            processor = self.m.ArchiveProcessor(args)
+            vols = processor.get_all_volumes(part2)
+            self.assertEqual({os.path.abspath(p) for p in (part1, part2, part3)}, set(vols))
+
+    def test_get_all_volumes_rar4_accepts_variable_digits(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "a")
+            main = base + ".rar"
+            part1 = base + ".r0"
+            part2 = base + ".r00"
+            part3 = base + ".r000"
+            for p in (main, part1, part2, part3):
+                with open(p, "wb") as f:
+                    f.write(b"")
+
+            args = SimpleNamespace(
+                verbose=False,
+                password=None,
+                password_file=None,
+                traditional_zip_policy="decode-auto",
+            )
+            processor = self.m.ArchiveProcessor(args)
+            vols = processor.get_all_volumes(part2)
+            self.assertEqual({os.path.abspath(p) for p in (main, part1, part2, part3)}, set(vols))
+
 
 if __name__ == "__main__":
     unittest.main()

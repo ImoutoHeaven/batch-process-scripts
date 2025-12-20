@@ -1607,12 +1607,12 @@ class ArchiveProcessor:
         """
         escaped = re.escape(base_filename)
         regex_map = {
-            # 7z multi-volume: .7z.001 / .7z.0001 ...
-            '7z': re.compile(rf'^{escaped}\.7z\.\d{{3,}}$', re.IGNORECASE),
-            # RAR4 volumes: .r00 / .r01 ...
-            'rar4': re.compile(rf'^{escaped}\.r\d{{2}}$', re.IGNORECASE),
-            # ZIP volumes: .z01 / .z02 ...
-            'zip': re.compile(rf'^{escaped}\.z\d{{2}}$', re.IGNORECASE),
+            # 7z multi-volume: .7z.001 / .7z.0001 / (some tools use shorter digits) .7z.1
+            '7z': re.compile(rf'^{escaped}\.7z\.\d+$', re.IGNORECASE),
+            # RAR4 volumes: .r00 / .r01 / ... (allow >=1 digit to avoid missing non-standard variants)
+            'rar4': re.compile(rf'^{escaped}\.r\d+$', re.IGNORECASE),
+            # ZIP volumes: .z01 / .z02 / ... (allow >=1 digit; some tools may output .z001)
+            'zip': re.compile(rf'^{escaped}\.z\d+$', re.IGNORECASE),
         }
         regex = regex_map.get(volume_type)
         if regex is None:
