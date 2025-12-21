@@ -4985,6 +4985,19 @@ def _run_transactional(processor, archives, *, args):
                     processor.failed_archives.append(txn.get("archive_path"))
             _garbage_collect(output_dir, keep_journal_days=args.keep_journal_days)
 
+    if getattr(args, "success_clean_journal", False):
+        if not processor.failed_archives:
+            for output_dir in groups.keys():
+                work_root = _work_root(output_dir)
+                lock_path = os.path.join(work_root, "locks", "output_dir.lock")
+                lock = FileLock(lock_path, timeout_ms=args.output_lock_timeout_ms, retry_ms=args.output_lock_retry_ms, debug=VERBOSE)
+                try:
+                    with lock:
+                        pass
+                    safe_rmtree(work_root, VERBOSE)
+                except Exception as e:
+                    print(f"  Warning: Could not clean journal dir {work_root}: {e}")
+
 
 # ==================== End Transactional Mode ====================
 
@@ -7286,6 +7299,11 @@ def main():
         choices=['auto', 'none'],
         default='auto',
         help='Durability fsync strategy (default: auto). auto: fsync WAL + txn.json only (does not fsync output files).'
+    )
+    parser.add_argument(
+        '--success-clean-journal', '-scj',
+        action='store_true',
+        help='If all archives succeed, remove .advdecompress_work after finishing (transactional mode only).'
     )
 
     parser.add_argument(
