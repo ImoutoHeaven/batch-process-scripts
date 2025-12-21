@@ -45,6 +45,18 @@ FORCE_CLEAN_TMP = False
 _active_subprocesses = set()
 _active_subprocesses_lock = threading.Lock()
 
+def parse_bool_arg(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return True
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
 def _register_active_subprocess(proc: subprocess.Popen):
     with _active_subprocesses_lock:
         _active_subprocesses.add(proc)
@@ -7302,8 +7314,11 @@ def main():
     )
     parser.add_argument(
         '--success-clean-journal', '-scj',
-        action='store_true',
-        help='If all archives succeed, remove .advdecompress_work after finishing (transactional mode only).'
+        type=parse_bool_arg,
+        nargs='?',
+        const=True,
+        default=True,
+        help='If all archives succeed, remove .advdecompress_work after finishing (transactional mode only). Use -scj false to disable.'
     )
 
     parser.add_argument(

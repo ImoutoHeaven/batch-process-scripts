@@ -78,7 +78,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `--degrade-cross-volume` | 允许跨卷降级 copy+delete（降低原子性） | 关闭 |
 | `--conflict-mode` | 事务化落位冲突策略：`fail` / `suffix` | `fail` |
 | `--keep-journal-days` | DONE 事务 journal 保留天数 | 7 |
-| `-scj`, `--success-clean-journal` | 若本轮全部成功则删除 `.advdecompress_work` | 关闭 |
+| `-scj`, `--success-clean-journal` | 若本轮全部成功则删除 `.advdecompress_work`（可用 `-scj false` 关闭） | 开启 |
 | `-dr`, `--depth-range` | 扫描深度范围，如 `0-2` / `1` | 全深度 |
 | `--fix-ext`, `-fe` | 启用扩展名修复（按文件头识别） | 关闭 |
 | `--safe-fix-ext`, `-sfe` | 启用安全扩展名修复（追加正确扩展名） | 关闭 |
