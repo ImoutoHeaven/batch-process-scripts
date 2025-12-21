@@ -86,6 +86,8 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 
 ---
 
+> 事务模式下的工作目录统一放在输出根目录的 `.advdecompress_work/` 下（不再在每个子输出目录生成）。
+
 ## 解压策略详解（`-dp/--decompress-policy`）
 
 | 策略名 | 行为说明 |

@@ -32,6 +32,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Union, Tuple
 import stat
+import hashlib
 
 # Global verbose flag
 VERBOSE = False
@@ -3881,12 +3882,18 @@ class FileLock:
         return False
 
 
-def _work_root(output_dir):
-    return os.path.join(output_dir, ".advdecompress_work")
+def _work_base(output_base):
+    return os.path.join(output_base, ".advdecompress_work")
 
 
-def _txn_paths(output_dir, txn_id):
-    work_root = _work_root(output_dir)
+def _work_root(output_dir, output_base):
+    output_dir_abs = os.path.abspath(output_dir)
+    token = hashlib.sha1(output_dir_abs.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(_work_base(output_base), "outputs", token)
+
+
+def _txn_paths(output_dir, output_base, txn_id):
+    work_root = _work_root(output_dir, output_base)
     return {
         "work_root": work_root,
         "staging_extracted": os.path.join(work_root, "staging", txn_id, "extracted"),
@@ -3899,9 +3906,9 @@ def _txn_paths(output_dir, txn_id):
     }
 
 
-def _validate_environment_for_output_dir(output_dir, success_to, fail_to, *, strict_cross_volume=True, degrade_cross_volume=False):
+def _validate_environment_for_output_dir(output_dir, output_base, success_to, fail_to, *, strict_cross_volume=True, degrade_cross_volume=False):
     safe_makedirs(output_dir, debug=VERBOSE)
-    work_root = _work_root(output_dir)
+    work_root = _work_root(output_dir, output_base)
     safe_makedirs(work_root, debug=VERBOSE)
 
     if strict_cross_volume and not degrade_cross_volume:
@@ -4017,9 +4024,9 @@ def _txn_fail(txn, error_type, message):
     _txn_snapshot(txn)
 
 
-def _txn_create(*, archive_path, volumes, output_dir, policy, wal_fsync_every=256, snapshot_every=512, durability_enabled=True):
+def _txn_create(*, archive_path, volumes, output_dir, output_base, policy, wal_fsync_every=256, snapshot_every=512, durability_enabled=True):
     txn_id = uuid.uuid4().hex
-    paths = _txn_paths(output_dir, txn_id)
+    paths = _txn_paths(output_dir, output_base, txn_id)
 
     safe_makedirs(paths["journal_dir"], debug=VERBOSE)
     safe_makedirs(os.path.dirname(paths["staging_extracted"]), debug=VERBOSE)
@@ -4032,6 +4039,7 @@ def _txn_create(*, archive_path, volumes, output_dir, policy, wal_fsync_every=25
         "archive_path": os.path.abspath(archive_path),
         "volumes": [os.path.abspath(v) for v in volumes],
         "output_dir": os.path.abspath(output_dir),
+        "output_base": os.path.abspath(output_base),
         "policy": policy,
         "resolved_policy": None,
         "policy_frozen": False,
@@ -4663,8 +4671,8 @@ def _cleanup_workdir(txn):
     safe_rmtree(os.path.join(work_root, "incoming", txn_id), VERBOSE)
 
 
-def _garbage_collect(output_dir, *, keep_journal_days=7):
-    work_root = _work_root(output_dir)
+def _garbage_collect(output_dir, *, output_base, keep_journal_days=7):
+    work_root = _work_root(output_dir, output_base)
     journal_root = os.path.join(work_root, "journal")
     if not safe_exists(journal_root, VERBOSE):
         return
@@ -4693,7 +4701,8 @@ def _garbage_collect(output_dir, *, keep_journal_days=7):
 
 
 def _recover_output_dir(output_dir, *, args):
-    work_root = _work_root(output_dir)
+    output_base = _output_base_from_args(args)
+    work_root = _work_root(output_dir, output_base)
     journal_root = os.path.join(work_root, "journal")
     if not safe_exists(journal_root, VERBOSE):
         return
@@ -4729,28 +4738,47 @@ def _recover_output_dir(output_dir, *, args):
 
 def _discover_output_dirs_for_recovery(output_base):
     output_dirs = set()
-    if not safe_exists(output_base, VERBOSE):
+    work_base = _work_base(output_base)
+    outputs_root = os.path.join(work_base, "outputs")
+    if not safe_exists(outputs_root, VERBOSE):
         return []
 
-    for root, dirs, _files in os.walk(output_base):
-        if ".advdecompress_work" in dirs:
-            output_dirs.add(root)
-            dirs.remove(".advdecompress_work")
-        # Avoid walking into very deep staging trees unnecessarily
-        if ".staging_advDecompress" in dirs:
-            dirs.remove(".staging_advDecompress")
+    for name in os.listdir(outputs_root):
+        work_root = os.path.join(outputs_root, name)
+        journal_root = os.path.join(work_root, "journal")
+        if not safe_exists(journal_root, VERBOSE):
+            continue
+
+        for txn_id in os.listdir(journal_root):
+            txn_dir = os.path.join(journal_root, txn_id)
+            txn_json = os.path.join(txn_dir, "txn.json")
+            if not safe_exists(txn_json, VERBOSE):
+                continue
+            try:
+                safe_txn_json = safe_path_for_operation(txn_json, VERBOSE)
+                with open(safe_txn_json, "r", encoding="utf-8") as f:
+                    txn = json.load(f)
+                output_dir = txn.get("output_dir")
+                if output_dir:
+                    output_dirs.add(output_dir)
+            except Exception:
+                continue
 
     return sorted(output_dirs)
 
 
 def _recover_all_outputs(output_base, *, args):
     for output_dir in _discover_output_dirs_for_recovery(output_base):
-        work_root = _work_root(output_dir)
+        work_root = _work_root(output_dir, output_base)
         lock_path = os.path.join(work_root, "locks", "output_dir.lock")
         lock = FileLock(lock_path, timeout_ms=args.output_lock_timeout_ms, retry_ms=args.output_lock_retry_ms, debug=VERBOSE)
         with lock:
             _recover_output_dir(output_dir, args=args)
-            _garbage_collect(output_dir, keep_journal_days=args.keep_journal_days)
+            _garbage_collect(output_dir, output_base=output_base, keep_journal_days=args.keep_journal_days)
+
+
+def _output_base_from_args(args):
+    return os.path.abspath(args.output) if args.output else os.path.abspath(args.path if safe_isdir(args.path, VERBOSE) else os.path.dirname(args.path))
 
 
 def _compute_output_dir(args, archive_path):
@@ -4763,7 +4791,7 @@ def _compute_output_dir(args, archive_path):
     return os.path.join(output_base, rel_path) if rel_path and rel_path != "." else output_base
 
 
-def _extract_phase(processor, archive_path, *, args):
+def _extract_phase(processor, archive_path, *, args, output_base):
     archive_path = os.path.abspath(archive_path)
     print(f"Extracting: {archive_path}")
 
@@ -4784,6 +4812,7 @@ def _extract_phase(processor, archive_path, *, args):
     output_dir = _compute_output_dir(args, archive_path)
     _validate_environment_for_output_dir(
         output_dir,
+        output_base,
         args.success_to if args.success_policy == "move" else None,
         args.fail_to if args.fail_policy == "move" else None,
         strict_cross_volume=not args.degrade_cross_volume,
@@ -4825,6 +4854,7 @@ def _extract_phase(processor, archive_path, *, args):
         archive_path=archive_path,
         volumes=volumes,
         output_dir=output_dir,
+        output_base=output_base,
         policy=args.decompress_policy,
         wal_fsync_every=args.wal_fsync_every,
         snapshot_every=args.snapshot_every,
@@ -4946,17 +4976,17 @@ def _place_and_finalize_txn(txn, *, args, recovery=False):
 
 
 def _run_transactional(processor, archives, *, args):
-    output_base = os.path.abspath(args.output) if args.output else os.path.abspath(args.path if safe_isdir(args.path, VERBOSE) else os.path.dirname(args.path))
+    output_base = _output_base_from_args(args)
     _recover_all_outputs(output_base, args=args)
 
     results = []
     if args.threads == 1:
         for a in archives:
-            results.append(_extract_phase(processor, a, args=args))
+            results.append(_extract_phase(processor, a, args=args, output_base=output_base))
     else:
         reset_interrupt_flag()
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            futures = {executor.submit(_extract_phase, processor, a, args=args): a for a in archives}
+            futures = {executor.submit(_extract_phase, processor, a, args=args, output_base=output_base): a for a in archives}
             for future in as_completed(futures):
                 check_interrupt()
                 results.append(future.result())
@@ -4982,7 +5012,7 @@ def _run_transactional(processor, archives, *, args):
 
     for output_dir, group in groups.items():
         group.sort(key=lambda t: t.get("archive_path", ""))
-        work_root = _work_root(output_dir)
+        work_root = _work_root(output_dir, output_base)
         lock_path = os.path.join(work_root, "locks", "output_dir.lock")
         lock = FileLock(lock_path, timeout_ms=args.output_lock_timeout_ms, retry_ms=args.output_lock_retry_ms, debug=VERBOSE)
         with lock:
@@ -4995,12 +5025,12 @@ def _run_transactional(processor, archives, *, args):
                 except Exception as e:
                     print(f"Error placing {txn.get('archive_path')}: {e}")
                     processor.failed_archives.append(txn.get("archive_path"))
-            _garbage_collect(output_dir, keep_journal_days=args.keep_journal_days)
+            _garbage_collect(output_dir, output_base=output_base, keep_journal_days=args.keep_journal_days)
 
     if getattr(args, "success_clean_journal", False):
         if not processor.failed_archives:
             for output_dir in groups.keys():
-                work_root = _work_root(output_dir)
+                work_root = _work_root(output_dir, output_base)
                 lock_path = os.path.join(work_root, "locks", "output_dir.lock")
                 lock = FileLock(lock_path, timeout_ms=args.output_lock_timeout_ms, retry_ms=args.output_lock_retry_ms, debug=VERBOSE)
                 try:
@@ -5009,6 +5039,16 @@ def _run_transactional(processor, archives, *, args):
                     safe_rmtree(work_root, VERBOSE)
                 except Exception as e:
                     print(f"  Warning: Could not clean journal dir {work_root}: {e}")
+            if groups:
+                work_base = _work_base(output_base)
+                try:
+                    safe_rmtree(os.path.join(work_base, "outputs"), VERBOSE)
+                except Exception:
+                    pass
+                try:
+                    safe_rmtree(work_base, VERBOSE)
+                except Exception:
+                    pass
 
 
 # ==================== End Transactional Mode ====================
