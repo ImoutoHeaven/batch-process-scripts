@@ -103,8 +103,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 
 > N 为正整数，例如 `5-collect`、`file-content-10-collect`、`file-content-auto-folder-3-collect-len` 等。
 >
-> 事务化模式（默认）目前支持：`separate` / `direct` / `collect` / `N-collect` / `file-content-with-folder-separate`。  
-> 其他策略请使用 `--legacy`。
+> 事务化模式（默认）已支持全部解压策略；`--legacy` 仅用于回退旧版流程。
 >
 > Durability 边界：默认只对 `txn.wal` 与 `txn.json` 做 best-effort `fsync`，不逐文件刷盘输出内容。
 

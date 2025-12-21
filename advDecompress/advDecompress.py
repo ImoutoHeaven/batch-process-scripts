@@ -40,6 +40,7 @@ VERBOSE = False
 # Default keeps non-empty temp dirs to avoid silent data loss and to aid debugging.
 FORCE_CLEAN_TMP = False
 
+
 # Track active subprocesses so SIGINT/SIGTERM can terminate them promptly.
 _active_subprocesses = set()
 _active_subprocesses_lock = threading.Lock()
@@ -607,6 +608,110 @@ class SFXDetector:
             return results
         return is_sfx
 
+
+def is_elf_file(file_path, debug=False):
+    try:
+        with safe_open(file_path, 'rb') as f:
+            header = f.read(4)
+            return header == b'\x7fELF'
+    except Exception as e:
+        if debug:
+            print(f"  DEBUG: ELF检查失败 {file_path}: {e}")
+        return False
+
+
+def _scan_for_signatures_in_file(file_path, signatures, *, min_offset=512, max_scan_bytes=32 * 1024 * 1024, debug=False):
+    max_sig_len = 0
+    for sigs in signatures.values():
+        for sig in sigs:
+            if len(sig) > max_sig_len:
+                max_sig_len = len(sig)
+
+    try:
+        with safe_open(file_path, 'rb') as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+
+            if file_size <= 0:
+                return {'found': False}
+
+            head_size = min(1024 * 1024, file_size)
+            tail_size = min(max_scan_bytes, file_size)
+            windows = [(0, head_size)]
+            if file_size > head_size:
+                tail_start = max(file_size - tail_size, 0)
+                if tail_start != 0:
+                    windows.append((tail_start, file_size - tail_start))
+
+            for start, size in windows:
+                f.seek(start)
+                chunk_size = 1024 * 1024
+                offset = start
+                prev = b''
+                remaining = size
+
+                while remaining > 0:
+                    to_read = min(chunk_size, remaining)
+                    chunk = f.read(to_read)
+                    if not chunk:
+                        break
+
+                    data = prev + chunk
+                    for fmt, sigs in signatures.items():
+                        for sig in sigs:
+                            start_idx = 0
+                            while True:
+                                idx = data.find(sig, start_idx)
+                                if idx == -1:
+                                    break
+                                sig_offset = offset - len(prev) + idx
+                                if sig_offset >= min_offset:
+                                    return {'found': True, 'format': fmt, 'offset': sig_offset}
+                                start_idx = idx + 1
+
+                    if len(data) > max_sig_len:
+                        prev = data[-(max_sig_len - 1):]
+                    else:
+                        prev = data
+                    offset += len(chunk)
+                    remaining -= len(chunk)
+    except Exception as e:
+        if debug:
+            print(f"  DEBUG: ELF签名扫描失败 {file_path}: {e}")
+
+    return {'found': False}
+
+
+def detect_elf_sfx(file_path, detailed=False, debug=False):
+    if debug:
+        print(f"  DEBUG: ELF-SFX检测开始: {file_path}")
+
+    if not safe_exists(file_path, debug):
+        if detailed:
+            return {'is_sfx': False, 'error': 'File does not exist'}
+        return False
+
+    if not is_elf_file(file_path, debug):
+        if detailed:
+            return {'is_sfx': False, 'error': 'Not a valid ELF file'}
+        return False
+
+    signature_result = _scan_for_signatures_in_file(file_path, SFXDetector.SIGNATURES, debug=debug)
+    is_sfx = bool(signature_result.get('found'))
+    results = {
+        'is_sfx': is_sfx,
+        'signature': signature_result,
+    }
+
+    if debug:
+        print(f"  DEBUG: ELF-SFX检测结果: {is_sfx}")
+        if is_sfx:
+            print(f"  DEBUG: ELF-SFX签名: {signature_result}")
+
+    if detailed:
+        return results
+    return is_sfx
+
 class ArchiveProcessor:
     """Handles archive processing with various policies."""
 
@@ -839,6 +944,108 @@ class ArchiveProcessor:
 
         return None
 
+    def _detect_archive_group(self, file_path):
+        """Return strong grouping info to avoid cross-archive mixing."""
+        if not safe_isfile(file_path, VERBOSE):
+            return {"volumes": [file_path], "group_key": None}
+
+        info = parse_archive_filename(os.path.basename(file_path))
+        bf, ext, ext2 = info['base_filename'], info['file_ext'], info['file_ext_extend']
+        folder = os.path.dirname(file_path)
+        folder_abs = os.path.abspath(folder)
+        exe_path = os.path.join(folder, bf + '.exe')
+
+        def _group(family, scheme, volumes):
+            key = (folder_abs, bf, family, scheme)
+            if VERBOSE:
+                print(f"  DEBUG: group_key={key}, volumes={len(volumes)}")
+            return {"volumes": sorted(set(volumes)), "group_key": key}
+
+        # 7z split: name.7z.001
+        if ext.isdigit() and ext2 == '7z' and not safe_exists(exe_path, VERBOSE):
+            return _group("7z", "7z_split", self._get_volume_files(bf, folder, '7z'))
+
+        # 7z single
+        if ext == '7z':
+            return _group("7z", "single", [file_path])
+
+        # 7z SFX split: name.exe.001 + name.exe
+        if ext.isdigit() and ext2 == 'exe' and safe_exists(exe_path, VERBOSE):
+            if self.sfx_detector.is_sfx(exe_path):
+                sfx = self.sfx_detector.is_sfx(exe_path, detailed=True)
+                family = "sfx-rar" if ((sfx.get('signature', {}).get('format') == 'RAR') or sfx.get('rar_marker', False)) else "sfx-7z"
+                vols = [exe_path] + self._get_volume_files(bf, folder, 'exe_split')
+                return _group(family, "exe_split", vols)
+
+        # RAR5 split: name.partN.rar (non-SFX)
+        if ext == 'rar' and re.fullmatch(r'part\d+', ext2):
+            if safe_glob(os.path.join(folder, bf + '.part*.exe')):
+                vols = [exe_path] + list(safe_glob(os.path.join(folder, bf + '.part*.rar')))
+                return _group("sfx-rar", "sfx-rar-part", vols)
+            vols = list(safe_glob(os.path.join(folder, bf + '.part*.rar')))
+            return _group("rar5", "rar5_part", vols)
+
+        # RAR4 split: name.rNN + name.rar
+        if re.fullmatch(r'r\d+', ext):
+            vols = [os.path.join(folder, bf + '.rar')] + self._get_volume_files(bf, folder, 'rar4')
+            return _group("rar4", "rar4_rNN", vols)
+        if ext == 'rar' and self._has_volume_files(bf, folder, 'rar4'):
+            vols = [os.path.join(folder, bf + '.rar')] + self._get_volume_files(bf, folder, 'rar4')
+            return _group("rar4", "rar4_rNN", vols)
+
+        # RAR single
+        if ext == 'rar':
+            return _group("rar", "single", [file_path])
+
+        # ZIP split: name.zip + name.zNN
+        if ext == 'zip' and self._has_volume_files(bf, folder, 'zip'):
+            vols = [os.path.join(folder, bf + '.zip')] + self._get_volume_files(bf, folder, 'zip')
+            return _group("zip", "zip_zNN", vols)
+        if re.fullmatch(r'z\d+', ext):
+            vols = self._get_volume_files(bf, folder, 'zip')
+            zip_main = os.path.join(folder, bf + '.zip')
+            if safe_exists(zip_main, VERBOSE):
+                vols = [zip_main] + vols
+            return _group("zip", "zip_zNN", vols)
+
+        # ZIP single
+        if ext == 'zip':
+            return _group("zip", "single", [file_path])
+
+        # EXE SFX (MZ)
+        if ext == 'exe':
+            if self._has_volume_files(bf, folder, 'exe_split'):
+                vols = [exe_path] + self._get_volume_files(bf, folder, 'exe_split')
+                return _group("sfx-7z", "exe_split", vols)
+            if self.sfx_detector.is_sfx(file_path):
+                sfx = self.sfx_detector.is_sfx(file_path, detailed=True)
+                is_rar_sfx = (sfx.get('signature', {}).get('format') == 'RAR') or sfx.get('rar_marker', False)
+                if is_rar_sfx:
+                    rar_parts = list(safe_glob(os.path.join(folder, bf + '.part*.rar')))
+                    if rar_parts:
+                        return _group("sfx-rar", "sfx-rar-part", [file_path] + rar_parts)
+                    return _group("sfx-rar", "single", [file_path])
+                if self._has_volume_files(bf, folder, '7z'):
+                    vols = [file_path] + self._get_volume_files(bf, folder, '7z')
+                    return _group("sfx-7z", "sfx-7z-7zsplit", vols)
+                return _group("sfx-7z", "single", [file_path])
+
+        # ELF SFX
+        elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
+        if elf_sfx.get('is_sfx'):
+            is_rar_sfx = elf_sfx.get('signature', {}).get('format') == 'RAR'
+            if is_rar_sfx:
+                rar_parts = list(safe_glob(os.path.join(folder, bf + '.part*.rar')))
+                if rar_parts:
+                    return _group("elf-sfx-rar", "sfx-rar-part", [file_path] + rar_parts)
+                return _group("elf-sfx-rar", "single", [file_path])
+            if self._has_volume_files(bf, folder, '7z'):
+                vols = [file_path] + self._get_volume_files(bf, folder, '7z')
+                return _group("elf-sfx-7z", "sfx-7z-7zsplit", vols)
+            return _group("elf-sfx-7z", "single", [file_path])
+
+        return {"volumes": [file_path], "group_key": None}
+
     def get_relative_path(self, file_path, base_path):
         """Get relative path from base path."""
         try:
@@ -994,6 +1201,10 @@ class ArchiveProcessor:
 
             if success:
                 print(f"  Successfully extracted to temporary directory")
+
+                ok, reason = validate_extracted_tree(tmp_dir)
+                if not ok:
+                    raise RuntimeError(f"unsafe_extracted_tree:{reason}")
 
                 extracted_files, extracted_dirs = count_items_in_dir(tmp_dir)
                 if extracted_files == 0 and extracted_dirs == 0:
@@ -1432,10 +1643,35 @@ class ArchiveProcessor:
         if re.fullmatch(r'z\d+', ext):
             return 'volume'
 
+        # --- ELF SFX (非exe扩展) ---
+        if ext != 'exe':
+            elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
+            if elf_sfx.get('is_sfx'):
+                is_rar_sfx = elf_sfx.get('signature', {}).get('format') == 'RAR'
+                if is_rar_sfx:
+                    if safe_glob(os.path.join(folder, bf + '.part*.rar')):
+                        return 'volume'
+                    return 'single'
+                if self._has_volume_files(bf, folder, '7z'):
+                    return 'volume'
+                return 'single'
+
         # --- EXE ---
         if ext == 'exe':
-            if not self.sfx_detector.is_sfx(file_path):
+            if self._has_volume_files(bf, folder, 'exe_split'):
                 return 'notarchive'
+            if not self.sfx_detector.is_sfx(file_path):
+                elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
+                if not elf_sfx.get('is_sfx'):
+                    return 'notarchive'
+                is_rar_sfx = elf_sfx.get('signature', {}).get('format') == 'RAR'
+                if is_rar_sfx:
+                    if safe_glob(os.path.join(folder, bf + '.part*.rar')):
+                        return 'volume'
+                    return 'single'
+                if self._has_volume_files(bf, folder, '7z'):
+                    return 'volume'
+                return 'single'
 
             sfx = self.sfx_detector.is_sfx(file_path, detailed=True)
             is_rar_sfx = (sfx.get('signature', {}).get('format') == 'RAR') or sfx.get('rar_marker', False)
@@ -1494,10 +1730,35 @@ class ArchiveProcessor:
         if re.fullmatch(r'z\d+', ext):
             return {"is_multi": True, "type": "zip-multi"}
 
+        # --- ELF SFX (非exe扩展) ---
+        if ext != 'exe':
+            elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
+            if elf_sfx.get('is_sfx'):
+                is_rar_sfx = elf_sfx.get('signature', {}).get('format') == 'RAR'
+                if is_rar_sfx:
+                    if safe_glob(os.path.join(folder, bf + '.part*.rar')):
+                        return {"is_multi": True, "type": "elf-rar-multi"}
+                    return {"is_multi": False, "type": "elf-rar-single"}
+                if self._has_volume_files(bf, folder, '7z'):
+                    return {"is_multi": True, "type": "elf-7z-multi"}
+                return {"is_multi": False, "type": "elf-7z-single"}
+
         # --- EXE ---
         if ext == 'exe':
+            if self._has_volume_files(bf, folder, 'exe_split'):
+                return {"is_multi": True, "type": "exe-7z-multi"}
             if not self.sfx_detector.is_sfx(file_path):
-                return {"is_multi": False, "type": "exe-notarchive"}
+                elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
+                if not elf_sfx.get('is_sfx'):
+                    return {"is_multi": False, "type": "exe-notarchive"}
+                is_rar_sfx = elf_sfx.get('signature', {}).get('format') == 'RAR'
+                if is_rar_sfx:
+                    if safe_glob(os.path.join(folder, bf + '.part*.rar')):
+                        return {"is_multi": True, "type": "elf-rar-multi"}
+                    return {"is_multi": False, "type": "elf-rar-single"}
+                if self._has_volume_files(bf, folder, '7z'):
+                    return {"is_multi": True, "type": "elf-7z-multi"}
+                return {"is_multi": False, "type": "elf-7z-single"}
 
             sfx = self.sfx_detector.is_sfx(file_path, detailed=True)
             is_rar_sfx = (sfx.get('signature', {}).get('format') == 'RAR') or sfx.get('rar_marker', False)
@@ -1550,6 +1811,8 @@ class ArchiveProcessor:
 
         # EXE SFX 主卷
         if ext == 'exe' and self.sfx_detector.is_sfx(file_path):
+            if self._has_volume_files(bf, folder, 'exe_split'):
+                return False
             sfx = self.sfx_detector.is_sfx(file_path, detailed=True)
             is_rar_sfx = (sfx.get('signature', {}).get('format') == 'RAR') or sfx.get('rar_marker', False)
 
@@ -1561,6 +1824,18 @@ class ArchiveProcessor:
 
             # EXE-7z-SFX
             if (not is_rar_sfx) and self._has_volume_files(bf, folder, '7z'):
+                return True
+            return True
+
+        # ELF SFX 主卷（非exe扩展或exe但非MZ）
+        elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
+        if elf_sfx.get('is_sfx'):
+            is_rar_sfx = elf_sfx.get('signature', {}).get('format') == 'RAR'
+            if is_rar_sfx:
+                if safe_glob(os.path.join(folder, bf + '.part*.rar')):
+                    return True
+                return False
+            if self._has_volume_files(bf, folder, '7z'):
                 return True
 
         return False
@@ -1652,64 +1927,9 @@ class ArchiveProcessor:
 
     def get_all_volumes(self, file_path):
         """给定归档或分卷文件，返回同组内所有分卷（包含主卷）"""
-        if not safe_isfile(file_path, VERBOSE):
-            return [file_path]
-
-        info = parse_archive_filename(os.path.basename(file_path))
-        bf, ext, ext2 = info['base_filename'], info['file_ext'], info['file_ext_extend']
-        folder = os.path.dirname(file_path)
-        volumes = set()
-
-        # 7z 纯
-        if ext.isdigit() and ext2 == '7z' and not safe_exists(os.path.join(folder, bf + '.exe')):
-            volumes |= set(self._get_volume_files(bf, folder, '7z'))
-
-        # 7z SFX split volumes (name.exe.001 etc)
-        elif ext.isdigit() and ext2 == 'exe' and safe_exists(os.path.join(folder, bf + '.exe')):
-            volumes.add(os.path.join(folder, bf + '.exe'))
-            volumes |= set(self._get_volume_files(bf, folder, 'exe_split'))
-
-        # EXE SFX 统一处理（从 .exe 文件开始的所有 SFX 情况）
-        elif ext == 'exe' and self.sfx_detector.is_sfx(file_path):
-            sfx = self.sfx_detector.is_sfx(file_path, detailed=True)
-            is_rar_sfx = (sfx.get('signature', {}).get('format') == 'RAR') or sfx.get('rar_marker', False)
-            
-            if is_rar_sfx:
-                # EXE-RAR SFX 分卷处理
-                if safe_glob(os.path.join(folder, bf + '.part*.rar')):
-                    volumes.add(file_path)  # 添加 .exe 主卷
-                    volumes |= set(safe_glob(os.path.join(folder, bf + '.part*.rar')))
-            else:
-                # EXE-7z SFX 分卷处理  
-                if self._has_volume_files(bf, folder, '7z'):
-                    volumes.add(file_path)  # 添加 .exe 主卷
-                    volumes |= set(self._get_volume_files(bf, folder, '7z'))
-
-        # RAR5 纯
-        elif ext == 'rar' and re.fullmatch(r'part\d+', ext2) \
-             and not safe_glob(os.path.join(folder, bf + '.part*.exe')):
-            volumes |= set(safe_glob(os.path.join(folder, bf + '.part*.rar')))
-
-        # RAR5 SFX 从卷（从 .rar 文件开始查找的情况）
-        elif ext == 'rar' and re.fullmatch(r'part\d+', ext2) and \
-             safe_glob(os.path.join(folder, bf + '.part*.exe')):
-            volumes.add(os.path.join(folder, bf + '.exe'))
-            volumes |= set(safe_glob(os.path.join(folder, bf + '.part*.rar')))
-
-        # RAR4
-        elif (ext == 'rar' and self._has_volume_files(bf, folder, 'rar4')) or re.fullmatch(r'r\d+', ext):
-            volumes.add(os.path.join(folder, bf + '.rar'))
-            volumes |= set(self._get_volume_files(bf, folder, 'rar4'))
-
-        # ZIP
-        elif (ext == 'zip' and self._has_volume_files(bf, folder, 'zip')) or re.fullmatch(r'z\d+', ext):
-            volumes.add(os.path.join(folder, bf + '.zip'))
-            volumes |= set(self._get_volume_files(bf, folder, 'zip'))
-
-        if not volumes:
-            volumes.add(file_path)
-
-        return sorted(volumes)
+        group = self._detect_archive_group(file_path)
+        volumes = group.get("volumes") or [file_path]
+        return sorted(set(volumes))
 
     def _should_skip_single_archive(self, file_path):
         """
@@ -3828,8 +4048,13 @@ def _resolve_policy_under_lock(txn, conflict_mode):
         raise AssertionError("policy is frozen after placing begins")
 
     policy = txn["policy"]
+    output_dir = txn["output_dir"]
+    incoming_dir = txn["paths"]["incoming_dir"]
+    archive_name = get_archive_base_name(txn["archive_path"])
+    suffix_token = txn["txn_id"][:8]
+    placement = txn.setdefault("placement", {})
     if policy == "collect":
-        if _direct_would_conflict(txn["paths"]["incoming_dir"], txn["output_dir"]):
+        if _direct_would_conflict(incoming_dir, output_dir):
             return "separate"
         return "direct"
 
@@ -3839,17 +4064,82 @@ def _resolve_policy_under_lock(txn, conflict_mode):
         return "separate"
     if policy == "file-content-with-folder-separate":
         return "file-content-with-folder-separate"
+    if policy == "only-file-content":
+        return "only-file-content"
+    if policy == "file-content-with-folder":
+        return "file-content-with-folder"
+    if policy == "only-file-content-direct":
+        file_content = find_file_content(incoming_dir, VERBOSE)
+        if not file_content.get("found"):
+            return "only-file-content"
+        if _file_conflicts_under(file_content["path"], output_dir):
+            return "only-file-content"
+        return "only-file-content-direct"
 
     m = re.match(r"^(\d+)-collect$", policy)
     if m:
         threshold = int(m.group(1))
-        files, dirs = count_items_in_dir(txn["paths"]["incoming_dir"])
+        files, dirs = count_items_in_dir(incoming_dir)
         total = files + dirs
         if total >= threshold:
             return "separate"
         if conflict_mode == "fail" and _direct_would_conflict(txn["paths"]["incoming_dir"], txn["output_dir"]):
             return "separate"
         return "direct"
+
+    m = re.match(r"^file-content-(\d+)-collect$", policy)
+    if m:
+        threshold = int(m.group(1))
+        file_content = find_file_content(incoming_dir, VERBOSE)
+        if not file_content.get("found"):
+            files, dirs = count_items_in_dir(incoming_dir)
+            total = files + dirs
+            if total >= threshold:
+                return "separate"
+            if conflict_mode == "fail" and _direct_would_conflict(incoming_dir, output_dir):
+                return "separate"
+            return "direct"
+
+        files, dirs = count_items_in_dir(file_content["path"])
+        total = files + dirs
+        if total >= threshold:
+            return "file-content-collect-wrap"
+        if _file_conflicts_under(file_content["path"], output_dir):
+            return "file-content-collect-wrap"
+        return "file-content-collect-direct"
+
+    m = re.match(r"^file-content-auto-folder-(\d+)-collect-(len|meaningful)$", policy)
+    if m:
+        threshold = int(m.group(1))
+        strategy = m.group(2)
+        file_content = find_file_content(incoming_dir, VERBOSE)
+        if not file_content.get("found"):
+            files, dirs = count_items_in_dir(incoming_dir)
+            total = files + dirs
+            if total >= threshold:
+                return "separate"
+            if conflict_mode == "fail" and _direct_would_conflict(incoming_dir, output_dir):
+                return "separate"
+            return "direct"
+
+        files, dirs = count_items_in_dir(file_content["path"])
+        total = files + dirs
+        need_folder = total >= threshold
+        if not need_folder and _file_conflicts_under(file_content["path"], output_dir):
+            need_folder = True
+
+        if need_folder:
+            deepest_folder_name = get_deepest_folder_name(file_content, incoming_dir, archive_name)
+            if strategy == "len":
+                folder_name = deepest_folder_name if len(deepest_folder_name) >= len(archive_name) else archive_name
+            else:
+                meaningful_deepest = remove_ascii_non_meaningful_chars(deepest_folder_name)
+                meaningful_archive = remove_ascii_non_meaningful_chars(archive_name)
+                folder_name = deepest_folder_name if len(meaningful_deepest) >= len(meaningful_archive) else archive_name
+            placement["auto_folder_name"] = folder_name
+            return "file-content-auto-folder-wrap"
+
+        return "file-content-auto-folder-direct"
 
     raise RuntimeError(f"Transactional mode does not support policy: {policy}")
 
@@ -3893,6 +4183,191 @@ def _choose_unique_dir(output_dir, stem, suffix_token):
         if not safe_exists(candidate, VERBOSE):
             return candidate
     raise RuntimeError(f"Could not choose unique dir for: {stem}")
+
+
+def _choose_unique_dir_in(parent_dir, stem, suffix_token):
+    candidate = os.path.join(parent_dir, stem)
+    if not safe_exists(candidate, VERBOSE):
+        return candidate
+    for i in range(1, 10000):
+        candidate = os.path.join(parent_dir, f"{stem}_{suffix_token}_{i}")
+        if not safe_exists(candidate, VERBOSE):
+            return candidate
+    raise RuntimeError(f"Could not choose unique dir for: {stem}")
+
+
+def _file_conflicts_under(src_root, output_dir):
+    for root, dirs, files in safe_walk(src_root, VERBOSE):
+        dirs.sort()
+        files.sort()
+        rel_root = os.path.relpath(root, src_root)
+        rel_root = '' if rel_root == '.' else rel_root
+        for f in files:
+            rel_path = os.path.join(rel_root, f) if rel_root else f
+            dest_path = os.path.join(output_dir, rel_path)
+            if safe_isfile(dest_path, VERBOSE):
+                return True
+    return False
+
+
+def _plan_file_tree_moves(txn, src_root, dst_root):
+    plans = []
+    for root, dirs, files in safe_walk(src_root, VERBOSE):
+        dirs.sort()
+        files.sort()
+        rel_root = os.path.relpath(root, src_root)
+        rel_root = '' if rel_root == '.' else rel_root
+        target_root = dst_root if not rel_root else os.path.join(dst_root, rel_root)
+        safe_makedirs(target_root, debug=VERBOSE)
+
+        for d in dirs:
+            safe_makedirs(os.path.join(target_root, d), debug=VERBOSE)
+
+        for f in files:
+            src = os.path.join(root, f)
+            dst = os.path.join(target_root, f)
+            if safe_exists(dst, VERBOSE):
+                raise FileExistsError(f"Conflict: {dst}")
+            plans.append({"t": "MOVE_PLAN", "id": _txn_next_move_id(txn), "src": src, "dst": dst})
+    return plans
+
+
+def _plan_file_content_items_move(txn, items, dest_dir, *, conflict_mode=None):
+    plans = []
+    for item in sorted(items, key=lambda x: x["name"]):
+        src = item["path"]
+        dst = os.path.join(dest_dir, item["name"])
+        if safe_exists(dst, VERBOSE):
+            if conflict_mode == "suffix":
+                dst = _ensure_unique_path(dst, txn["txn_id"][:8])
+            else:
+                raise FileExistsError(f"Conflict: {dst}")
+        plans.append({"t": "MOVE_PLAN", "id": _txn_next_move_id(txn), "src": src, "dst": dst})
+    return plans
+
+
+def _plan_only_file_content_moves(txn, *, conflict_mode=None):
+    output_dir = txn["output_dir"]
+    incoming_dir = txn["paths"]["incoming_dir"]
+    archive_name = get_archive_base_name(txn["archive_path"])
+    suffix_token = txn["txn_id"][:8]
+
+    file_content = find_file_content(incoming_dir, VERBOSE)
+    if not file_content.get("found"):
+        return _plan_separate_dir_move(txn)
+
+    placement = txn.setdefault("placement", {})
+    final_dir = placement.get("final_archive_dir")
+    if not final_dir:
+        final_dir = _choose_unique_dir(output_dir, archive_name, suffix_token)
+        placement["final_archive_dir"] = final_dir
+        _txn_snapshot(txn)
+    safe_makedirs(final_dir, debug=VERBOSE)
+
+    return _plan_file_content_items_move(txn, file_content.get("items") or [], final_dir, conflict_mode=conflict_mode)
+
+
+def _plan_file_content_with_folder_moves(txn, *, conflict_mode=None):
+    output_dir = txn["output_dir"]
+    incoming_dir = txn["paths"]["incoming_dir"]
+    archive_name = get_archive_base_name(txn["archive_path"])
+    suffix_token = txn["txn_id"][:8]
+
+    file_content = find_file_content(incoming_dir, VERBOSE)
+    if not file_content.get("found"):
+        return _plan_separate_dir_move(txn)
+
+    deepest_folder_name = get_deepest_folder_name(file_content, incoming_dir, archive_name)
+
+    placement = txn.setdefault("placement", {})
+    final_dir = placement.get("final_archive_dir")
+    if not final_dir:
+        final_dir = _choose_unique_dir(output_dir, deepest_folder_name, suffix_token)
+        placement["final_archive_dir"] = final_dir
+        _txn_snapshot(txn)
+    safe_makedirs(final_dir, debug=VERBOSE)
+
+    return _plan_file_content_items_move(txn, file_content.get("items") or [], final_dir, conflict_mode=conflict_mode)
+
+
+def _plan_only_file_content_direct_moves(txn):
+    output_dir = txn["output_dir"]
+    incoming_dir = txn["paths"]["incoming_dir"]
+
+    file_content = find_file_content(incoming_dir, VERBOSE)
+    if not file_content.get("found"):
+        return _plan_only_file_content_moves(txn)
+
+    if _file_conflicts_under(file_content["path"], output_dir):
+        return _plan_only_file_content_moves(txn)
+
+    return _plan_file_tree_moves(txn, file_content["path"], output_dir)
+
+
+def _plan_file_content_collect_wrap_moves(txn, threshold):
+    output_dir = txn["output_dir"]
+    incoming_dir = txn["paths"]["incoming_dir"]
+    archive_name = get_archive_base_name(txn["archive_path"])
+    suffix_token = txn["txn_id"][:8]
+
+    file_content = find_file_content(incoming_dir, VERBOSE)
+    if not file_content.get("found"):
+        return _plan_separate_dir_move(txn)
+
+    placement = txn.setdefault("placement", {})
+    archive_dir = placement.get("archive_dir")
+    if not archive_dir:
+        archive_dir = _choose_unique_dir(output_dir, archive_name, suffix_token)
+        placement["archive_dir"] = archive_dir
+        _txn_snapshot(txn)
+    safe_makedirs(archive_dir, debug=VERBOSE)
+
+    return _plan_file_content_items_move(txn, file_content.get("items") or [], archive_dir)
+
+
+def _plan_file_content_collect_direct_moves(txn, threshold):
+    output_dir = txn["output_dir"]
+    incoming_dir = txn["paths"]["incoming_dir"]
+
+    file_content = find_file_content(incoming_dir, VERBOSE)
+    if not file_content.get("found"):
+        return _plan_direct_moves(txn, conflict_mode="fail")
+
+    return _plan_file_tree_moves(txn, file_content["path"], output_dir)
+
+
+def _plan_file_content_auto_folder_wrap_moves(txn):
+    output_dir = txn["output_dir"]
+    incoming_dir = txn["paths"]["incoming_dir"]
+    archive_name = get_archive_base_name(txn["archive_path"])
+    suffix_token = txn["txn_id"][:8]
+
+    file_content = find_file_content(incoming_dir, VERBOSE)
+    if not file_content.get("found"):
+        return _plan_separate_dir_move(txn)
+
+    placement = txn.setdefault("placement", {})
+    final_dir = placement.get("auto_folder_target_dir")
+    if not final_dir:
+        deepest_folder_name = get_deepest_folder_name(file_content, incoming_dir, archive_name)
+        folder_name = placement.get("auto_folder_name") or deepest_folder_name
+        final_dir = _choose_unique_dir(output_dir, folder_name, suffix_token)
+        placement["auto_folder_target_dir"] = final_dir
+        _txn_snapshot(txn)
+    safe_makedirs(final_dir, debug=VERBOSE)
+
+    return _plan_file_content_items_move(txn, file_content.get("items") or [], final_dir)
+
+
+def _plan_file_content_auto_folder_direct_moves(txn):
+    output_dir = txn["output_dir"]
+    incoming_dir = txn["paths"]["incoming_dir"]
+
+    file_content = find_file_content(incoming_dir, VERBOSE)
+    if not file_content.get("found"):
+        return _plan_direct_moves(txn, conflict_mode="fail")
+
+    return _plan_file_tree_moves(txn, file_content["path"], output_dir)
 
 
 def _plan_separate_dir_move(txn):
@@ -3988,8 +4463,31 @@ def _execute_policy_with_wal(txn, *, conflict_mode, wal_fsync_every, degrade_cro
         elif resolved == "direct":
             plans = _plan_direct_moves(txn, conflict_mode=conflict_mode)
             _execute_plans(txn, plans, wal_writer=wal_writer, degrade_cross_volume=degrade_cross_volume)
+        elif resolved == "only-file-content":
+            plans = _plan_only_file_content_moves(txn, conflict_mode=conflict_mode)
+            _execute_plans(txn, plans, wal_writer=wal_writer, degrade_cross_volume=degrade_cross_volume)
+        elif resolved == "only-file-content-direct":
+            plans = _plan_only_file_content_direct_moves(txn)
+            _execute_plans(txn, plans, wal_writer=wal_writer, degrade_cross_volume=degrade_cross_volume)
+        elif resolved == "file-content-with-folder":
+            plans = _plan_file_content_with_folder_moves(txn, conflict_mode=conflict_mode)
+            _execute_plans(txn, plans, wal_writer=wal_writer, degrade_cross_volume=degrade_cross_volume)
         elif resolved == "file-content-with-folder-separate":
             plans = _plan_file_content_with_folder_separate_moves(txn, conflict_mode=conflict_mode)
+            _execute_plans(txn, plans, wal_writer=wal_writer, degrade_cross_volume=degrade_cross_volume)
+        elif resolved == "file-content-collect-wrap":
+            threshold = int(re.match(r"^file-content-(\d+)-collect$", txn["policy"]).group(1))
+            plans = _plan_file_content_collect_wrap_moves(txn, threshold)
+            _execute_plans(txn, plans, wal_writer=wal_writer, degrade_cross_volume=degrade_cross_volume)
+        elif resolved == "file-content-collect-direct":
+            threshold = int(re.match(r"^file-content-(\d+)-collect$", txn["policy"]).group(1))
+            plans = _plan_file_content_collect_direct_moves(txn, threshold)
+            _execute_plans(txn, plans, wal_writer=wal_writer, degrade_cross_volume=degrade_cross_volume)
+        elif resolved == "file-content-auto-folder-wrap":
+            plans = _plan_file_content_auto_folder_wrap_moves(txn)
+            _execute_plans(txn, plans, wal_writer=wal_writer, degrade_cross_volume=degrade_cross_volume)
+        elif resolved == "file-content-auto-folder-direct":
+            plans = _plan_file_content_auto_folder_direct_moves(txn)
             _execute_plans(txn, plans, wal_writer=wal_writer, degrade_cross_volume=degrade_cross_volume)
         else:
             raise RuntimeError(f"Unknown resolved_policy: {resolved}")
@@ -4327,6 +4825,10 @@ def _extract_phase(processor, archive_path, *, args):
         check_interrupt()
         if not success:
             raise RuntimeError("extract_failed")
+
+        ok, reason = validate_extracted_tree(txn["paths"]["staging_extracted"])
+        if not ok:
+            raise RuntimeError(f"unsafe_extracted_tree:{reason}")
 
         extracted_files, extracted_dirs = count_items_in_dir(txn["paths"]["staging_extracted"])
         if extracted_files == 0 and extracted_dirs == 0:
@@ -5340,11 +5842,40 @@ def is_zip_format(archive_path):
     return False
 
 
+def validate_extracted_tree(root_dir):
+    """Reject symlinks, special files, or paths that escape the root."""
+    if not safe_exists(root_dir, VERBOSE):
+        return True, ""
+
+    root_abs = os.path.abspath(root_dir)
+    for root, dirs, files in safe_walk(root_dir, VERBOSE):
+        root_abs_check = os.path.abspath(root)
+        if not root_abs_check.startswith(root_abs):
+            return False, f"path_escape:{root}"
+
+        for name in list(dirs) + list(files):
+            p = os.path.join(root, name)
+            try:
+                st = os.lstat(p)
+            except Exception as e:
+                return False, f"stat_failed:{p}:{e}"
+
+            if stat.S_ISLNK(st.st_mode):
+                return False, f"symlink_blocked:{p}"
+            if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+                return False, f"special_file_blocked:{p}"
+
+    return True, ""
+
+
 # ==================== 新增解压策略 ====================
 
 def find_file_content(tmp_dir, debug=False):
     """
-    递归查找$file_content - 定义为同一深度有2个或以上文件夹/文件的层级
+    递归查找$file_content（按启发式规则）：
+      1) 从浅到深，若当前层 file_count + folder_count >= 1 且 file_exists，则当前层为 file_content；
+      2) 从浅到深，若当前层 folder_count >= 2（不关心 file_exists），则当前层为 file_content；
+      3) 若始终 folder_count == 1 且 file_exists == False，则最内层为 file_content。
 
     Args:
         tmp_dir: 临时目录路径
@@ -5356,8 +5887,8 @@ def find_file_content(tmp_dir, debug=False):
             'path': str,    # file_content所在路径
             'depth': int,   # 相对深度
             'items': list,  # file_content项目列表
-            'parent_folder_path': str,  # file_content的父文件夹路径
-            'parent_folder_name': str   # file_content的父文件夹名称
+            'parent_folder_path': str,  # file_content所在路径（用于命名推断）
+            'parent_folder_name': str   # file_content所在路径名称
         }
     """
     result = {
@@ -5372,10 +5903,6 @@ def find_file_content(tmp_dir, debug=False):
     if debug:
         print(f"  DEBUG: 开始查找file_content: {tmp_dir}")
 
-    # Fast path: walk down the "single-dir shell" until we hit a layer with:
-    # - any file, or
-    # - 2+ sub-directories,
-    # otherwise the deepest layer (rule #3).
     current = tmp_dir
     depth = 1
     while True:
@@ -5390,7 +5917,7 @@ def find_file_content(tmp_dir, debug=False):
         items = []
         file_count = 0
         dir_count = 0
-        for name in names:
+        for name in sorted(names):
             p = os.path.join(current, name)
             is_dir = safe_isdir(p, debug)
             items.append({"name": name, "path": p, "is_dir": is_dir})
@@ -5399,20 +5926,12 @@ def find_file_content(tmp_dir, debug=False):
             else:
                 file_count += 1
 
+        file_exists = file_count > 0
+
         if debug:
             print(f"  DEBUG: 深度{depth}: 文件{file_count} 目录{dir_count} 项目{len(items)}")
 
-        # Empty directory: treat it as the innermost file_content (rule #3), producing empty output.
-        if file_count == 0 and dir_count == 0:
-            result["found"] = True
-            result["depth"] = depth
-            result["items"] = []
-            result["path"] = current
-            result["parent_folder_path"] = current
-            result["parent_folder_name"] = os.path.basename(current)
-            break
-
-        if file_count > 0 or dir_count >= 2:
+        if file_exists and (file_count + dir_count) >= 1:
             result["found"] = True
             result["depth"] = depth
             result["items"] = items
@@ -5421,13 +5940,32 @@ def find_file_content(tmp_dir, debug=False):
             result["parent_folder_name"] = os.path.basename(current)
             break
 
-        if dir_count == 1 and file_count == 0:
+        if dir_count >= 2:
+            result["found"] = True
+            result["depth"] = depth
+            result["items"] = items
+            result["path"] = current
+            result["parent_folder_path"] = current
+            result["parent_folder_name"] = os.path.basename(current)
+            break
+
+        if dir_count == 1 and not file_exists:
             only_dir = next(i for i in items if i["is_dir"])
             current = only_dir["path"]
             depth += 1
             continue
 
-        # Empty directory or other non-informative state.
+        if dir_count == 0 and not file_exists:
+            # 最内层空目录：视为 file_content（规则3）
+            result["found"] = True
+            result["depth"] = depth
+            result["items"] = []
+            result["path"] = current
+            result["parent_folder_path"] = current
+            result["parent_folder_name"] = os.path.basename(current)
+            break
+
+        # Fallback: non-informative state
         break
 
     return result
@@ -6118,6 +6656,17 @@ def should_use_rar_extractor(archive_path, enable_rar=False, sfx_detector=None):
             if VERBOSE:
                 print(f"  DEBUG: 非SFX文件，使用7z解压")
 
+    # ELF SFX 检测（非MZ EXE 或无扩展的 ELF）
+    elf_sfx = detect_elf_sfx(archive_path, detailed=True, debug=VERBOSE)
+    if elf_sfx.get('is_sfx', False):
+        if elf_sfx.get('signature', {}).get('format') == 'RAR':
+            if VERBOSE:
+                print(f"  DEBUG: ELF-SFX包含RAR签名，使用RAR解压")
+            return True
+        if VERBOSE:
+            print(f"  DEBUG: ELF-SFX非RAR格式，使用7z解压")
+        return False
+
     if VERBOSE:
         print(f"  DEBUG: 使用7z解压")
     return False
@@ -6571,8 +7120,7 @@ def main():
     parser.add_argument(
         '-dp', '--decompress-policy',
         default='2-collect',
-        help='Decompress policy: separate/direct/collect/only-file-content/file-content-with-folder/file-content-with-folder-separate/only-file-content-direct/N-collect/file-content-N-collect/file-content-auto-folder-N-collect-len/file-content-auto-folder-N-collect-meaningful (default: 2-collect). '
-             'Transactional mode supports: separate/direct/collect/N-collect/file-content-with-folder-separate (use --legacy for others).'
+        help='Decompress policy: separate/direct/collect/only-file-content/file-content-with-folder/file-content-with-folder-separate/only-file-content-direct/N-collect/file-content-N-collect/file-content-auto-folder-N-collect-len/file-content-auto-folder-N-collect-meaningful (default: 2-collect).'
     )
 
     parser.add_argument(
@@ -6876,17 +7424,6 @@ def main():
                     return 1
             else:
                 print(f"Error: Invalid decompress policy: {args.decompress_policy}")
-                return 1
-
-        # Transactional mode policy restriction (WAL/recovery only implemented for these policies)
-        if not args.legacy:
-            txn_supported = (
-                args.decompress_policy in ["separate", "direct", "collect", "file-content-with-folder-separate"]
-                or re.match(r"^\d+-collect$", args.decompress_policy)
-            )
-            if not txn_supported:
-                print(f"Error: decompress-policy '{args.decompress_policy}' is not supported in transactional mode.")
-                print("       Use --legacy to run the old pipeline, or choose one of: separate/direct/collect/N-collect/file-content-with-folder-separate.")
                 return 1
 
         # Validate depth range parameter
