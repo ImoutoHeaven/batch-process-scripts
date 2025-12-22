@@ -1044,18 +1044,19 @@ class ArchiveProcessor:
                 return _group("sfx-7z", "single", [file_path])
 
         # ELF SFX
-        elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
-        if elf_sfx.get('is_sfx'):
-            is_rar_sfx = elf_sfx.get('signature', {}).get('format') == 'RAR'
-            if is_rar_sfx:
-                rar_parts = list(safe_glob(os.path.join(folder, bf + '.part*.rar')))
-                if rar_parts:
-                    return _group("elf-sfx-rar", "sfx-rar-part", [file_path] + rar_parts)
-                return _group("elf-sfx-rar", "single", [file_path])
-            if self._has_volume_files(bf, folder, '7z'):
-                vols = [file_path] + self._get_volume_files(bf, folder, '7z')
-                return _group("elf-sfx-7z", "sfx-7z-7zsplit", vols)
-            return _group("elf-sfx-7z", "single", [file_path])
+        if getattr(self.args, "detect_elf_sfx", False):
+            elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
+            if elf_sfx.get('is_sfx'):
+                is_rar_sfx = elf_sfx.get('signature', {}).get('format') == 'RAR'
+                if is_rar_sfx:
+                    rar_parts = list(safe_glob(os.path.join(folder, bf + '.part*.rar')))
+                    if rar_parts:
+                        return _group("elf-sfx-rar", "sfx-rar-part", [file_path] + rar_parts)
+                    return _group("elf-sfx-rar", "single", [file_path])
+                if self._has_volume_files(bf, folder, '7z'):
+                    vols = [file_path] + self._get_volume_files(bf, folder, '7z')
+                    return _group("elf-sfx-7z", "sfx-7z-7zsplit", vols)
+                return _group("elf-sfx-7z", "single", [file_path])
 
         return {"volumes": [file_path], "group_key": None}
 
@@ -1204,7 +1205,7 @@ class ArchiveProcessor:
                 print(f"  Warning: RAR command not available, falling back to 7z")
                 enable_rar = False
 
-            success = try_extract(archive_path, correct_password, tmp_dir, final_zip_decode, enable_rar, self.sfx_detector)
+            success = try_extract(archive_path, correct_password, tmp_dir, final_zip_decode, enable_rar, self.sfx_detector, detect_elf_sfx=getattr(self.args, "detect_elf_sfx", False))
 
             # Check for interrupt after extraction
             check_interrupt()
@@ -1657,7 +1658,7 @@ class ArchiveProcessor:
             return 'volume'
 
         # --- ELF SFX (非exe扩展) ---
-        if ext != 'exe':
+        if ext != 'exe' and getattr(self.args, "detect_elf_sfx", False):
             elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
             if elf_sfx.get('is_sfx'):
                 is_rar_sfx = elf_sfx.get('signature', {}).get('format') == 'RAR'
@@ -1674,6 +1675,8 @@ class ArchiveProcessor:
             if self._has_volume_files(bf, folder, 'exe_split'):
                 return 'notarchive'
             if not self.sfx_detector.is_sfx(file_path):
+                if not getattr(self.args, "detect_elf_sfx", False):
+                    return 'notarchive'
                 elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
                 if not elf_sfx.get('is_sfx'):
                     return 'notarchive'
@@ -1744,7 +1747,7 @@ class ArchiveProcessor:
             return {"is_multi": True, "type": "zip-multi"}
 
         # --- ELF SFX (非exe扩展) ---
-        if ext != 'exe':
+        if ext != 'exe' and getattr(self.args, "detect_elf_sfx", False):
             elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
             if elf_sfx.get('is_sfx'):
                 is_rar_sfx = elf_sfx.get('signature', {}).get('format') == 'RAR'
@@ -1761,6 +1764,8 @@ class ArchiveProcessor:
             if self._has_volume_files(bf, folder, 'exe_split'):
                 return {"is_multi": True, "type": "exe-7z-multi"}
             if not self.sfx_detector.is_sfx(file_path):
+                if not getattr(self.args, "detect_elf_sfx", False):
+                    return {"is_multi": False, "type": "exe-notarchive"}
                 elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
                 if not elf_sfx.get('is_sfx'):
                     return {"is_multi": False, "type": "exe-notarchive"}
@@ -1841,15 +1846,16 @@ class ArchiveProcessor:
             return True
 
         # ELF SFX 主卷（非exe扩展或exe但非MZ）
-        elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
-        if elf_sfx.get('is_sfx'):
-            is_rar_sfx = elf_sfx.get('signature', {}).get('format') == 'RAR'
-            if is_rar_sfx:
-                if safe_glob(os.path.join(folder, bf + '.part*.rar')):
+        if getattr(self.args, "detect_elf_sfx", False):
+            elf_sfx = detect_elf_sfx(file_path, detailed=True, debug=VERBOSE)
+            if elf_sfx.get('is_sfx'):
+                is_rar_sfx = elf_sfx.get('signature', {}).get('format') == 'RAR'
+                if is_rar_sfx:
+                    if safe_glob(os.path.join(folder, bf + '.part*.rar')):
+                        return True
+                    return False
+                if self._has_volume_files(bf, folder, '7z'):
                     return True
-                return False
-            if self._has_volume_files(bf, folder, '7z'):
-                return True
 
         return False
 
@@ -2062,6 +2068,11 @@ class ArchiveProcessor:
             self.args.traditional_zip_decode_confidence = 90
             if VERBOSE:
                 print(f"  DEBUG: 设置默认值 traditional_zip_decode_confidence = 90")
+
+        if not hasattr(self.args, 'detect_elf_sfx'):
+            self.args.detect_elf_sfx = False
+            if VERBOSE:
+                print(f"  DEBUG: 设置默认值 detect_elf_sfx = False")
 
     def build_password_candidates(self):
         """
@@ -4863,7 +4874,7 @@ def _extract_phase(processor, archive_path, *, args, output_base):
 
     try:
         safe_makedirs(txn["paths"]["staging_extracted"], debug=VERBOSE)
-        success = try_extract(archive_path, correct_password, txn["paths"]["staging_extracted"], final_zip_decode, enable_rar, processor.sfx_detector)
+        success = try_extract(archive_path, correct_password, txn["paths"]["staging_extracted"], final_zip_decode, enable_rar, processor.sfx_detector, detect_elf_sfx=getattr(args, "detect_elf_sfx", False))
         check_interrupt()
         if not success:
             raise RuntimeError("extract_failed")
@@ -4992,11 +5003,13 @@ def _run_transactional(processor, archives, *, args):
                 results.append(future.result())
 
     txns = []
+    clean_output_dirs = set()
     for r in results:
         if not r:
             continue
         if r.get("kind") == "txn":
             txn = r["txn"]
+            clean_output_dirs.add(txn.get("output_dir"))
             if txn.get("state") == TXN_STATE_EXTRACTED:
                 txns.append(txn)
         elif r.get("kind") == "skipped":
@@ -5005,6 +5018,8 @@ def _run_transactional(processor, archives, *, args):
             processor.skipped_archives.append(r["archive_path"])
         elif r.get("kind") in ("failed", "txn_failed"):
             processor.failed_archives.append(r.get("archive_path") or r.get("txn", {}).get("archive_path"))
+            if r.get("kind") == "txn_failed":
+                clean_output_dirs.add(r.get("txn", {}).get("output_dir"))
 
     groups = {}
     for txn in txns:
@@ -5027,28 +5042,35 @@ def _run_transactional(processor, archives, *, args):
                     processor.failed_archives.append(txn.get("archive_path"))
             _garbage_collect(output_dir, output_base=output_base, keep_journal_days=args.keep_journal_days)
 
-    if getattr(args, "success_clean_journal", False):
-        if not processor.failed_archives:
-            for output_dir in groups.keys():
-                work_root = _work_root(output_dir, output_base)
-                lock_path = os.path.join(work_root, "locks", "output_dir.lock")
-                lock = FileLock(lock_path, timeout_ms=args.output_lock_timeout_ms, retry_ms=args.output_lock_retry_ms, debug=VERBOSE)
-                try:
-                    with lock:
-                        pass
-                    safe_rmtree(work_root, VERBOSE)
-                except Exception as e:
-                    print(f"  Warning: Could not clean journal dir {work_root}: {e}")
-            if groups:
-                work_base = _work_base(output_base)
-                try:
-                    safe_rmtree(os.path.join(work_base, "outputs"), VERBOSE)
-                except Exception:
+    should_clean = False
+    if processor.failed_archives:
+        should_clean = getattr(args, "fail_clean_journal", False)
+    else:
+        should_clean = getattr(args, "success_clean_journal", False)
+
+    if should_clean:
+        for output_dir in clean_output_dirs:
+            if not output_dir:
+                continue
+            work_root = _work_root(output_dir, output_base)
+            lock_path = os.path.join(work_root, "locks", "output_dir.lock")
+            lock = FileLock(lock_path, timeout_ms=args.output_lock_timeout_ms, retry_ms=args.output_lock_retry_ms, debug=VERBOSE)
+            try:
+                with lock:
                     pass
-                try:
-                    safe_rmtree(work_base, VERBOSE)
-                except Exception:
-                    pass
+                safe_rmtree(work_root, VERBOSE)
+            except Exception as e:
+                print(f"  Warning: Could not clean journal dir {work_root}: {e}")
+        if clean_output_dirs:
+            work_base = _work_base(output_base)
+            try:
+                safe_rmtree(os.path.join(work_base, "outputs"), VERBOSE)
+            except Exception:
+                pass
+            try:
+                safe_rmtree(work_base, VERBOSE)
+            except Exception:
+                pass
 
 
 # ==================== End Transactional Mode ====================
@@ -5542,7 +5564,7 @@ def is_password_correct(archive_path, password, encryption_status='encrypted_con
         return False
 
 
-def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=False, sfx_detector=None):
+def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=False, sfx_detector=None, detect_elf_sfx=False):
     """
     Extract archive to temporary directory.
 
@@ -5568,7 +5590,7 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
             return False
 
         # 判断是否应该使用RAR解压
-        use_rar = should_use_rar_extractor(archive_path, enable_rar, sfx_detector)
+        use_rar = should_use_rar_extractor(archive_path, enable_rar, sfx_detector, detect_elf_sfx_flag=detect_elf_sfx)
 
         if use_rar:
             # 使用RAR命令解压
@@ -6664,7 +6686,7 @@ def is_rar_format(archive_path):
     return False
 
 
-def should_use_rar_extractor(archive_path, enable_rar=False, sfx_detector=None):
+def should_use_rar_extractor(archive_path, enable_rar=False, sfx_detector=None, *, detect_elf_sfx_flag=False):
     """
     判断是否应该使用RAR命令解压文件
 
@@ -6722,15 +6744,16 @@ def should_use_rar_extractor(archive_path, enable_rar=False, sfx_detector=None):
                 print(f"  DEBUG: 非SFX文件，使用7z解压")
 
     # ELF SFX 检测（非MZ EXE 或无扩展的 ELF）
-    elf_sfx = detect_elf_sfx(archive_path, detailed=True, debug=VERBOSE)
-    if elf_sfx.get('is_sfx', False):
-        if elf_sfx.get('signature', {}).get('format') == 'RAR':
+    if detect_elf_sfx_flag:
+        elf_sfx = detect_elf_sfx(archive_path, detailed=True, debug=VERBOSE)
+        if elf_sfx.get('is_sfx', False):
+            if elf_sfx.get('signature', {}).get('format') == 'RAR':
+                if VERBOSE:
+                    print(f"  DEBUG: ELF-SFX包含RAR签名，使用RAR解压")
+                return True
             if VERBOSE:
-                print(f"  DEBUG: ELF-SFX包含RAR签名，使用RAR解压")
-            return True
-        if VERBOSE:
-            print(f"  DEBUG: ELF-SFX非RAR格式，使用7z解压")
-        return False
+                print(f"  DEBUG: ELF-SFX非RAR格式，使用7z解压")
+            return False
 
     if VERBOSE:
         print(f"  DEBUG: 使用7z解压")
@@ -7174,6 +7197,11 @@ def main():
         action='store_true',
         help='Enable RAR command-line tool for extracting RAR archives and RAR SFX files. Falls back to 7z if RAR is not available.'
     )
+    parser.add_argument(
+        '-des', '--detect-elf-sfx',
+        action='store_true',
+        help='Enable ELF SFX detection (Linux). Disabled by default for performance.'
+    )
 
     parser.add_argument(
         '-t', '--threads',
@@ -7359,6 +7387,14 @@ def main():
         const=True,
         default=True,
         help='If all archives succeed, remove .advdecompress_work after finishing (transactional mode only). Use -scj false to disable.'
+    )
+    parser.add_argument(
+        '--fail-clean-journal', '-fcj',
+        type=parse_bool_arg,
+        nargs='?',
+        const=True,
+        default=True,
+        help='If any archive fails, remove .advdecompress_work after finishing (transactional mode only). Use -fcj false to disable.'
     )
 
     parser.add_argument(

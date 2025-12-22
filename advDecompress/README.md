@@ -62,6 +62,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `-tzdm`, `--traditional-zip-decode-model` | 编码检测模型：`chardet` / `charset_normalizer` | `chardet` |
 | `--force-clean-tmp` | 强制删除非空临时/中转目录（不安全，不建议） | 关闭 |
 | `-er`, `--enable-rar` | 优先使用 RAR CLI 解压 RAR/SFX | 关闭 |
+| `-des`, `--detect-elf-sfx` | 启用 ELF SFX 检测（Linux），默认关闭以减少扫描开销 | 关闭 |
 | `-t`, `--threads` | 并行解压线程数 | 1 |
 | `-dp`, `--decompress-policy` | 解压策略（下节详述） | `2-collect` |
 | `-sp`, `--success-policy` | 解压成功后：`delete` / `asis` / `move` | `asis` |
@@ -79,6 +80,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `--conflict-mode` | 事务化落位冲突策略：`fail` / `suffix` | `fail` |
 | `--keep-journal-days` | DONE 事务 journal 保留天数 | 7 |
 | `-scj`, `--success-clean-journal` | 若本轮全部成功则删除 `.advdecompress_work`（可用 `-scj false` 关闭） | 开启 |
+| `-fcj`, `--fail-clean-journal` | 若本轮存在失败也删除 `.advdecompress_work`（可用 `-fcj false` 关闭） | 开启 |
 | `-dr`, `--depth-range` | 扫描深度范围，如 `0-2` / `1` | 全深度 |
 | `--fix-ext`, `-fe` | 启用扩展名修复（按文件头识别） | 关闭 |
 | `--safe-fix-ext`, `-sfe` | 启用安全扩展名修复（追加正确扩展名） | 关闭 |
@@ -87,6 +89,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 ---
 
 > 事务模式下的工作目录统一放在输出根目录的 `.advdecompress_work/` 下（不再在每个子输出目录生成）。
+> 默认无论成功或失败都会清理该目录；如需保留以便恢复或排查，可用 `-scj false` 或 `-fcj false` 关闭清理。
 
 ## 解压策略详解（`-dp/--decompress-policy`）
 
