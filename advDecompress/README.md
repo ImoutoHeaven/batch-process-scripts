@@ -106,8 +106,9 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `file-content-N-collect` | 先定位 **file_content** 后按阈值判断。 |
 | `file-content-auto-folder-N-collect-len` | 自动选取最长文件夹名作为目标，再按照阈值判断。 |
 | `file-content-auto-folder-N-collect-meaningful` | 自动选取“最有意义”文件夹名（ASCII 过滤）后按阈值判断。 |
+| `file-content-auto-folder-N-collect-meaningful-ent` | 自动选取“最有意义”文件夹名（熵加权评分）后按阈值判断。 |
 
-> N 为正整数，例如 `5-collect`、`file-content-10-collect`、`file-content-auto-folder-3-collect-len` 等。
+> N 为正整数，例如 `5-collect`、`file-content-10-collect`、`file-content-auto-folder-3-collect-len`、`file-content-auto-folder-3-collect-meaningful-ent` 等。
 >
 > 事务化模式（默认）已支持全部解压策略；`--legacy` 仅用于回退旧版流程。
 >

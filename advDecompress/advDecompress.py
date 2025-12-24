@@ -26,6 +26,7 @@ import signal
 import atexit
 import errno
 import datetime
+import math
 import ctypes
 import ctypes.wintypes
 from pathlib import Path
@@ -33,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Union, Tuple
 import stat
 import hashlib
+from collections import Counter
 
 # Global verbose flag
 VERBOSE = False
@@ -1338,16 +1340,21 @@ class ArchiveProcessor:
         elif self.args.decompress_policy == 'file-content-with-folder-separate':
             apply_file_content_with_folder_separate_policy(tmp_dir, final_output_dir, archive_base_name, unique_suffix)
 
-        elif re.match(r'^file-content-auto-folder-\d+-collect-(len|meaningful)$', self.args.decompress_policy):
+        elif re.match(r'^file-content-auto-folder-\d+-collect-(len|meaningful|meaningful-ent)$', self.args.decompress_policy):
             # file-content-auto-folder-N-collect-len/meaningful policy
             parts = self.args.decompress_policy.split('-')
             threshold = int(parts[4])  # N值
-            strategy_type = parts[6]   # len 或 meaningful
+            if len(parts) >= 8 and parts[6] == 'meaningful' and parts[7] == 'ent':
+                strategy_type = 'meaningful-ent'
+            else:
+                strategy_type = parts[6]   # len or meaningful
 
             if strategy_type == 'len':
                 apply_file_content_auto_folder_collect_len_policy(tmp_dir, final_output_dir, archive_base_name, threshold, unique_suffix)
             elif strategy_type == 'meaningful':
                 apply_file_content_auto_folder_collect_meaningful_policy(tmp_dir, final_output_dir, archive_base_name, threshold, unique_suffix)
+            elif strategy_type == 'meaningful-ent':
+                apply_file_content_auto_folder_collect_meaningful_ent_policy(tmp_dir, final_output_dir, archive_base_name, threshold, unique_suffix)
 
         elif self.args.decompress_policy.startswith('file-content-') and self.args.decompress_policy.endswith('-collect'):
             # file-content-N-collect policy
@@ -4035,7 +4042,7 @@ def _resolve_policy_under_lock(txn, conflict_mode):
             return "file-content-collect-wrap"
         return "file-content-collect-direct"
 
-    m = re.match(r"^file-content-auto-folder-(\d+)-collect-(len|meaningful)$", policy)
+    m = re.match(r"^file-content-auto-folder-(\d+)-collect-(len|meaningful|meaningful-ent)$", policy)
     if m:
         threshold = int(m.group(1))
         strategy = m.group(2)
@@ -4060,9 +4067,14 @@ def _resolve_policy_under_lock(txn, conflict_mode):
             if strategy == "len":
                 folder_name = deepest_folder_name if len(deepest_folder_name) >= len(archive_name) else archive_name
             else:
-                meaningful_deepest = remove_ascii_non_meaningful_chars(deepest_folder_name)
-                meaningful_archive = remove_ascii_non_meaningful_chars(archive_name)
-                folder_name = deepest_folder_name if len(meaningful_deepest) >= len(meaningful_archive) else archive_name
+                if strategy == "meaningful-ent":
+                    score_deepest = get_smart_meaningful_score(deepest_folder_name)
+                    score_archive = get_smart_meaningful_score(archive_name)
+                    folder_name = deepest_folder_name if score_deepest >= score_archive else archive_name
+                else:
+                    meaningful_deepest = remove_ascii_non_meaningful_chars(deepest_folder_name)
+                    meaningful_archive = remove_ascii_non_meaningful_chars(archive_name)
+                    folder_name = deepest_folder_name if len(meaningful_deepest) >= len(meaningful_archive) else archive_name
             placement["auto_folder_name"] = folder_name
             return "file-content-auto-folder-wrap"
 
@@ -5733,6 +5745,68 @@ def remove_ascii_non_meaningful_chars(text):
 
     return ''.join(result)
 
+
+def calculate_shannon_entropy(text):
+    if not text:
+        return 0
+    counts = Counter(text)
+    total = len(text)
+    entropy = 0.0
+    for count in counts.values():
+        p = count / total
+        entropy -= p * math.log2(p)
+    return entropy
+
+
+def get_smart_meaningful_score(text):
+    """
+    计算字符串的'智能语义分' (V3 优化版)。
+    优化了日期混合词的判定，统一了CJK权重，并增加了噪声符号抑制。
+    """
+    if not text:
+        return 0
+
+    score = 0.0
+    digit_count = 0
+    alnum_count = 0
+
+    common_separators = " _-."
+
+    for char in text:
+        code = ord(char)
+        if code >= 0x2E80:
+            score += 1.5
+            alnum_count += 1
+        elif char.isalpha():
+            score += 1.0
+            alnum_count += 1
+        elif char.isdigit():
+            score += 0.5
+            digit_count += 1
+            alnum_count += 1
+        elif char in common_separators:
+            score += 0.1
+        else:
+            score += 0.0
+
+    length = len(text)
+    if length == 0:
+        return 0
+
+    if (digit_count / length) > 0.66:
+        score *= 0.6
+
+    if (length - alnum_count) / length > 0.3:
+        score *= 0.7
+
+    unique_ratio = len(set(text)) / length
+    if length > 4 and unique_ratio < 0.3:
+        score *= 0.5
+
+    entropy = calculate_shannon_entropy(text)
+    final_score = score * (1 + 0.2 * entropy)
+    return final_score
+
 def get_staging_dir(root_dir, debug=False):
     """Get (and create) a staging directory under the given root_dir."""
     staging_dir = os.path.join(root_dir, '.staging_advDecompress')
@@ -7018,6 +7092,155 @@ def apply_file_content_auto_folder_collect_meaningful_policy(tmp_dir, output_dir
         clean_temp_dir(content_dir)
 
 
+def apply_file_content_auto_folder_collect_meaningful_ent_policy(tmp_dir, output_dir, archive_name, threshold, unique_suffix):
+    """
+    应用file-content-auto-folder-N-collect-meaningful-ent策略
+
+    Args:
+        tmp_dir: 临时目录
+        output_dir: 输出目录
+        archive_name: 归档名称
+        threshold: 阈值N
+        unique_suffix: 唯一后缀
+    """
+    if VERBOSE:
+        print(f"  DEBUG: 应用file-content-auto-folder-{threshold}-collect-meaningful-ent策略")
+
+    file_content = find_file_content(tmp_dir, VERBOSE)
+
+    if not file_content['found']:
+        if VERBOSE:
+            print(f"  DEBUG: 未找到file_content，回退到{threshold}-collect策略")
+        files, dirs = count_items_in_dir(tmp_dir)
+        total_items = files + dirs
+
+        if total_items >= threshold:
+            archive_folder = os.path.join(output_dir, archive_name)
+            archive_folder = ensure_unique_name(archive_folder, unique_suffix)
+            safe_makedirs(archive_folder, debug=VERBOSE)
+
+            for item in os.listdir(tmp_dir):
+                src_item = os.path.join(tmp_dir, item)
+                dest_item = os.path.join(archive_folder, item)
+                safe_move(src_item, dest_item, VERBOSE)
+
+            print(f"  Extracted to: {archive_folder} ({total_items} items >= {threshold})")
+        else:
+            tmp_items = os.listdir(tmp_dir)
+            conflicts = [item for item in tmp_items if safe_exists(os.path.join(output_dir, item), VERBOSE)]
+
+            if conflicts:
+                archive_folder = os.path.join(output_dir, archive_name)
+                archive_folder = ensure_unique_name(archive_folder, unique_suffix)
+                safe_makedirs(archive_folder, debug=VERBOSE)
+
+                for item in tmp_items:
+                    src_item = os.path.join(tmp_dir, item)
+                    dest_item = os.path.join(archive_folder, item)
+                    safe_move(src_item, dest_item, VERBOSE)
+
+                print(f"  Extracted to: {archive_folder} (conflicts detected, {total_items} items < {threshold})")
+            else:
+                for item in tmp_items:
+                    src_item = os.path.join(tmp_dir, item)
+                    dest_item = os.path.join(output_dir, item)
+                    safe_move(src_item, dest_item, VERBOSE)
+
+                print(f"  Extracted to: {output_dir} ({total_items} items < {threshold})")
+        return
+
+    deepest_folder_name = get_deepest_folder_name(file_content, tmp_dir, archive_name)
+    if VERBOSE:
+        print(f"  DEBUG: 确定的deepest_folder_name: {deepest_folder_name}")
+
+    staging_root = get_staging_dir(output_dir, debug=VERBOSE)
+    content_dir = os.path.join(staging_root, f"content_{unique_suffix}")
+
+    try:
+        safe_makedirs(content_dir, debug=VERBOSE)
+
+        if VERBOSE:
+            print(f"  DEBUG: 创建content目录: {content_dir}")
+
+        for item in file_content['items']:
+            src_path = item['path']
+            dst_path = os.path.join(content_dir, item['name'])
+
+            if VERBOSE:
+                print(f"  DEBUG: 移动file_content项目: {src_path} -> {dst_path}")
+
+            safe_move(src_path, dst_path, VERBOSE)
+
+        files, dirs = count_items_in_dir(content_dir)
+        total_items = files + dirs
+
+        if VERBOSE:
+            print(f"  DEBUG: content目录统计 - 文件: {files}, 目录: {dirs}, 总计: {total_items}, 阈值: {threshold}")
+
+        if total_items >= threshold:
+            need_folder = True
+        else:
+            conflict_found = False
+            for root, dirs, files in safe_walk(content_dir, VERBOSE):
+                rel_root = os.path.relpath(root, content_dir)
+                rel_root = '' if rel_root == '.' else rel_root
+                for f in files:
+                    rel_path = os.path.join(rel_root, f) if rel_root else f
+                    dest_path = os.path.join(output_dir, rel_path)
+                    if safe_isfile(dest_path, VERBOSE):
+                        if VERBOSE:
+                            print(f"  DEBUG: 冲突文件检测到: {dest_path}")
+                        conflict_found = True
+                        break
+                if conflict_found:
+                    break
+
+            need_folder = conflict_found
+
+        if need_folder:
+            score_deepest = get_smart_meaningful_score(deepest_folder_name)
+            score_archive = get_smart_meaningful_score(archive_name)
+
+            folder_name = deepest_folder_name if score_deepest >= score_archive else archive_name
+
+            if VERBOSE:
+                print(f"  DEBUG: meaningful-ent策略 - deepest_score: {score_deepest:.3f}, archive_score: {score_archive:.3f}, 选择: {folder_name}")
+
+            final_archive_dir = os.path.join(output_dir, folder_name)
+            final_archive_dir = ensure_unique_name(final_archive_dir, unique_suffix)
+            safe_makedirs(final_archive_dir, debug=VERBOSE)
+
+            for item in os.listdir(content_dir):
+                src_path = os.path.join(content_dir, item)
+                dst_path = os.path.join(final_archive_dir, item)
+
+                if VERBOSE:
+                    print(f"  DEBUG: 移动到最终文件夹: {src_path} -> {dst_path}")
+
+                safe_move(src_path, dst_path, VERBOSE)
+
+            print(f"  Extracted using file-content-auto-folder-{threshold}-collect-meaningful-ent policy to: {final_archive_dir}")
+        else:
+            for root, dirs, files in safe_walk(content_dir, VERBOSE):
+                rel_root = os.path.relpath(root, content_dir)
+                target_root = output_dir if rel_root == '.' else os.path.join(output_dir, rel_root)
+                safe_makedirs(target_root, debug=VERBOSE)
+
+                for d in dirs:
+                    dest_dir = os.path.join(target_root, d)
+                    safe_makedirs(dest_dir, debug=VERBOSE)
+
+                for f in files:
+                    src_f = os.path.join(root, f)
+                    dest_f = os.path.join(target_root, f)
+                    safe_move(src_f, dest_f, VERBOSE)
+
+            print(f"  Extracted using file-content-auto-folder-{threshold}-collect-meaningful-ent policy to: {output_dir} ({total_items} items < {threshold})")
+
+    finally:
+        clean_temp_dir(content_dir)
+
+
 def main():
     """Main function."""
     global VERBOSE
@@ -7109,7 +7332,7 @@ def main():
     parser.add_argument(
         '-dp', '--decompress-policy',
         default='2-collect',
-        help='Decompress policy: separate/direct/collect/only-file-content/file-content-with-folder/file-content-with-folder-separate/only-file-content-direct/N-collect/file-content-N-collect/file-content-auto-folder-N-collect-len/file-content-auto-folder-N-collect-meaningful (default: 2-collect).'
+        help='Decompress policy: separate/direct/collect/only-file-content/file-content-with-folder/file-content-with-folder-separate/only-file-content-direct/N-collect/file-content-N-collect/file-content-auto-folder-N-collect-len/file-content-auto-folder-N-collect-meaningful/file-content-auto-folder-N-collect-meaningful-ent (default: 2-collect).'
     )
 
     parser.add_argument(
@@ -7420,7 +7643,7 @@ def main():
                 if threshold < 1:
                     print(f"Error: file-content-N-collect threshold must be >= 1")
                     return 1
-            elif re.match(r'^file-content-auto-folder-\d+-collect-(len|meaningful)$', args.decompress_policy):
+            elif re.match(r'^file-content-auto-folder-\d+-collect-(len|meaningful|meaningful-ent)$', args.decompress_policy):
                 # Validate file-content-auto-folder-N-collect-len/meaningful threshold
                 parts = args.decompress_policy.split('-')
                 threshold = int(parts[4])  # N值

@@ -372,6 +372,14 @@ class TestZipEncodingHelpers(unittest.TestCase):
                 zf.writestr(info, "hello")
             self.assertFalse(self.m.is_traditional_zip(path))
 
+    def test_smart_meaningful_score_ordering(self):
+        score = self.m.get_smart_meaningful_score
+        self.assertGreater(score("Project_Report"), score("1029384756"))
+        self.assertGreater(score("apple"), score("aaaaaa"))
+        self.assertGreater(score("My_Vacation_Photos"), score("DCIM"))
+        self.assertGreater(score("2024_Report"), score("20241231"))
+        self.assertGreater(score("Backup"), score("a$#k@!"))
+
 
 if __name__ == "__main__":
     unittest.main()
