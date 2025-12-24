@@ -66,7 +66,14 @@ class TestTxnPrimitives(unittest.TestCase):
             with open(os.path.join(paths["incoming_dir"], "x.txt"), "w", encoding="utf-8") as f:
                 f.write("x")
 
-            txn = {"policy_frozen": False, "policy": "2-collect", "paths": paths, "output_dir": out}
+            txn = {
+                "policy_frozen": False,
+                "policy": "2-collect",
+                "paths": paths,
+                "output_dir": out,
+                "archive_path": os.path.join(td, "a.7z"),
+                "txn_id": "testtxn",
+            }
             resolved = self.m._resolve_policy_under_lock(txn, conflict_mode="fail")
             self.assertEqual(resolved, "direct")
 
@@ -124,7 +131,7 @@ class TestTxnPrimitives(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             output_dir = os.path.join(td, "out")
             os.makedirs(output_dir)
-            paths = self.m._txn_paths(output_dir, "testtxn")
+            paths = self.m._txn_paths(output_dir, td, "testtxn")
             os.makedirs(paths["incoming_dir"])
             with open(os.path.join(paths["incoming_dir"], "x.txt"), "w", encoding="utf-8") as f:
                 f.write("x")
@@ -136,6 +143,8 @@ class TestTxnPrimitives(unittest.TestCase):
                 "policy": "collect",
                 "paths": paths,
                 "output_dir": output_dir,
+                "archive_path": os.path.join(td, "a.zip"),
+                "txn_id": "testtxn",
             }
             resolved = self.m._resolve_policy_under_lock(txn, conflict_mode="fail")
             self.assertEqual(resolved, "separate")
@@ -148,6 +157,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 archive_path=os.path.join(td, "a.7z"),
                 volumes=[],
                 output_dir=out,
+                output_base=td,
                 policy="direct",
                 wal_fsync_every=1,
                 snapshot_every=1,
@@ -319,6 +329,48 @@ class TestTxnPrimitives(unittest.TestCase):
 
             # Base name normalization should strip .exe.NNN
             self.assertEqual("a", self.m.get_archive_base_name(v1))
+
+
+class TestZipEncodingHelpers(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.m = _load_advdecompress_module()
+
+    def test_has_valid_extension_ascii_rules(self):
+        self.assertTrue(self.m.has_valid_extension("a.zip"))
+        self.assertFalse(self.m.has_valid_extension("a.z-p"))
+        self.assertFalse(self.m.has_valid_extension("a.z p"))
+        self.assertTrue(self.m.has_valid_extension("a.中"))
+        self.assertFalse(self.m.has_valid_extension("a.中-"))
+
+    def test_traditional_zip_allows_data_descriptor(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "dd.zip")
+            info = zipfile.ZipInfo("a.txt")
+            info.flag_bits |= 0x08
+            info.compress_type = zipfile.ZIP_DEFLATED
+            with zipfile.ZipFile(path, "w") as zf:
+                zf.writestr(info, "hello")
+            self.assertTrue(self.m.is_traditional_zip(path))
+
+    def test_traditional_zip_rejects_utf8_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "utf8.zip")
+            info = zipfile.ZipInfo("中文.txt")
+            info.compress_type = zipfile.ZIP_DEFLATED
+            with zipfile.ZipFile(path, "w") as zf:
+                zf.writestr(info, "hello")
+            self.assertFalse(self.m.is_traditional_zip(path))
+
+    def test_traditional_zip_rejects_unicode_path_extra(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "extra.zip")
+            info = zipfile.ZipInfo("a.txt")
+            info.extra = b"\x75\x70\x01\x00\x00"
+            info.compress_type = zipfile.ZIP_DEFLATED
+            with zipfile.ZipFile(path, "w") as zf:
+                zf.writestr(info, "hello")
+            self.assertFalse(self.m.is_traditional_zip(path))
 
 
 if __name__ == "__main__":
