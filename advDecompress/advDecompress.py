@@ -3461,7 +3461,7 @@ def get_lock_file_path():
 
 LOCK_FILE = get_lock_file_path()
 
-# 全局变量保存锁文件句柄
+# 全局变量保存锁文件句柄（保持打开以持有OS级锁）
 lock_handle = None
 
 # 新增：标记当前实例是否拥有锁的全局变量
@@ -3471,7 +3471,7 @@ lock_owner = False
 def acquire_lock(max_attempts=30, min_wait=2, max_wait=10):
     """
     尝试获取全局锁，如果锁被占用则重试。
-    使用文件存在性作为锁机制：文件存在=有锁，文件不存在=无锁。
+    使用OS级文件锁（不依赖文件存在性），进程异常退出时会自动释放。
 
     Args:
         max_attempts: 最大尝试次数
@@ -3485,59 +3485,58 @@ def acquire_lock(max_attempts=30, min_wait=2, max_wait=10):
     global LOCK_FILE
     global lock_owner  # 新增：锁所有者标记
 
+    if lock_owner and lock_handle:
+        return True
+
     attempt = 0
 
     while attempt < max_attempts:
         try:
-            # 检查锁文件是否存在
-            if safe_exists(LOCK_FILE, VERBOSE):
-                # 锁文件存在，说明有其他进程正在使用
-                pass
-            else:
-                # 锁文件不存在，尝试创建锁文件
+            safe_makedirs(os.path.dirname(LOCK_FILE), debug=VERBOSE)
+            lock_handle = safe_open(LOCK_FILE, 'a+b')
+            try:
+                if os.name != "nt":
+                    import fcntl
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    import msvcrt
+                    lock_handle.seek(0)
+                    msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+
+                # 成功获取锁，写入进程信息（仅用于调试）
                 try:
-                    # 使用短路径获取安全的锁文件路径
-                    safe_lock_file = safe_path_for_operation(LOCK_FILE)
-
-                    # 使用 'x' 模式：只有当文件不存在时才创建，如果文件已存在会抛出异常
-                    lock_handle = safe_open(safe_lock_file, 'x')
-
-                    # 成功创建锁文件，写入进程信息
                     hostname = socket.gethostname()
                     pid = os.getpid()
                     lock_info = f"{hostname}:{pid}:{time.time()}"
-                    lock_handle.write(lock_info)
+                    lock_handle.seek(0)
+                    lock_handle.truncate()
+                    lock_handle.write(lock_info.encode("utf-8", errors="replace"))
                     lock_handle.flush()
-                    lock_handle.close()  # 关闭文件句柄，但保留锁文件
-                    lock_handle = None
+                    try:
+                        os.fsync(lock_handle.fileno())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
-                    # 设置锁所有者标记
-                    lock_owner = True
-
-                    if VERBOSE:
-                        print(f"  DEBUG: 成功获取全局锁: {LOCK_FILE}")
-
-                    # 注册退出时的清理函数
-                    atexit.register(release_lock)
-                    return True
-
-                except FileExistsError:
-                    # 文件已存在，其他进程在我们检查后创建了锁文件
-                    if lock_handle:
-                        try:
-                            lock_handle.close()
-                        except:
-                            pass
-                        lock_handle = None
-
+                lock_owner = True
+                if VERBOSE:
+                    print(f"  DEBUG: 成功获取全局锁: {LOCK_FILE}")
+                atexit.register(release_lock)
+                return True
+            except (OSError, IOError):
+                try:
+                    lock_handle.close()
+                except Exception:
+                    pass
+                lock_handle = None
         except Exception as e:
             if VERBOSE:
                 print(f"  DEBUG: 获取锁时出错: {e}")
-            # 出现异常情况，清理并重试
             if lock_handle:
                 try:
                     lock_handle.close()
-                except:
+                except Exception:
                     pass
                 lock_handle = None
 
@@ -3556,43 +3555,28 @@ def release_lock():
     global lock_handle
     global lock_owner
 
-    # 只有锁的拥有者才能释放锁
     if not lock_owner:
         return
 
-    # 关闭文件句柄（如果还打开着）
     if lock_handle:
         try:
+            if os.name != "nt":
+                import fcntl
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            else:
+                import msvcrt
+                lock_handle.seek(0)
+                msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except Exception:
+            pass
+        try:
             lock_handle.close()
-        except:
+        except Exception:
             pass
         lock_handle = None
 
-    # 尝试删除锁文件，最多重试5次
-    max_retries = 5
-    retry_delay = 5  # 每次重试间隔5秒
-
-    for attempt in range(max_retries):
-        try:
-            if safe_exists(LOCK_FILE, VERBOSE):
-                if safe_remove(LOCK_FILE, VERBOSE):
-                    if VERBOSE:
-                        print(f"  DEBUG: 成功删除锁文件: {LOCK_FILE}")
-                    lock_owner = False  # 重置锁所有者标记
-                    return
-            else:
-                # 文件不存在，说明已经被删除了
-                lock_owner = False  # 重置锁所有者标记
-                return
-
-        except Exception as e:
-            print(f"  删除锁文件失败 (尝试 {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:  # 不是最后一次尝试
-                print(f"  将在 {retry_delay} 秒后重试...")
-                time.sleep(retry_delay)
-            else:
-                print(f"  删除锁文件失败，已达到最大重试次数 ({max_retries})")
-                print(f"  请手动删除锁文件: {LOCK_FILE}")
+    # 不删除锁文件，避免删除后产生并发竞争；锁由OS级别控制。
+    lock_owner = False
 
 
 def signal_handler(signum, frame):
@@ -7559,8 +7543,8 @@ def main():
         signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        # Legacy pipeline uses a coarse global lock; transactional mode uses per-output_dir OS locks.
-        if args.legacy and not args.no_lock:
+        # Global lock applies across modes to prevent concurrent runs (transactional mode still uses per-output locks).
+        if not args.no_lock:
             if not acquire_lock(args.lock_timeout):
                 print("无法获取全局锁，程序退出")
                 return 1
