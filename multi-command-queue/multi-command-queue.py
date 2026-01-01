@@ -162,6 +162,11 @@ def parse_args():
         "--status-interval", type=int, default=10,
         help="定期打印状态的间隔（秒）")
     parser.add_argument(
+        "--child-stdin", choices=["inherit", "null"], default=None,
+        help=("child stdin handling: inherit|null. "
+              "Default: null on Windows (so control commands work), "
+              "inherit on other platforms."))
+    parser.add_argument(
         "--debug", action="store_true",
         help="启用调试模式，显示更多内部信息")
     return parser.parse_args()
@@ -640,6 +645,11 @@ def execute_command(cmd_id, cmd, total_retries):
             "stderr": subprocess.STDOUT,
             "bufsize": 1
         }
+        cmd_to_run = cmd
+        if platform.system() == "Windows":
+            # Windows: use PowerShell instead of cmd.exe for command parsing.
+            popen_kwargs["shell"] = False
+            cmd_to_run = ["powershell", "-NoProfile", "-Command", cmd]
         
         # 设置子进程环境变量，确保使用UTF-8编码
         env = os.environ.copy()
@@ -655,7 +665,10 @@ def execute_command(cmd_id, cmd, total_retries):
             env["LANG"] = "C.UTF-8"
         
         popen_kwargs["env"] = env
-        process = subprocess.Popen(cmd, **popen_kwargs)
+        child_stdin = execution_args.get("child_stdin", "inherit")
+        if child_stdin == "null":
+            popen_kwargs["stdin"] = subprocess.DEVNULL
+        process = subprocess.Popen(cmd_to_run, **popen_kwargs)
 
         with command_lock:
             st["process"] = process
@@ -800,6 +813,9 @@ def main():
     global debug_mode, execution_args
     debug_mode = args.debug
     execution_args['total_retries'] = args.total_retries
+    if args.child_stdin is None:
+        args.child_stdin = "null" if platform.system() == "Windows" else "inherit"
+    execution_args['child_stdin'] = args.child_stdin
     
     # 初始化控制台编码
     init_console_encoding()
