@@ -24,6 +24,7 @@ STATE_LOCK = threading.Lock()
 LOG_LOCK = threading.Lock()
 STOP_EVENT = threading.Event()
 SIGNAL_STATE = {"received": False, "signum": None}
+DRY_RUN_MODE = False
 
 
 def log(message, stream=sys.stdout):
@@ -158,6 +159,8 @@ def load_state(state_path, root):
 
 
 def save_state(state_path, state):
+    if DRY_RUN_MODE:
+        return
     with STATE_LOCK:
         state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
@@ -385,6 +388,8 @@ def create_list(file_ids, title, api_key):
 
 def main():
     args = parse_args()
+    global DRY_RUN_MODE
+    DRY_RUN_MODE = bool(args.dry_run)
     register_signal_handlers()
     root = Path(args.folder).resolve()
     if not root.exists() or not root.is_dir():
@@ -577,16 +582,11 @@ def main():
 
         title = args.album_name or root.name
         if args.dry_run:
-            list_id = "DRYRUNLIST"
-            album_url = f"https://pixeldrain.com/l/{list_id}"
-            state["album"] = {
-                "status": "created",
-                "id": list_id,
-                "url": album_url,
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            }
-            save_state(state_path, state)
-            log(f"Album created: {album_url}")
+            log(
+                "Dry run: album would be created with {count} file(s).".format(
+                    count=len(file_ids)
+                )
+            )
             return 0
 
         ok, list_id, err = create_list(file_ids, title, api_key)
