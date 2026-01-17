@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import random
 import re
+import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib import error as urlerror
@@ -16,6 +19,29 @@ from urllib import request as urlrequest
 STATE_VERSION = 1
 PIXELDRAIN_URL_RE = re.compile(r"https?://(?:www\.)?pixeldrain\.com/\S+", re.I)
 FILE_ID_RE = re.compile(r"/(?:u|file)/([A-Za-z0-9_-]+)")
+INTERRUPTED_ERROR = "interrupted"
+STATE_LOCK = threading.Lock()
+LOG_LOCK = threading.Lock()
+STOP_EVENT = threading.Event()
+SIGNAL_STATE = {"received": False, "signum": None}
+
+
+def log(message, stream=sys.stdout):
+    with LOG_LOCK:
+        print(message, file=stream, flush=True)
+
+
+def handle_signal(signum, frame):
+    SIGNAL_STATE["received"] = True
+    SIGNAL_STATE["signum"] = signum
+    STOP_EVENT.set()
+
+
+def register_signal_handlers():
+    signal.signal(signal.SIGINT, handle_signal)
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is not None:
+        signal.signal(sigterm, handle_signal)
 
 
 def parse_args():
@@ -50,6 +76,12 @@ def parse_args():
         type=float,
         default=0.3,
         help="Random jitter (0-1) as fraction of delay",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=6,
+        help="Number of parallel uploads (default: 6)",
     )
     parser.add_argument(
         "--api-key",
@@ -126,12 +158,13 @@ def load_state(state_path, root):
 
 
 def save_state(state_path, state):
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8", newline="\n") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
-        f.write("\n")
-    tmp_path.replace(state_path)
+    with STATE_LOCK:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8", newline="\n") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
+            f.write("\n")
+        tmp_path.replace(state_path)
 
 
 def iter_files(root, state_path):
@@ -163,24 +196,160 @@ def extract_file_id(url):
     return match.group(1)
 
 
-def pd_upload_file(pd_path, file_path, api_key):
+def terminate_process(proc):
+    try:
+        proc.terminate()
+    except Exception:
+        return
+    try:
+        proc.communicate(timeout=5)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        return
+    try:
+        proc.communicate(timeout=5)
+    except Exception:
+        pass
+
+
+def pd_upload_file(pd_path, file_path, api_key, stop_event):
     cmd = [pd_path, "upload", "--", str(file_path)]
     env = os.environ.copy()
     if api_key:
         env["PIXELDRAIN_API_KEY"] = api_key
-    proc = subprocess.run(
+    if stop_event.is_set():
+        return False, None, INTERRUPTED_ERROR
+    proc = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         env=env,
     )
-    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    if proc.returncode != 0:
-        return False, None, combined.strip()
-    url = extract_url(combined)
-    if not url:
-        return False, None, combined.strip() or "pd returned no URL"
-    return True, url, combined.strip()
+    while True:
+        if stop_event.is_set():
+            terminate_process(proc)
+            return False, None, INTERRUPTED_ERROR
+        ret = proc.poll()
+        if ret is not None:
+            stdout, stderr = proc.communicate()
+            combined = (stdout or "") + "\n" + (stderr or "")
+            if ret != 0:
+                return False, None, combined.strip()
+            url = extract_url(combined)
+            if not url:
+                return False, None, combined.strip() or "pd returned no URL"
+            return True, url, combined.strip()
+        time.sleep(0.2)
+
+
+def sleep_with_stop(delay, stop_event):
+    end = time.time() + delay
+    while time.time() < end:
+        if stop_event.is_set():
+            return False
+        time.sleep(min(0.2, end - time.time()))
+    return True
+
+
+def upload_worker(
+    rel,
+    root,
+    pd_path,
+    api_key,
+    max_attempts,
+    retry_delay,
+    retry_backoff,
+    retry_jitter,
+    dry_run,
+    prev_attempts,
+    stop_event,
+):
+    if stop_event.is_set():
+        return {
+            "rel": rel,
+            "status": "aborted",
+            "url": None,
+            "attempts": prev_attempts,
+            "last_error": INTERRUPTED_ERROR,
+        }
+    file_path = root / Path(rel)
+    if not file_path.exists():
+        return {
+            "rel": rel,
+            "status": "failed",
+            "url": None,
+            "attempts": prev_attempts,
+            "last_error": "file missing",
+        }
+    attempt = 0
+    attempts = prev_attempts
+    delay = retry_delay
+    last_error = None
+    while attempt < max_attempts:
+        if stop_event.is_set():
+            return {
+                "rel": rel,
+                "status": "aborted",
+                "url": None,
+                "attempts": attempts,
+                "last_error": INTERRUPTED_ERROR,
+            }
+        attempt += 1
+        attempts += 1
+        if dry_run:
+            return {
+                "rel": rel,
+                "status": "success",
+                "url": "https://pixeldrain.com/u/DRYRUN",
+                "attempts": attempts,
+                "last_error": None,
+            }
+        try:
+            ok, url, info = pd_upload_file(pd_path, file_path, api_key, stop_event)
+        except Exception as exc:
+            ok = False
+            url = None
+            info = f"upload error: {exc}"
+        if info == INTERRUPTED_ERROR or stop_event.is_set():
+            return {
+                "rel": rel,
+                "status": "aborted",
+                "url": None,
+                "attempts": attempts,
+                "last_error": INTERRUPTED_ERROR,
+            }
+        if ok:
+            return {
+                "rel": rel,
+                "status": "success",
+                "url": url,
+                "attempts": attempts,
+                "last_error": None,
+            }
+        last_error = info
+        if attempt < max_attempts:
+            jitter = delay * retry_jitter * random.random()
+            if not sleep_with_stop(delay + jitter, stop_event):
+                return {
+                    "rel": rel,
+                    "status": "aborted",
+                    "url": None,
+                    "attempts": attempts,
+                    "last_error": INTERRUPTED_ERROR,
+                }
+            delay *= retry_backoff
+    return {
+        "rel": rel,
+        "status": "failed",
+        "url": None,
+        "attempts": attempts,
+        "last_error": last_error or "upload failed",
+    }
 
 
 def create_list(file_ids, title, api_key):
@@ -216,19 +385,23 @@ def create_list(file_ids, title, api_key):
 
 def main():
     args = parse_args()
+    register_signal_handlers()
     root = Path(args.folder).resolve()
     if not root.exists() or not root.is_dir():
-        print(f"Folder not found: {root}", file=sys.stderr)
+        log(f"Folder not found: {root}", stream=sys.stderr)
         return 2
 
     pd_path = resolve_pd_path(args.pd_path)
     if not shutil.which(pd_path) and not Path(pd_path).exists():
-        print(f"pd not found: {pd_path}", file=sys.stderr)
+        log(f"pd not found: {pd_path}", stream=sys.stderr)
+        return 2
+    if args.jobs < 1:
+        log("--jobs must be >= 1", stream=sys.stderr)
         return 2
     state_path = Path(args.state).resolve() if args.state else root / ".pd_upload_state.json"
     api_key = args.api_key or os.environ.get("PIXELDRAIN_API_KEY")
     if not api_key:
-        print("API key required: use --api-key or set PIXELDRAIN_API_KEY.", file=sys.stderr)
+        log("API key required: use --api-key or set PIXELDRAIN_API_KEY.", stream=sys.stderr)
         return 2
 
     state = load_state(state_path, root)
@@ -276,92 +449,120 @@ def main():
     save_state(state_path, state)
 
     if not files:
-        print("No files found.")
+        log("No files found.")
         return 0
 
     dup_names = [name for name, count in duplicates.items() if count > 1]
     if dup_names:
-        print(
+        log(
             f"Warning: {len(dup_names)} duplicate basenames detected. "
             "Pixeldrain allows duplicates, but names may be ambiguous."
         )
     if deleted_files:
-        print(f"Detected {len(deleted_files)} deleted file(s).")
+        log(f"Detected {len(deleted_files)} deleted file(s).")
 
     max_attempts = max(1, args.retries + 1)
     uploaded = 0
     failed = 0
     skipped = 0
+    aborted = 0
+    interrupted = False
     changed_reuploaded = False
 
-    for rel in sorted(files):
-        rec = state["files"].get(rel, {})
-        if rec.get("status") == "success":
-            skipped += 1
-            continue
+    futures = {}
+    with ThreadPoolExecutor(max_workers=args.jobs) as executor:
+        for rel in sorted(files):
+            if STOP_EVENT.is_set():
+                interrupted = True
+                break
+            rec = state["files"].get(rel, {})
+            if rec.get("status") == "success":
+                skipped += 1
+                continue
+            log(f"Uploading {rel} ...")
+            prev_attempts = rec.get("attempts", 0)
+            future = executor.submit(
+                upload_worker,
+                rel,
+                root,
+                pd_path,
+                api_key,
+                max_attempts,
+                args.retry_delay,
+                args.retry_backoff,
+                args.retry_jitter,
+                args.dry_run,
+                prev_attempts,
+                STOP_EVENT,
+            )
+            futures[future] = rel
 
-        file_path = root / Path(rel)
-        if not file_path.exists():
-            rec["status"] = "failed"
-            rec["last_error"] = "file missing"
+        for future in as_completed(futures):
+            rel = futures[future]
+            if STOP_EVENT.is_set():
+                interrupted = True
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "rel": rel,
+                    "status": "failed",
+                    "url": None,
+                    "attempts": state["files"].get(rel, {}).get("attempts", 0),
+                    "last_error": f"unexpected error: {exc}",
+                }
+
+            rec = state["files"].get(rel, {})
+            rec["attempts"] = result.get("attempts", rec.get("attempts", 0))
+            if result.get("status") == "success":
+                rec["status"] = "success"
+                rec["url"] = result.get("url")
+                rec["id"] = extract_file_id(rec["url"])
+                rec["last_error"] = None
+                rec["uploaded_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                uploaded += 1
+                if rel in changed_files:
+                    changed_reuploaded = True
+            elif result.get("status") == "aborted":
+                rec["status"] = "pending"
+                rec["last_error"] = INTERRUPTED_ERROR
+                aborted += 1
+                interrupted = True
+            else:
+                rec["status"] = "failed"
+                rec["last_error"] = result.get("last_error") or "upload failed"
+                failed += 1
+
             state["files"][rel] = rec
             save_state(state_path, state)
-            failed += 1
-            continue
-
-        print(f"Uploading {rel} ...")
-        attempt = 0
-        delay = args.retry_delay
-        success = False
-        last_error = None
-        while attempt < max_attempts:
-            attempt += 1
-            rec["attempts"] = rec.get("attempts", 0) + 1
-            if args.dry_run:
-                success = True
-                url = "https://pixeldrain.com/u/DRYRUN"
-                break
-            ok, url, info = pd_upload_file(pd_path, file_path, api_key)
-            if ok:
-                success = True
-                break
-            last_error = info
-            if attempt < max_attempts:
-                jitter = delay * args.retry_jitter * random.random()
-                time.sleep(delay + jitter)
-                delay *= args.retry_backoff
-
-        if success:
-            rec["status"] = "success"
-            rec["url"] = url
-            rec["id"] = extract_file_id(url)
-            rec["last_error"] = None
-            rec["uploaded_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            uploaded += 1
-            if rel in changed_files:
-                changed_reuploaded = True
-        else:
-            rec["status"] = "failed"
-            rec["last_error"] = last_error or "upload failed"
-            failed += 1
-
-        state["files"][rel] = rec
-        save_state(state_path, state)
 
     total = len(files)
-    print(f"Done. total={total} uploaded={uploaded} skipped={skipped} failed={failed}")
+    log(
+        "Done. total={total} uploaded={uploaded} skipped={skipped} failed={failed} "
+        "aborted={aborted}".format(
+            total=total,
+            uploaded=uploaded,
+            skipped=skipped,
+            failed=failed,
+            aborted=aborted,
+        )
+    )
 
     if args.no_album:
         return 0
+
+    if interrupted:
+        log("Interrupted; skipping album creation.", stream=sys.stderr)
+        return 130
 
     if failed == 0:
         album_state = state.get("album", {})
         album_exists = album_state.get("status") == "created"
         if album_exists and not args.recreate_album:
-            print(f"Album already created: {album_state.get('url')}")
+            log(f"Album already created: {album_state.get('url')}")
             return 0
         if album_exists and args.recreate_album and not (changed_reuploaded or deleted_files):
-            print("No changed files reuploaded or deletions detected; album not recreated.")
+            log("No changed files reuploaded or deletions detected; album not recreated.")
             return 0
 
         file_ids = []
@@ -371,7 +572,7 @@ def main():
             if file_id:
                 file_ids.append(file_id)
         if not file_ids:
-            print("No file IDs available, cannot create album/list.")
+            log("No file IDs available, cannot create album/list.", stream=sys.stderr)
             return 1
 
         title = args.album_name or root.name
@@ -385,7 +586,7 @@ def main():
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
             save_state(state_path, state)
-            print(f"Album created: {album_url}")
+            log(f"Album created: {album_url}")
             return 0
 
         ok, list_id, err = create_list(file_ids, title, api_key)
@@ -398,7 +599,7 @@ def main():
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
             save_state(state_path, state)
-            print(f"Album created: {album_url}")
+            log(f"Album created: {album_url}")
             return 0
 
         state["album"] = {
@@ -407,10 +608,10 @@ def main():
             "attempted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         save_state(state_path, state)
-        print(f"Album creation failed: {err}", file=sys.stderr)
+        log(f"Album creation failed: {err}", stream=sys.stderr)
         return 1
 
-    print("Not all files uploaded successfully; album/list not created.")
+    log("Not all files uploaded successfully; album/list not created.")
     return 1
 
 
