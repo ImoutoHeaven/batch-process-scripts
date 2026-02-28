@@ -1,0 +1,13 @@
+[package]
+name = "ed2k115_native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ed2k115_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+md4 = "0.10"
+hex = "0.4"

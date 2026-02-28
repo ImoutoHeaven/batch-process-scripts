@@ -1,14 +1,46 @@
 import argparse
+import concurrent.futures
 import hashlib
+import importlib
 import os
 import sqlite3
 import struct
 import tempfile
 from pathlib import Path
+from typing import Callable, cast
 from urllib.parse import quote
 
 
 ED2K_CHUNK_SIZE = 9728000
+SQLITE_UPSERT_BATCH_SIZE = 1000
+
+
+def _load_native_hasher():
+    try:
+        native = importlib.import_module("ed2k115_native")
+        module_file = getattr(native, "__file__", None)
+        if module_file is not None:
+            module_path = Path(module_file).resolve()
+            repo_root_native = Path(__file__).resolve().parents[1] / module_path.name
+            if module_path == repo_root_native:
+                return None
+
+        return native
+    except Exception:
+        return None
+
+
+def hash_file_with_best_backend(file_path: Path, size: int) -> str:
+    native = _load_native_hasher()
+    if native is not None:
+        file_hasher = cast(Callable[[str, int], str] | None, getattr(native, "ed2k115_file_hex", None))
+        if callable(file_hasher):
+            try:
+                return file_hasher(str(file_path), size)
+            except AttributeError:
+                pass
+    with file_path.open("rb") as fp:
+        return ed2k_115_stream(fp, size)
 
 
 def build_parser():
@@ -54,7 +86,9 @@ def main(argv=None):
     task_key = build_task_key(input_path, out_path, args.keep_dirs, args.url_encode)
     conn = open_state_db(task_key)
     grouped_lines = {}
+    pending_upserts = []
     try:
+        ordered_items = []
         for file_path, rel_parent in iter_input_files(input_path):
             if should_skip_input_file(file_path, input_path, out_path, args.keep_dirs):
                 continue
@@ -64,23 +98,58 @@ def main(argv=None):
             mtime_ns = stat.st_mtime_ns
             rel_key = stable_rel_path(input_path, file_path)
 
+            mark_path_seen(conn, rel_key)
             digest = get_file_state_hash(conn, rel_key, size, mtime_ns)
-            if digest is None:
-                with file_path.open("rb") as fp:
-                    digest = ed2k_115_stream(fp, size)
-                upsert_file_state(conn, rel_key, size, mtime_ns, digest)
+            ordered_items.append(
+                {
+                    "file_path": file_path,
+                    "log_path": target_log_path(rel_parent, out_path, args.keep_dirs),
+                    "name": name,
+                    "size": size,
+                    "mtime_ns": mtime_ns,
+                    "rel_key": rel_key,
+                    "digest": digest,
+                }
+            )
 
-            link = f"ed2k://|file|{name}|{size}|{digest}|/"
+        pending_hashes = [item for item in ordered_items if item["digest"] is None]
+        if pending_hashes:
+            max_workers = min(32, os.cpu_count() or 4)
+            jobs = [(item["file_path"], item["size"]) for item in pending_hashes]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for item, digest in zip(pending_hashes, executor.map(_hash_work_item, jobs)):
+                    item["digest"] = digest
+                    pending_upserts.append((item["rel_key"], item["size"], item["mtime_ns"], digest))
+                    if len(pending_upserts) >= SQLITE_UPSERT_BATCH_SIZE:
+                        flush_file_state_upserts(conn, pending_upserts)
+                        pending_upserts.clear()
 
-            log_path = target_log_path(rel_parent, out_path, args.keep_dirs)
-            grouped_lines.setdefault(log_path, []).append(link)
+        if pending_upserts:
+            flush_file_state_upserts(conn, pending_upserts)
+            pending_upserts.clear()
+
+        for item in ordered_items:
+            link = f"ed2k://|file|{item['name']}|{item['size']}|{item['digest']}|/"
+            grouped_lines.setdefault(item["log_path"], []).append(link)
+
+        for log_path, lines in grouped_lines.items():
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        prune_unseen_file_state(conn)
+    except Exception:
+        if pending_upserts:
+            flush_file_state_upserts(conn, pending_upserts)
+        raise
     finally:
         conn.close()
 
-    for log_path, lines in grouped_lines.items():
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return 0
+
+
+def _hash_work_item(work_item):
+    file_path, size = work_item
+    return hash_file_with_best_backend(file_path, size)
 
 
 def iter_input_files(input_path: Path):
@@ -136,18 +205,71 @@ def open_state_db(task_key: str) -> sqlite3.Connection:
     root.mkdir(parents=True, exist_ok=True)
     db_path = root / f"{task_key}.sqlite3"
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS file_state (
             rel_path TEXT PRIMARY KEY,
             size INTEGER NOT NULL,
             mtime_ns INTEGER NOT NULL,
-            hash_hex TEXT NOT NULL
+            hash_blob BLOB NOT NULL
         )
         """
     )
+    ensure_file_state_hash_blob(conn)
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS seen_paths (rel_path TEXT PRIMARY KEY)")
+    conn.execute("DELETE FROM seen_paths")
     conn.commit()
     return conn
+
+
+def ensure_file_state_hash_blob(conn: sqlite3.Connection):
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(file_state)").fetchall()]
+    if cols == ["rel_path", "size", "mtime_ns", "hash_blob"]:
+        return
+
+    has_blob = "hash_blob" in cols
+    has_hex = "hash_hex" in cols
+    rows_to_copy = []
+
+    if has_blob and has_hex:
+        rows = conn.execute("SELECT rel_path, size, mtime_ns, hash_blob, hash_hex FROM file_state").fetchall()
+        for rel_path, size, mtime_ns, hash_blob, hash_hex in rows:
+            blob_value = hash_blob if hash_blob is not None else _hash_hex_to_blob(hash_hex)
+            rows_to_copy.append((rel_path, size, mtime_ns, blob_value))
+    elif has_blob:
+        rows_to_copy = conn.execute("SELECT rel_path, size, mtime_ns, hash_blob FROM file_state").fetchall()
+    elif has_hex:
+        rows = conn.execute("SELECT rel_path, size, mtime_ns, hash_hex FROM file_state").fetchall()
+        rows_to_copy = [(rel_path, size, mtime_ns, _hash_hex_to_blob(hash_hex)) for rel_path, size, mtime_ns, hash_hex in rows]
+
+    conn.execute(
+        """
+        CREATE TABLE file_state_new (
+            rel_path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            hash_blob BLOB NOT NULL
+        )
+        """
+    )
+    if rows_to_copy:
+        conn.executemany(
+            "INSERT INTO file_state_new (rel_path, size, mtime_ns, hash_blob) VALUES (?, ?, ?, ?)",
+            rows_to_copy,
+        )
+    conn.execute("DROP TABLE file_state")
+    conn.execute("ALTER TABLE file_state_new RENAME TO file_state")
+
+
+def mark_path_seen(conn: sqlite3.Connection, rel_path: str):
+    conn.execute("INSERT OR IGNORE INTO seen_paths(rel_path) VALUES (?)", (rel_path,))
+
+
+def prune_unseen_file_state(conn: sqlite3.Connection):
+    conn.execute("DELETE FROM file_state WHERE rel_path NOT IN (SELECT rel_path FROM seen_paths)")
+    conn.commit()
 
 
 def stable_rel_path(input_path: Path, file_path: Path) -> str:
@@ -158,25 +280,40 @@ def stable_rel_path(input_path: Path, file_path: Path) -> str:
 
 def get_file_state_hash(conn: sqlite3.Connection, rel_path: str, size: int, mtime_ns: int):
     row = conn.execute(
-        "SELECT hash_hex FROM file_state WHERE rel_path = ? AND size = ? AND mtime_ns = ?",
+        "SELECT hash_blob FROM file_state WHERE rel_path = ? AND size = ? AND mtime_ns = ?",
         (rel_path, size, mtime_ns),
     ).fetchone()
     if row is None:
         return None
-    return row[0]
+    return _hash_blob_to_hex(row[0])
 
 
 def upsert_file_state(conn: sqlite3.Connection, rel_path: str, size: int, mtime_ns: int, hash_hex: str):
-    conn.execute(
+    flush_file_state_upserts(conn, [(rel_path, size, mtime_ns, hash_hex)])
+
+
+def flush_file_state_upserts(conn: sqlite3.Connection, upserts):
+    if not upserts:
+        return
+
+    conn.executemany(
         """
-        INSERT INTO file_state (rel_path, size, mtime_ns, hash_hex)
+        INSERT INTO file_state (rel_path, size, mtime_ns, hash_blob)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(rel_path)
-        DO UPDATE SET size = excluded.size, mtime_ns = excluded.mtime_ns, hash_hex = excluded.hash_hex
+        DO UPDATE SET size = excluded.size, mtime_ns = excluded.mtime_ns, hash_blob = excluded.hash_blob
         """,
-        (rel_path, size, mtime_ns, hash_hex),
+        [(rel_path, size, mtime_ns, _hash_hex_to_blob(hash_hex)) for rel_path, size, mtime_ns, hash_hex in upserts],
     )
     conn.commit()
+
+
+def _hash_hex_to_blob(hash_hex: str) -> bytes:
+    return bytes.fromhex(hash_hex)
+
+
+def _hash_blob_to_hex(hash_blob: bytes) -> str:
+    return hash_blob.hex().upper()
 
 
 def _left_rotate_32(x: int, n: int) -> int:
@@ -291,7 +428,7 @@ def _read_exact(fp, size: int) -> bytes:
 def ed2k_115_stream(fp, file_size: int) -> str:
     if file_size < ED2K_CHUNK_SIZE:
         data = _read_exact(fp, file_size)
-        return md4_raw(data).hex().upper()
+        return md4_raw(md4_raw(data)).hex().upper()
 
     chunk_digests = bytearray()
     remaining = file_size

@@ -3,6 +3,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -52,7 +54,7 @@ class TestCliValidation(unittest.TestCase):
 
 class TestMd4(unittest.TestCase):
     def test_md4_vectors(self):
-        from python_port.ed2k115_calc import md4_raw
+        from ed2k_calculator.ed2k115_calc import md4_raw
 
         self.assertEqual(md4_raw(b"").hex().upper(), "31D6CFE0D16AE931B73C59D7E0C089C0")
         self.assertEqual(md4_raw(b"a").hex().upper(), "BDE52CB31DE33E46245E05FBDBD6FB24")
@@ -64,47 +66,136 @@ class TestMd4(unittest.TestCase):
 
 
 class TestEd2k115Core(unittest.TestCase):
-    def test_stream_tiny_input_uses_single_md4(self):
-        from python_port.ed2k115_calc import ed2k_115_stream, md4_raw
+    def test_stream_tiny_input_uses_nested_md4(self):
+        from ed2k_calculator.ed2k115_calc import ed2k_115_stream, md4_raw
 
         data = b"a"
-        self.assertEqual(ed2k_115_stream(io.BytesIO(data), len(data)), md4_raw(data).hex().upper())
+        self.assertEqual(ed2k_115_stream(io.BytesIO(data), len(data)), md4_raw(md4_raw(data)).hex().upper())
 
     def test_small_file_uses_nested_md4(self):
-        from python_port.ed2k115_calc import ed2k_115_bytes, md4_raw
+        from ed2k_calculator.ed2k115_calc import ed2k_115_bytes, md4_raw
 
         data = b"a"
         self.assertEqual(ed2k_115_bytes(data), md4_raw(md4_raw(data)).hex().upper())
 
     def test_chunk_boundary_vectors(self):
-        from python_port.ed2k115_calc import ED2K_CHUNK_SIZE, ed2k_115_stream
+        from ed2k_calculator.ed2k115_calc import ED2K_CHUNK_SIZE, ed2k_115_stream
 
         d1 = bytes([0]) * (ED2K_CHUNK_SIZE - 1)
         d2 = bytes([0]) * ED2K_CHUNK_SIZE
         d3 = bytes([0]) * (ED2K_CHUNK_SIZE + 1)
 
-        self.assertEqual(ed2k_115_stream(io.BytesIO(d1), len(d1)), "AC44B93FC9AFF773AB0005C911F8396F")
+        self.assertEqual(ed2k_115_stream(io.BytesIO(d1), len(d1)), "8F6994B027B2D435150DF26D3E0B1A29")
         self.assertEqual(ed2k_115_stream(io.BytesIO(d2), len(d2)), "FC21D9AF828F92A8DF64BEAC3357425D")
         self.assertEqual(ed2k_115_stream(io.BytesIO(d3), len(d3)), "06329E9DBA1373512C06386FE29E3C65")
 
     def test_stream_small_file_handles_partial_reads(self):
-        from python_port.ed2k115_calc import ed2k_115_stream, md4_raw
+        from ed2k_calculator.ed2k115_calc import ed2k_115_stream, md4_raw
 
         data = b"abcdef"
         stream = PartialReadIO(data, max_read=2)
-        self.assertEqual(ed2k_115_stream(stream, len(data)), md4_raw(data).hex().upper())
+        self.assertEqual(ed2k_115_stream(stream, len(data)), md4_raw(md4_raw(data)).hex().upper())
 
     def test_stream_chunked_file_handles_partial_reads_without_boundary_drift(self):
-        from python_port.ed2k115_calc import ED2K_CHUNK_SIZE, ed2k_115_bytes, ed2k_115_stream
+        from ed2k_calculator.ed2k115_calc import ED2K_CHUNK_SIZE, ed2k_115_bytes, ed2k_115_stream
 
         data = (b"a" * ED2K_CHUNK_SIZE) + b"b"
         stream = PartialReadIO(data, max_read=131072)
         self.assertEqual(ed2k_115_stream(stream, len(data)), ed2k_115_bytes(data))
 
 
+class TestCompatibilityContract(unittest.TestCase):
+    def test_small_file_stream_vs_bytes_semantics_are_consistent(self):
+        from ed2k_calculator.ed2k115_calc import ed2k_115_stream, ed2k_115_bytes, md4_raw
+
+        data = b"a"
+        stream_digest = ed2k_115_stream(io.BytesIO(data), len(data))
+        bytes_digest = ed2k_115_bytes(data)
+
+        self.assertEqual(stream_digest, md4_raw(md4_raw(data)).hex().upper())
+        self.assertEqual(bytes_digest, md4_raw(md4_raw(data)).hex().upper())
+        self.assertEqual(stream_digest, bytes_digest)
+
+    def test_exact_chunk_multiple_still_appends_empty_chunk_digest(self):
+        from ed2k_calculator.ed2k115_calc import ED2K_CHUNK_SIZE, ed2k_115_stream
+
+        data = b"\x00" * ED2K_CHUNK_SIZE
+        self.assertEqual(ed2k_115_stream(io.BytesIO(data), len(data)), "FC21D9AF828F92A8DF64BEAC3357425D")
+
+
+class TestNativeHasherParity(unittest.TestCase):
+    def test_native_hash_bytes_matches_python_vectors(self):
+        import ed2k_calculator.ed2k115_calc as calc
+
+        native = calc._load_native_hasher()
+        if native is None:
+            self.skipTest("native module unavailable; run 'maturin develop --manifest-path ed2k_calculator/native/Cargo.toml'")
+        self.assertEqual(native.md4_hex(b""), "31D6CFE0D16AE931B73C59D7E0C089C0")
+        self.assertEqual(native.md4_hex(b"abc"), "A448017AAF21D8525FC10AE87AA6729D")
+
+
+class TestNativeFileHashParity(unittest.TestCase):
+    def test_native_hash_file_matches_python_stream_vectors(self):
+        import ed2k_calculator.ed2k115_calc as calc
+
+        native = calc._load_native_hasher()
+        if native is None:
+            self.skipTest("native module unavailable; run 'maturin develop --manifest-path ed2k_calculator/native/Cargo.toml'")
+        with tempfile.TemporaryDirectory() as td:
+            sizes = [1024, calc.ED2K_CHUNK_SIZE - 1, calc.ED2K_CHUNK_SIZE, calc.ED2K_CHUNK_SIZE + 1]
+            for size in sizes:
+                payload = Path(td) / f"payload-{size}.bin"
+                payload.write_bytes(b"\x00" * size)
+
+                with self.subTest(size=size):
+                    with payload.open("rb") as fp:
+                        expected = calc.ed2k_115_stream(fp, size)
+                    got = native.ed2k115_file_hex(str(payload), size)
+                    self.assertEqual(got, expected)
+
+
+class TestBackendSelection(unittest.TestCase):
+    def test_hash_file_best_backend_falls_back_to_python_when_native_unavailable(self):
+        import ed2k_calculator.ed2k115_calc as calc
+
+        with mock.patch.object(calc, "_load_native_hasher", return_value=None):
+            with tempfile.TemporaryDirectory() as td:
+                p = Path(td) / "x.bin"
+                p.write_bytes(b"x")
+
+                got = calc.hash_file_with_best_backend(p, 1)
+                with p.open("rb") as fp:
+                    expected = calc.ed2k_115_stream(fp, 1)
+
+                self.assertEqual(got, expected)
+
+    def test_native_loader_ignores_repo_root_extension_artifact(self):
+        import ed2k_calculator.ed2k115_calc as calc
+
+        fake_native = mock.Mock()
+        fake_native.__file__ = str(Path(calc.__file__).resolve().parents[1] / "ed2k115_native.so")
+        with mock.patch.object(calc.importlib, "import_module", return_value=fake_native):
+            self.assertIsNone(calc._load_native_hasher())
+
+    def test_hash_file_best_backend_falls_back_when_native_missing_file_hasher(self):
+        import ed2k_calculator.ed2k115_calc as calc
+
+        stale_native = mock.Mock(spec=["md4_hex"])
+        with mock.patch.object(calc, "_load_native_hasher", return_value=stale_native):
+            with tempfile.TemporaryDirectory() as td:
+                p = Path(td) / "x.bin"
+                p.write_bytes(b"x")
+
+                got = calc.hash_file_with_best_backend(p, 1)
+                with p.open("rb") as fp:
+                    expected = calc.ed2k_115_stream(fp, 1)
+
+                self.assertEqual(got, expected)
+
+
 class TestFilenameEncoding(unittest.TestCase):
     def test_default_mode_encodes_only_unsafe_delimiters(self):
-        from python_port.ed2k115_calc import encode_name_for_ed2k
+        from ed2k_calculator.ed2k115_calc import encode_name_for_ed2k
 
         name = "中 文|a\n\rb\tc"
         out = encode_name_for_ed2k(name, url_encode_all=False)
@@ -116,13 +207,13 @@ class TestFilenameEncoding(unittest.TestCase):
         self.assertIn("%09", out)
 
     def test_default_mode_preserves_literal_percent(self):
-        from python_port.ed2k115_calc import encode_name_for_ed2k
+        from ed2k_calculator.ed2k115_calc import encode_name_for_ed2k
 
         out = encode_name_for_ed2k("100%|done", url_encode_all=False)
         self.assertEqual(out, "100%%7Cdone")
 
     def test_url_encode_all_mode(self):
-        from python_port.ed2k115_calc import encode_name_for_ed2k
+        from ed2k_calculator.ed2k115_calc import encode_name_for_ed2k
 
         out = encode_name_for_ed2k("日本語 file|x", url_encode_all=True)
         self.assertNotIn("日本語", out)
@@ -132,7 +223,7 @@ class TestFilenameEncoding(unittest.TestCase):
 
 class TestOutputModes(unittest.TestCase):
     def test_flat_mode_single_log(self):
-        from python_port.ed2k115_calc import md4_raw
+        from ed2k_calculator.ed2k115_calc import md4_raw
 
         script_path = Path(__file__).resolve().parents[1] / "ed2k115_calc.py"
 
@@ -154,11 +245,11 @@ class TestOutputModes(unittest.TestCase):
 
             lines = out_log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 2)
-            self.assertIn(f"|b.txt|3|{md4_raw(b'bbb').hex().upper()}|/", lines[0])
-            self.assertIn(f"|a.txt|1|{md4_raw(b'a').hex().upper()}|/", lines[1])
+            self.assertIn(f"|b.txt|3|{md4_raw(md4_raw(b'bbb')).hex().upper()}|/", lines[0])
+            self.assertIn(f"|a.txt|1|{md4_raw(md4_raw(b'a')).hex().upper()}|/", lines[1])
 
     def test_keep_dirs_mode_one_log_per_dir(self):
-        from python_port.ed2k115_calc import md4_raw
+        from ed2k_calculator.ed2k115_calc import md4_raw
 
         script_path = Path(__file__).resolve().parents[1] / "ed2k115_calc.py"
 
@@ -186,13 +277,13 @@ class TestOutputModes(unittest.TestCase):
             sub_lines = sub_log.read_text(encoding="utf-8").splitlines()
 
             self.assertEqual(len(root_lines), 1)
-            self.assertIn(f"|root.txt|1|{md4_raw(b'r').hex().upper()}|/", root_lines[0])
+            self.assertIn(f"|root.txt|1|{md4_raw(md4_raw(b'r')).hex().upper()}|/", root_lines[0])
 
             self.assertEqual(len(sub_lines), 1)
-            self.assertIn(f"|child.txt|2|{md4_raw(b'cc').hex().upper()}|/", sub_lines[0])
+            self.assertIn(f"|child.txt|2|{md4_raw(md4_raw(b'cc')).hex().upper()}|/", sub_lines[0])
 
     def test_single_file_input_flat_mode_writes_out_file(self):
-        from python_port.ed2k115_calc import md4_raw
+        from ed2k_calculator.ed2k115_calc import md4_raw
 
         script_path = Path(__file__).resolve().parents[1] / "ed2k115_calc.py"
 
@@ -211,10 +302,10 @@ class TestOutputModes(unittest.TestCase):
 
             lines = out_log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 1)
-            self.assertIn(f"|one.bin|1|{md4_raw(b'x').hex().upper()}|/", lines[0])
+            self.assertIn(f"|one.bin|1|{md4_raw(md4_raw(b'x')).hex().upper()}|/", lines[0])
 
     def test_single_file_input_keep_dirs_writes_files_log(self):
-        from python_port.ed2k115_calc import md4_raw
+        from ed2k_calculator.ed2k115_calc import md4_raw
 
         script_path = Path(__file__).resolve().parents[1] / "ed2k115_calc.py"
 
@@ -234,7 +325,7 @@ class TestOutputModes(unittest.TestCase):
             self.assertTrue(out_log.exists())
             lines = out_log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 1)
-            self.assertIn(f"|one.bin|1|{md4_raw(b'x').hex().upper()}|/", lines[0])
+            self.assertIn(f"|one.bin|1|{md4_raw(md4_raw(b'x')).hex().upper()}|/", lines[0])
 
     def test_cli_url_encode_option_affects_emitted_link_name(self):
         script_path = Path(__file__).resolve().parents[1] / "ed2k115_calc.py"
@@ -337,6 +428,49 @@ class TestOutputModes(unittest.TestCase):
             self.assertIn("|child.bin|", sub_lines[0])
 
 
+class TestParallelHashingBehavior(unittest.TestCase):
+    def test_parallel_hashing_preserves_log_line_order(self):
+        import ed2k_calculator.ed2k115_calc as calc
+
+        hash_threads = []
+        upsert_threads = []
+        real_flush = calc.flush_file_state_upserts
+
+        def fake_hash(file_path, size):
+            hash_threads.append(threading.current_thread().name)
+            if file_path.name == "b.txt":
+                time.sleep(0.05)
+                return "B" * 32
+            return "A" * 32
+
+        def recording_flush(conn, upserts):
+            upsert_threads.append(threading.current_thread().name)
+            return real_flush(conn, upserts)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            root.mkdir()
+            (root / "b.txt").write_bytes(b"bbb")
+            (root / "sub").mkdir()
+            (root / "sub" / "a.txt").write_bytes(b"a")
+
+            out_log = Path(td) / "flat.ed2k.log"
+            task_key = f"task4-parallel-{uuid.uuid4().hex}"
+
+            with mock.patch.object(calc, "build_task_key", return_value=task_key):
+                with mock.patch.object(calc, "hash_file_with_best_backend", side_effect=fake_hash):
+                    with mock.patch.object(calc, "flush_file_state_upserts", side_effect=recording_flush):
+                        rc = calc.main([str(root), "--out", str(out_log)])
+
+            self.assertEqual(rc, 0)
+            lines = out_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertIn("|b.txt|", lines[0])
+            self.assertIn("|a.txt|", lines[1])
+            self.assertTrue(any(name != "MainThread" for name in hash_threads))
+            self.assertEqual(set(upsert_threads), {"MainThread"})
+
+
 class TestCheckpointResume(unittest.TestCase):
     def make_task_key(self, label: str) -> str:
         return f"task6-{label}-{uuid.uuid4().hex}"
@@ -350,7 +484,7 @@ class TestCheckpointResume(unittest.TestCase):
             db_path.unlink()
 
     def test_resume_after_interruption_skips_completed_unchanged_files(self):
-        from python_port import ed2k115_calc as calc
+        import ed2k_calculator.ed2k115_calc as calc
 
         task_key = self.make_task_key("resume-interrupt")
         self.cleanup_checkpoint_db(task_key)
@@ -365,7 +499,7 @@ class TestCheckpointResume(unittest.TestCase):
             with mock.patch.object(calc, "build_task_key", return_value=task_key):
                 with mock.patch.object(
                     calc,
-                    "ed2k_115_stream",
+                    "hash_file_with_best_backend",
                     side_effect=["A" * 32, RuntimeError("simulated interruption")],
                 ) as hasher:
                     with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
@@ -374,7 +508,7 @@ class TestCheckpointResume(unittest.TestCase):
 
                 with mock.patch.object(
                     calc,
-                    "ed2k_115_stream",
+                    "hash_file_with_best_backend",
                     return_value="B" * 32,
                 ) as hasher:
                     second_rc = calc.main([str(root), "--out", str(out_log)])
@@ -394,7 +528,7 @@ class TestCheckpointResume(unittest.TestCase):
         self.cleanup_checkpoint_db(task_key)
 
     def test_file_change_triggers_rehash_and_record_replacement(self):
-        from python_port import ed2k115_calc as calc
+        import ed2k_calculator.ed2k115_calc as calc
 
         task_key = self.make_task_key("rehash")
         self.cleanup_checkpoint_db(task_key)
@@ -407,14 +541,14 @@ class TestCheckpointResume(unittest.TestCase):
             out_log = Path(td) / "flat.ed2k.log"
 
             with mock.patch.object(calc, "build_task_key", return_value=task_key):
-                with mock.patch.object(calc, "ed2k_115_stream", return_value="A" * 32) as hasher:
+                with mock.patch.object(calc, "hash_file_with_best_backend", return_value="A" * 32) as hasher:
                     first_rc = calc.main([str(root), "--out", str(out_log)])
                     self.assertEqual(first_rc, 0)
                     self.assertEqual(hasher.call_count, 1)
 
                 file_path.write_bytes(b"second-version")
 
-                with mock.patch.object(calc, "ed2k_115_stream", return_value="B" * 32) as hasher:
+                with mock.patch.object(calc, "hash_file_with_best_backend", return_value="B" * 32) as hasher:
                     second_rc = calc.main([str(root), "--out", str(out_log)])
                     self.assertEqual(second_rc, 0)
                     self.assertEqual(hasher.call_count, 1)
@@ -427,19 +561,138 @@ class TestCheckpointResume(unittest.TestCase):
             with sqlite3.connect(db_path) as conn:
                 row_count = conn.execute("SELECT COUNT(*) FROM file_state WHERE rel_path = ?", ("changed.bin",)).fetchone()[0]
                 row = conn.execute(
-                    "SELECT size, hash_hex FROM file_state WHERE rel_path = ?",
+                    "SELECT size, hash_blob FROM file_state WHERE rel_path = ?",
                     ("changed.bin",),
                 ).fetchone()
             self.assertEqual(row_count, 1)
             self.assertEqual(row[0], len(b"second-version"))
-            self.assertEqual(row[1], "B" * 32)
+            self.assertEqual(row[1], bytes.fromhex("B" * 32))
 
         self.cleanup_checkpoint_db(task_key)
 
 
+class TestCheckpointPruneCurrentScan(unittest.TestCase):
+    def test_successful_run_prunes_rows_not_in_current_scan(self):
+        import ed2k_calculator.ed2k115_calc as calc
+
+        task_key = f"task-prune-{uuid.uuid4().hex}"
+        db_path = Path(tempfile.gettempdir()) / "ed2k115-checkpoints" / f"{task_key}.sqlite3"
+        if db_path.exists():
+            db_path.unlink()
+        self.addCleanup(lambda: db_path.unlink() if db_path.exists() else None)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            root.mkdir()
+            keep = root / "keep.bin"
+            drop = root / "drop.bin"
+            keep.write_bytes(b"k")
+            drop.write_bytes(b"d")
+            out_log = Path(td) / "flat.ed2k.log"
+
+            with mock.patch.object(calc, "build_task_key", return_value=task_key):
+                self.assertEqual(calc.main([str(root), "--out", str(out_log)]), 0)
+
+            drop.unlink()
+
+            with mock.patch.object(calc, "build_task_key", return_value=task_key):
+                self.assertEqual(calc.main([str(root), "--out", str(out_log)]), 0)
+
+            with sqlite3.connect(db_path) as conn:
+                rows = conn.execute("SELECT rel_path FROM file_state ORDER BY rel_path").fetchall()
+
+            self.assertEqual(rows, [("keep.bin",)])
+
+    def test_failed_run_does_not_prune_rows_not_in_current_scan(self):
+        import ed2k_calculator.ed2k115_calc as calc
+
+        task_key = f"task-prune-failed-{uuid.uuid4().hex}"
+        db_path = Path(tempfile.gettempdir()) / "ed2k115-checkpoints" / f"{task_key}.sqlite3"
+        if db_path.exists():
+            db_path.unlink()
+        self.addCleanup(lambda: db_path.unlink() if db_path.exists() else None)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            root.mkdir()
+            keep = root / "keep.bin"
+            drop = root / "drop.bin"
+            keep.write_bytes(b"k")
+            drop.write_bytes(b"d")
+            out_log = Path(td) / "flat.ed2k.log"
+
+            with mock.patch.object(calc, "build_task_key", return_value=task_key):
+                self.assertEqual(calc.main([str(root), "--out", str(out_log)]), 0)
+
+            drop.unlink()
+            keep.write_bytes(b"kk")
+
+            with mock.patch.object(calc, "build_task_key", return_value=task_key):
+                with mock.patch.object(
+                    calc,
+                    "hash_file_with_best_backend",
+                    side_effect=RuntimeError("simulated interruption"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                        calc.main([str(root), "--out", str(out_log)])
+
+            with sqlite3.connect(db_path) as conn:
+                rows = conn.execute("SELECT rel_path FROM file_state ORDER BY rel_path").fetchall()
+
+            self.assertEqual(rows, [("drop.bin",), ("keep.bin",)])
+
+
+class TestCheckpointLegacySchemaMigration(unittest.TestCase):
+    def test_open_state_db_migrates_legacy_hash_hex_table_to_hash_blob_schema(self):
+        import ed2k_calculator.ed2k115_calc as calc
+
+        task_key = f"task-migrate-{uuid.uuid4().hex}"
+        db_path = Path(tempfile.gettempdir()) / "ed2k115-checkpoints" / f"{task_key}.sqlite3"
+        if db_path.exists():
+            db_path.unlink()
+        self.addCleanup(lambda: db_path.unlink() if db_path.exists() else None)
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE file_state (
+                    rel_path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    hash_hex TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO file_state (rel_path, size, mtime_ns, hash_hex) VALUES (?, ?, ?, ?)",
+                ("legacy.bin", 1, 123, "A" * 32),
+            )
+            conn.commit()
+
+        conn = calc.open_state_db(task_key)
+        try:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(file_state)").fetchall()]
+            self.assertEqual(columns, ["rel_path", "size", "mtime_ns", "hash_blob"])
+
+            legacy_blob = conn.execute(
+                "SELECT hash_blob FROM file_state WHERE rel_path = ?",
+                ("legacy.bin",),
+            ).fetchone()[0]
+            self.assertEqual(legacy_blob, bytes.fromhex("A" * 32))
+
+            calc.upsert_file_state(conn, "new.bin", 2, 456, "B" * 32)
+            new_blob = conn.execute(
+                "SELECT hash_blob FROM file_state WHERE rel_path = ?",
+                ("new.bin",),
+            ).fetchone()[0]
+            self.assertEqual(new_blob, bytes.fromhex("B" * 32))
+        finally:
+            conn.close()
+
+
 class TestDryRun(unittest.TestCase):
     def test_dry_run_no_state_and_no_log_written(self):
-        from python_port.ed2k115_calc import build_task_key
+        from ed2k_calculator.ed2k115_calc import build_task_key
 
         script_path = Path(__file__).resolve().parents[1] / "ed2k115_calc.py"
 
@@ -477,7 +730,7 @@ class TestDryRun(unittest.TestCase):
             self.assertFalse(db_path.exists())
 
     def test_dry_run_keep_dirs_multi_targets_no_state_and_no_logs(self):
-        from python_port.ed2k115_calc import build_task_key
+        from ed2k_calculator.ed2k115_calc import build_task_key
 
         script_path = Path(__file__).resolve().parents[1] / "ed2k115_calc.py"
 
