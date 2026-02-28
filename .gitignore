@@ -7,3 +7,4 @@ advDecompress/__pycache__/
 *.pyd
 __pycache__/
 .worktrees/
+docs/plans
