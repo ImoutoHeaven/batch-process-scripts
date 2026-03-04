@@ -53,6 +53,25 @@ def build_parser():
     return parser
 
 
+def _detect_backend():
+    native = _load_native_hasher()
+    if native is not None:
+        file_hasher = getattr(native, "ed2k115_file_hex", None)
+        if callable(file_hasher):
+            return "native"
+    return "python"
+
+
+def _print_backend_banner():
+    backend = _detect_backend()
+    print(f"[ed2k115] backend: {backend}", flush=True)
+
+
+def _flush_log_line(log_path: Path, link: str):
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(link + "\n")
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -83,10 +102,12 @@ def main(argv=None):
             print(target)
         return 0
 
+    _print_backend_banner()
+
     task_key = build_task_key(input_path, out_path, args.keep_dirs, args.url_encode)
     conn = open_state_db(task_key)
-    grouped_lines = {}
     pending_upserts = []
+    flushed_logs = set()
     try:
         ordered_items = []
         for file_path, rel_parent in iter_input_files(input_path):
@@ -112,29 +133,39 @@ def main(argv=None):
                 }
             )
 
-        pending_hashes = [item for item in ordered_items if item["digest"] is None]
-        if pending_hashes:
-            max_workers = min(32, os.cpu_count() or 4)
-            jobs = [(item["file_path"], item["size"]) for item in pending_hashes]
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                for item, digest in zip(pending_hashes, executor.map(_hash_work_item, jobs)):
+        # Truncate all target log files before writing so append starts fresh
+        for item in ordered_items:
+            lp = item["log_path"]
+            if lp not in flushed_logs:
+                lp.parent.mkdir(parents=True, exist_ok=True)
+                lp.write_text("", encoding="utf-8")
+                flushed_logs.add(lp)
+
+        # Submit hash jobs for items that need hashing, keep futures in order
+        max_workers = min(32, os.cpu_count() or 4)
+        futures = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for item in ordered_items:
+                if item["digest"] is None:
+                    future = executor.submit(_hash_work_item, (item["file_path"], item["size"]))
+                    futures[id(item)] = future
+
+            # Consume results in original order, flush each line immediately
+            for item in ordered_items:
+                if item["digest"] is None:
+                    digest = futures[id(item)].result()
                     item["digest"] = digest
                     pending_upserts.append((item["rel_key"], item["size"], item["mtime_ns"], digest))
                     if len(pending_upserts) >= SQLITE_UPSERT_BATCH_SIZE:
                         flush_file_state_upserts(conn, pending_upserts)
                         pending_upserts.clear()
 
+                link = f"ed2k://|file|{item['name']}|{item['size']}|{item['digest']}|/"
+                _flush_log_line(item["log_path"], link)
+
         if pending_upserts:
             flush_file_state_upserts(conn, pending_upserts)
             pending_upserts.clear()
-
-        for item in ordered_items:
-            link = f"ed2k://|file|{item['name']}|{item['size']}|{item['digest']}|/"
-            grouped_lines.setdefault(item["log_path"], []).append(link)
-
-        for log_path, lines in grouped_lines.items():
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         prune_unseen_file_state(conn)
     except Exception:

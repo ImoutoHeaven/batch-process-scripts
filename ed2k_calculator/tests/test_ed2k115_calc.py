@@ -771,3 +771,189 @@ class TestDryRun(unittest.TestCase):
             self.assertFalse(sub_target.exists())
             self.assertFalse(out_dir.exists())
             self.assertFalse(db_path.exists())
+
+
+class TestStreamingLogFlush(unittest.TestCase):
+    def test_log_lines_are_flushed_incrementally_not_batched_at_end(self):
+        """_flush_log_line is called once per item as each digest becomes available,
+        not all at once after every hash is complete."""
+        import ed2k_calculator.ed2k115_calc as calc
+
+        flush_call_order = []
+        hash_call_order = []
+        real_flush_log = calc._flush_log_line
+
+        def recording_flush_log(log_path, link):
+            flush_call_order.append(("flush", link))
+            return real_flush_log(log_path, link)
+
+        hash_count = 0
+
+        def sequential_hash(file_path, size):
+            nonlocal hash_count
+            hash_count += 1
+            return f"{'A' * 31}{hash_count}"
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            root.mkdir()
+            (root / "a.txt").write_bytes(b"aaa")
+            (root / "b.txt").write_bytes(b"bbb")
+            (root / "c.txt").write_bytes(b"ccc")
+
+            out_log = Path(td) / "flat.ed2k.log"
+            task_key = f"task-streaming-{uuid.uuid4().hex}"
+
+            with mock.patch.object(calc, "build_task_key", return_value=task_key):
+                with mock.patch.object(calc, "hash_file_with_best_backend", side_effect=sequential_hash):
+                    with mock.patch.object(calc, "_flush_log_line", side_effect=recording_flush_log):
+                        rc = calc.main([str(root), "--out", str(out_log)])
+
+            self.assertEqual(rc, 0)
+            # Should have 3 flush calls, one per file
+            self.assertEqual(len(flush_call_order), 3)
+
+            # Verify log file has all 3 lines (final state)
+            final_lines = out_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(final_lines), 3)
+            self.assertIn("|a.txt|", final_lines[0])
+            self.assertIn("|b.txt|", final_lines[1])
+            self.assertIn("|c.txt|", final_lines[2])
+
+    def test_cached_items_are_also_flushed_incrementally(self):
+        """Items with cached digests should also be flushed one-by-one, not batched."""
+        import ed2k_calculator.ed2k115_calc as calc
+
+        flush_calls = []
+        real_flush_log = calc._flush_log_line
+
+        def recording_flush(log_path, link):
+            flush_calls.append(link)
+            return real_flush_log(log_path, link)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            root.mkdir()
+            (root / "a.txt").write_bytes(b"aaa")
+            (root / "b.txt").write_bytes(b"bbb")
+            out_log = Path(td) / "flat.ed2k.log"
+            task_key = f"task-streaming-cache-{uuid.uuid4().hex}"
+
+            # First run to populate cache
+            with mock.patch.object(calc, "build_task_key", return_value=task_key):
+                calc.main([str(root), "--out", str(out_log)])
+
+            # Second run: all cached, no hashing needed
+            with mock.patch.object(calc, "build_task_key", return_value=task_key):
+                with mock.patch.object(calc, "_flush_log_line", side_effect=recording_flush):
+                    with mock.patch.object(calc, "hash_file_with_best_backend") as hasher:
+                        rc = calc.main([str(root), "--out", str(out_log)])
+                        self.assertEqual(hasher.call_count, 0)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(flush_calls), 2)
+            self.assertIn("|a.txt|", flush_calls[0])
+            self.assertIn("|b.txt|", flush_calls[1])
+
+    def test_keep_dirs_flushes_to_correct_logs_incrementally(self):
+        """In keep-dirs mode, each line is flushed to the correct log file immediately."""
+        import ed2k_calculator.ed2k115_calc as calc
+
+        flush_calls = []
+        real_flush_log = calc._flush_log_line
+
+        def recording_flush(log_path, link):
+            flush_calls.append((str(log_path), link))
+            return real_flush_log(log_path, link)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            root.mkdir()
+            (root / "root1.txt").write_bytes(b"r1")
+            (root / "sub").mkdir()
+            (root / "sub" / "child.txt").write_bytes(b"c")
+
+            out_dir = Path(td) / "out"
+            task_key = f"task-streaming-kd-{uuid.uuid4().hex}"
+
+            with mock.patch.object(calc, "build_task_key", return_value=task_key):
+                with mock.patch.object(calc, "_flush_log_line", side_effect=recording_flush):
+                    rc = calc.main([str(root), "--out", str(out_dir), "--keep-dirs"])
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(flush_calls), 2)
+
+            root_log = out_dir / "files.ed2k.log"
+            sub_log = out_dir / "sub" / "files.ed2k.log"
+            self.assertIn(str(root_log), flush_calls[0][0])
+            self.assertIn("|root1.txt|", flush_calls[0][1])
+            self.assertIn(str(sub_log), flush_calls[1][0])
+            self.assertIn("|child.txt|", flush_calls[1][1])
+
+
+class TestBackendBannerPrinted(unittest.TestCase):
+    def test_main_prints_python_backend_banner_when_native_unavailable(self):
+        import ed2k_calculator.ed2k115_calc as calc
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            root.mkdir()
+            (root / "x.bin").write_bytes(b"x")
+            out_log = Path(td) / "flat.ed2k.log"
+            task_key = f"task-banner-py-{uuid.uuid4().hex}"
+
+            with mock.patch.object(calc, "build_task_key", return_value=task_key):
+                with mock.patch.object(calc, "_load_native_hasher", return_value=None):
+                    from io import StringIO
+                    captured = StringIO()
+                    with mock.patch("sys.stdout", captured):
+                        calc.main([str(root), "--out", str(out_log)])
+
+            output = captured.getvalue()
+            self.assertIn("python", output.lower())
+
+    def test_main_prints_native_backend_banner_when_native_available(self):
+        import ed2k_calculator.ed2k115_calc as calc
+
+        fake_native = mock.Mock()
+        fake_native.__file__ = None
+        fake_native.ed2k115_file_hex = mock.Mock(return_value="A" * 32)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            root.mkdir()
+            (root / "x.bin").write_bytes(b"x")
+            out_log = Path(td) / "flat.ed2k.log"
+            task_key = f"task-banner-native-{uuid.uuid4().hex}"
+
+            with mock.patch.object(calc, "build_task_key", return_value=task_key):
+                with mock.patch.object(calc, "_load_native_hasher", return_value=fake_native):
+                    from io import StringIO
+                    captured = StringIO()
+                    with mock.patch("sys.stdout", captured):
+                        calc.main([str(root), "--out", str(out_log)])
+
+            output = captured.getvalue()
+            self.assertIn("native", output.lower())
+
+    def test_cli_prints_backend_banner_to_stderr(self):
+        """When run as CLI, backend info should appear in stderr."""
+        script_path = Path(__file__).resolve().parents[1] / "ed2k115_calc.py"
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "input"
+            root.mkdir()
+            (root / "x.bin").write_bytes(b"x")
+            out_log = Path(td) / "flat.ed2k.log"
+
+            run = subprocess.run(
+                [sys.executable, str(script_path), str(root), "--out", str(out_log)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(run.returncode, 0, msg=run.stderr)
+            combined = run.stdout.lower() + run.stderr.lower()
+            self.assertTrue(
+                "native" in combined or "python" in combined,
+                f"Expected backend banner in output, got stdout={run.stdout!r} stderr={run.stderr!r}",
+            )
