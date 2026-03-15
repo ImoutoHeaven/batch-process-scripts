@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "cua": {
+      "type": "local",
+      "command": [
+        "/root/batch-process-scripts/cua_opencode_mcp_docker/cua_mcp_server_docker.py"
+      ],
+      "enabled": true,
+      "timeout": 600000,
+      "environment": {
+        "CUA_MODEL_NAME": "anthropic/claude-sonnet-4-5-20250929",
+        "ANTHROPIC_API_KEY": "{env:ANTHROPIC_API_KEY}",
+        "CUA_SANDBOX_OS": "linux",
+        "CUA_DOCKER_IMAGE": "trycua/cua-ubuntu:latest",
+        "CUA_DOCKER_EPHEMERAL": "true",
+        "CUA_TELEMETRY_ENABLED": "false"
+      }
+    }
+  }
+}
