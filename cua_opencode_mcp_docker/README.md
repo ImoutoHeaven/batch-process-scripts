@@ -15,12 +15,14 @@ In short, this script gives OpenCode a practical local CUA MCP server on Linux w
 - Docker must be installed and running.
 - The official `cua-mcp-server` package must already be installed.
 - A supported model provider key must be available through environment variables.
+- If you use `omniparser+...`, install `cua-som` into the same Python environment as `cua-mcp-server`.
 
 Example setup:
 
 ```bash
 uv python install 3.12
 uv tool install --python 3.12 cua-mcp-server
+uv pip install --python ~/.local/share/uv/tools/cua-mcp-server/bin/python cua-som
 docker pull --platform=linux/amd64 trycua/cua-ubuntu:latest
 ```
 
@@ -42,8 +44,9 @@ Example `opencode.json` snippet:
       "enabled": true,
       "timeout": 600000,
       "environment": {
-        "CUA_MODEL_NAME": "anthropic/claude-sonnet-4-5-20250929",
-        "ANTHROPIC_API_KEY": "{env:ANTHROPIC_API_KEY}",
+        "CUA_MODEL_NAME": "omniparser+openai/rightcode/gpt-5.4",
+        "OPENAI_API_KEY": "{env:OPENAI_API_KEY}",
+        "OPENAI_BASE_URL": "{env:OPENAI_BASE_URL}",
         "CUA_SANDBOX_OS": "linux",
         "CUA_DOCKER_IMAGE": "trycua/cua-ubuntu:latest",
         "CUA_DOCKER_EPHEMERAL": "true",
@@ -64,6 +67,20 @@ You should see the `cua` server in the `connected` state.
 
 If you want a starting point without embedded secrets, copy `opencode.example.json` and replace the model/provider environment entries to match your setup.
 
+### 4. OpenAI-compatible endpoints and `cliproxy-codex`
+
+If your target model is exposed through an OpenAI-compatible API, keep the provider prefix in the composed model string. For example:
+
+```json
+{
+  "CUA_MODEL_NAME": "omniparser+openai/rightcode/gpt-5.4",
+  "OPENAI_API_KEY": "{env:OPENAI_API_KEY}",
+  "OPENAI_BASE_URL": "{env:OPENAI_BASE_URL}"
+}
+```
+
+For a local OpenCode setup that already has a `cliproxy-codex` provider block, use the same endpoint and key values for the `mcp.cua.environment` section. Do not commit those literal values into source control; keep them in shell environment variables or a machine-local OpenCode config.
+
 ## Parameter Configuration
 
 The wrapper reads the following environment variables.
@@ -76,6 +93,12 @@ The wrapper reads the following environment variables.
   - `ANTHROPIC_API_KEY`
   - `OPENROUTER_API_KEY`
   - `OPENAI_BASE_URL` for OpenAI-compatible endpoints
+
+For `omniparser+openai/rightcode/gpt-5.4`, the minimum practical set is:
+
+- `CUA_MODEL_NAME=omniparser+openai/rightcode/gpt-5.4`
+- `OPENAI_API_KEY=...`
+- `OPENAI_BASE_URL=...`
 
 ### Wrapper-specific parameters
 
@@ -98,6 +121,7 @@ The wrapper reads the following environment variables.
 - This wrapper does not replace the official MCP server logic. It imports the installed `cua-mcp-server` package and only swaps out the session pool implementation.
 - The wrapper is Linux-oriented because it forces `provider_type=DOCKER` and `os_type=linux` by default.
 - If you need a composed model, set it directly in `CUA_MODEL_NAME`. Example values:
+  - `omniparser+openai/rightcode/gpt-5.4`
   - `omniparser+openai/gpt-4o`
   - `moondream3+anthropic/claude-sonnet-4-5-20250929`
   - `huggingface-local/HelloKKMe/GTA1-7B+anthropic/claude-sonnet-4-5-20250929`
@@ -114,3 +138,4 @@ The wrapper reads the following environment variables.
 - Task execution fails after MCP connects:
   - Check that `CUA_MODEL_NAME` and the matching provider credentials are set.
   - If using an OpenAI-compatible endpoint, confirm `OPENAI_BASE_URL` and `OPENAI_API_KEY` are correct.
+  - If using `omniparser+...`, confirm `cua-som` is installed in the same Python environment as `cua-mcp-server`.

@@ -9,8 +9,9 @@
       "enabled": true,
       "timeout": 600000,
       "environment": {
-        "CUA_MODEL_NAME": "anthropic/claude-sonnet-4-5-20250929",
-        "ANTHROPIC_API_KEY": "{env:ANTHROPIC_API_KEY}",
+        "CUA_MODEL_NAME": "omniparser+openai/rightcode/gpt-5.4",
+        "OPENAI_API_KEY": "{env:OPENAI_API_KEY}",
+        "OPENAI_BASE_URL": "{env:OPENAI_BASE_URL}",
         "CUA_SANDBOX_OS": "linux",
         "CUA_DOCKER_IMAGE": "trycua/cua-ubuntu:latest",
         "CUA_DOCKER_EPHEMERAL": "true",
