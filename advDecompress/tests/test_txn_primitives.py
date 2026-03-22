@@ -6,6 +6,7 @@ import importlib.util
 import types
 from multiprocessing import Process, Pipe
 from types import SimpleNamespace
+from unittest import mock
 import zipfile
 
 
@@ -24,6 +25,41 @@ class TestTxnPrimitives(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.m = _load_advdecompress_module()
+
+    def _make_processor_args(self, **overrides):
+        args = {
+            "verbose": False,
+            "password": None,
+            "password_file": None,
+            "traditional_zip_policy": "decode-auto",
+        }
+        args.update(overrides)
+        return SimpleNamespace(**args)
+
+    def _make_processing_args(self, root_dir, **overrides):
+        args = {
+            "verbose": False,
+            "password": None,
+            "password_file": None,
+            "traditional_zip_policy": "decode-auto",
+            "dry_run": False,
+            "path": root_dir,
+            "output": os.path.join(root_dir, "out"),
+            "fail_policy": "asis",
+            "fail_to": None,
+            "success_policy": "asis",
+            "success_to": None,
+            "zip_decode": None,
+            "enable_rar": False,
+            "detect_elf_sfx": False,
+            "decompress_policy": "direct",
+            "degrade_cross_volume": False,
+            "wal_fsync_every": 1,
+            "snapshot_every": 1,
+            "no_durability": True,
+        }
+        args.update(overrides)
+        return SimpleNamespace(**args)
 
     def test_atomic_write_json(self):
         with tempfile.TemporaryDirectory() as td:
@@ -63,7 +99,9 @@ class TestTxnPrimitives(unittest.TestCase):
             os.makedirs(out)
             paths = {"incoming_dir": os.path.join(td, "incoming")}
             os.makedirs(paths["incoming_dir"])
-            with open(os.path.join(paths["incoming_dir"], "x.txt"), "w", encoding="utf-8") as f:
+            with open(
+                os.path.join(paths["incoming_dir"], "x.txt"), "w", encoding="utf-8"
+            ) as f:
                 f.write("x")
 
             txn = {
@@ -101,7 +139,9 @@ class TestTxnPrimitives(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             lock_path = os.path.join(td, "lockfile")
-            lock1 = self.m.FileLock(lock_path, timeout_ms=2000, retry_ms=50, debug=False)
+            lock1 = self.m.FileLock(
+                lock_path, timeout_ms=2000, retry_ms=50, debug=False
+            )
             self.assertTrue(lock1.acquire())
 
             parent_conn, child_conn = Pipe(duplex=False)
@@ -123,7 +163,9 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertFalse(ok)
             lock1.release()
 
-            lock2 = self.m.FileLock(lock_path, timeout_ms=1000, retry_ms=50, debug=False)
+            lock2 = self.m.FileLock(
+                lock_path, timeout_ms=1000, retry_ms=50, debug=False
+            )
             self.assertTrue(lock2.acquire())
             lock2.release()
 
@@ -133,7 +175,9 @@ class TestTxnPrimitives(unittest.TestCase):
             os.makedirs(output_dir)
             paths = self.m._txn_paths(output_dir, td, "testtxn")
             os.makedirs(paths["incoming_dir"])
-            with open(os.path.join(paths["incoming_dir"], "x.txt"), "w", encoding="utf-8") as f:
+            with open(
+                os.path.join(paths["incoming_dir"], "x.txt"), "w", encoding="utf-8"
+            ) as f:
                 f.write("x")
             with open(os.path.join(output_dir, "x.txt"), "w", encoding="utf-8") as f:
                 f.write("y")
@@ -256,7 +300,9 @@ class TestTxnPrimitives(unittest.TestCase):
             )
             processor = self.m.ArchiveProcessor(args)
             vols = processor.get_all_volumes(part1)
-            self.assertEqual({os.path.abspath(p) for p in (main, part1, part2)}, set(vols))
+            self.assertEqual(
+                {os.path.abspath(p) for p in (main, part1, part2)}, set(vols)
+            )
 
     def test_get_all_volumes_7z_accepts_short_digits(self):
         with tempfile.TemporaryDirectory() as td:
@@ -276,7 +322,9 @@ class TestTxnPrimitives(unittest.TestCase):
             )
             processor = self.m.ArchiveProcessor(args)
             vols = processor.get_all_volumes(part2)
-            self.assertEqual({os.path.abspath(p) for p in (part1, part2, part3)}, set(vols))
+            self.assertEqual(
+                {os.path.abspath(p) for p in (part1, part2, part3)}, set(vols)
+            )
 
     def test_get_all_volumes_rar4_accepts_variable_digits(self):
         with tempfile.TemporaryDirectory() as td:
@@ -297,7 +345,9 @@ class TestTxnPrimitives(unittest.TestCase):
             )
             processor = self.m.ArchiveProcessor(args)
             vols = processor.get_all_volumes(part2)
-            self.assertEqual({os.path.abspath(p) for p in (main, part1, part2, part3)}, set(vols))
+            self.assertEqual(
+                {os.path.abspath(p) for p in (main, part1, part2, part3)}, set(vols)
+            )
 
     def test_exe_split_volume_detection(self):
         with tempfile.TemporaryDirectory() as td:
@@ -329,6 +379,663 @@ class TestTxnPrimitives(unittest.TestCase):
 
             # Base name normalization should strip .exe.NNN
             self.assertEqual("a", self.m.get_archive_base_name(v1))
+
+    def test_find_archives_recognizes_tar_family_suffixes(self):
+        names = [
+            "a.tar",
+            "b.tar.gz",
+            "c.tgz",
+            "d.tar.bz2",
+            "e.tbz2",
+            "f.tar.xz",
+            "g.txz",
+            "H.TAR",
+            "I.TGZ",
+            "J.Tar.Xz",
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            for name in names + ["ignore.txt"]:
+                with open(os.path.join(td, name), "wb") as f:
+                    f.write(b"")
+
+            processor = self.m.ArchiveProcessor(self._make_processor_args())
+            found = {os.path.basename(path) for path in processor.find_archives(td)}
+
+        self.assertEqual(set(names), found)
+
+    def test_get_archive_base_name_normalizes_tar_family(self):
+        cases = {
+            "a.tar": "a",
+            "a.tar.gz": "a",
+            "a.tgz": "a",
+            "a.tar.bz2": "a",
+            "a.tbz2": "a",
+            "a.tar.xz": "a",
+            "a.txz": "a",
+            "A.TAR.GZ": "A",
+        }
+
+        for archive_name, expected in cases.items():
+            with self.subTest(archive_name=archive_name):
+                self.assertEqual(expected, self.m.get_archive_base_name(archive_name))
+
+    def test_is_archive_single_or_volume_recognizes_tar_family_as_single(self):
+        names = [
+            "a.tar",
+            "b.tar.gz",
+            "c.tgz",
+            "d.tar.bz2",
+            "e.tbz2",
+            "f.tar.xz",
+            "g.txz",
+            "H.TAR",
+            "I.TGZ",
+            "J.Tar.Xz",
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            processor = self.m.ArchiveProcessor(self._make_processor_args())
+            for name in names:
+                path = os.path.join(td, name)
+                with open(path, "wb") as f:
+                    f.write(b"")
+                with self.subTest(path=path):
+                    self.assertEqual(
+                        "single", processor.is_archive_single_or_volume(path)
+                    )
+
+    def test_parse_archive_filename_understands_tar_double_suffixes(self):
+        cases = {
+            "a.tar.gz": {
+                "base_filename": "a",
+                "file_ext": "gz",
+                "file_ext_extend": "tar",
+            },
+            "a.tar.bz2": {
+                "base_filename": "a",
+                "file_ext": "bz2",
+                "file_ext_extend": "tar",
+            },
+            "a.tar.xz": {
+                "base_filename": "a",
+                "file_ext": "xz",
+                "file_ext_extend": "tar",
+            },
+            "a.tgz": {
+                "base_filename": "a",
+                "file_ext": "tgz",
+                "file_ext_extend": "",
+            },
+        }
+
+        for filename, expected in cases.items():
+            with self.subTest(filename=filename):
+                self.assertEqual(expected, self.m.parse_archive_filename(filename))
+
+    def test_validate_args_sets_skip_tar_default_false(self):
+        processor = self.m.ArchiveProcessor(self._make_processor_args())
+        self.assertFalse(processor.args.skip_tar)
+
+    def test_should_skip_single_archive_honors_skip_tar_only_for_tar_family(self):
+        with tempfile.TemporaryDirectory() as td:
+            tar_path = os.path.join(td, "a.tar.gz")
+            zip_path = os.path.join(td, "a.zip")
+            for path in (tar_path, zip_path):
+                with open(path, "wb") as f:
+                    f.write(b"")
+
+            processor = self.m.ArchiveProcessor(
+                self._make_processor_args(skip_tar=True)
+            )
+
+            self.assertEqual(
+                (True, "单个TAR文件被跳过 (--skip-tar)"),
+                processor._should_skip_single_archive(tar_path),
+            )
+            self.assertEqual(
+                (False, ""), processor._should_skip_single_archive(zip_path)
+            )
+
+    def test_get_all_volumes_returns_single_path_for_tar_family(self):
+        names = [
+            "a.tar",
+            "b.tar.gz",
+            "c.tgz",
+            "d.tar.bz2",
+            "e.tbz2",
+            "f.tar.xz",
+            "g.txz",
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            processor = self.m.ArchiveProcessor(self._make_processor_args())
+            for name in names:
+                path = os.path.join(td, name)
+                with open(path, "wb") as f:
+                    f.write(b"")
+                with self.subTest(path=path):
+                    self.assertEqual([path], processor.get_all_volumes(path))
+
+    def test_process_archive_tar_skips_encryption_probe(self):
+        with tempfile.TemporaryDirectory() as td:
+            tar_path = os.path.join(td, "a.tar.gz")
+            zip_path = os.path.join(td, "a.zip")
+            password_file = os.path.join(td, "passwords.txt")
+            for path in (tar_path, zip_path):
+                with open(path, "wb") as f:
+                    f.write(b"")
+            with open(password_file, "w", encoding="utf-8") as f:
+                f.write("secret\n")
+
+            tar_args = self._make_processing_args(td, password_file=password_file)
+            tar_processor = self.m.ArchiveProcessor(tar_args)
+            with (
+                mock.patch.object(
+                    tar_processor,
+                    "handle_traditional_zip_policy",
+                    return_value={
+                        "should_continue": True,
+                        "zip_decode": None,
+                        "reason": "",
+                    },
+                ),
+                mock.patch.object(tar_processor, "apply_decompress_policy"),
+                mock.patch.object(self.m, "try_extract", return_value=True),
+                mock.patch.object(
+                    self.m, "validate_extracted_tree", return_value=(True, "")
+                ),
+                mock.patch.object(
+                    self.m, "count_items_in_dir", side_effect=[(1, 0), (0, 0)]
+                ),
+                mock.patch.object(self.m, "clean_temp_dir"),
+                mock.patch.object(
+                    self.m, "check_encryption", return_value="plain"
+                ) as tar_check_encryption,
+            ):
+                self.assertTrue(tar_processor.process_archive(tar_path))
+                tar_check_encryption.assert_not_called()
+
+            zip_args = self._make_processing_args(td, password_file=password_file)
+            zip_processor = self.m.ArchiveProcessor(zip_args)
+            with (
+                mock.patch.object(
+                    zip_processor,
+                    "handle_traditional_zip_policy",
+                    return_value={
+                        "should_continue": True,
+                        "zip_decode": None,
+                        "reason": "",
+                    },
+                ),
+                mock.patch.object(zip_processor, "apply_decompress_policy"),
+                mock.patch.object(self.m, "try_extract", return_value=True),
+                mock.patch.object(
+                    self.m, "validate_extracted_tree", return_value=(True, "")
+                ),
+                mock.patch.object(
+                    self.m, "count_items_in_dir", side_effect=[(1, 0), (0, 0)]
+                ),
+                mock.patch.object(self.m, "clean_temp_dir"),
+                mock.patch.object(
+                    self.m, "check_encryption", return_value="plain"
+                ) as zip_check_encryption,
+            ):
+                self.assertTrue(zip_processor.process_archive(zip_path))
+                zip_check_encryption.assert_called_once_with(os.path.abspath(zip_path))
+
+    def test_txn_extract_tar_skips_encryption_probe(self):
+        with tempfile.TemporaryDirectory() as td:
+            tar_path = os.path.join(td, "a.tar.gz")
+            zip_path = os.path.join(td, "a.zip")
+            password_file = os.path.join(td, "passwords.txt")
+            for path in (tar_path, zip_path):
+                with open(path, "wb") as f:
+                    f.write(b"")
+            with open(password_file, "w", encoding="utf-8") as f:
+                f.write("secret\n")
+
+            tar_args = self._make_processing_args(td, password_file=password_file)
+            tar_processor = self.m.ArchiveProcessor(tar_args)
+            with (
+                mock.patch.object(
+                    tar_processor,
+                    "handle_traditional_zip_policy",
+                    return_value={
+                        "should_continue": True,
+                        "zip_decode": None,
+                        "reason": "",
+                    },
+                ),
+                mock.patch.object(self.m, "_validate_environment_for_output_dir"),
+                mock.patch.object(self.m, "try_extract", return_value=True),
+                mock.patch.object(
+                    self.m, "validate_extracted_tree", return_value=(True, "")
+                ),
+                mock.patch.object(self.m, "count_items_in_dir", return_value=(1, 0)),
+                mock.patch.object(
+                    self.m, "check_encryption", return_value="plain"
+                ) as tar_check_encryption,
+            ):
+                result = self.m._extract_phase(
+                    tar_processor,
+                    tar_path,
+                    args=tar_args,
+                    output_base=tar_args.output,
+                )
+                self.assertEqual("txn", result["kind"])
+                tar_check_encryption.assert_not_called()
+
+            zip_args = self._make_processing_args(td, password_file=password_file)
+            zip_processor = self.m.ArchiveProcessor(zip_args)
+            with (
+                mock.patch.object(
+                    zip_processor,
+                    "handle_traditional_zip_policy",
+                    return_value={
+                        "should_continue": True,
+                        "zip_decode": None,
+                        "reason": "",
+                    },
+                ),
+                mock.patch.object(self.m, "_validate_environment_for_output_dir"),
+                mock.patch.object(self.m, "try_extract", return_value=True),
+                mock.patch.object(
+                    self.m, "validate_extracted_tree", return_value=(True, "")
+                ),
+                mock.patch.object(self.m, "count_items_in_dir", return_value=(1, 0)),
+                mock.patch.object(
+                    self.m, "check_encryption", return_value="plain"
+                ) as zip_check_encryption,
+            ):
+                result = self.m._extract_phase(
+                    zip_processor,
+                    zip_path,
+                    args=zip_args,
+                    output_base=zip_args.output,
+                )
+                self.assertEqual("txn", result["kind"])
+                zip_check_encryption.assert_called_once_with(os.path.abspath(zip_path))
+
+    def _write_minimal_tar(self, path):
+        data = bytearray(512)
+        data[257:263] = b"ustar\x00"
+        with open(path, "wb") as f:
+            f.write(data)
+
+    def test_try_extract_tar_plain_uses_one_stage_7z(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "a.tar")
+            with open(archive_path, "wb") as f:
+                f.write(b"")
+            tmp_dir = os.path.join(td, "tmp")
+
+            calls = []
+
+            def _fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            with mock.patch.object(
+                self.m, "safe_subprocess_run", side_effect=_fake_run
+            ):
+                ok = self.m.try_extract(archive_path, None, tmp_dir)
+
+            self.assertTrue(ok)
+            self.assertEqual(1, len(calls))
+            out_dir = next(
+                t for t in calls[0] if isinstance(t, str) and t.startswith("-o")
+            )[2:]
+            self.assertEqual(tmp_dir, out_dir)
+
+    def test_try_extract_tarball_uses_two_stage_7z_and_cleans_stage(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "a.tar.gz")
+            with open(archive_path, "wb") as f:
+                f.write(b"")
+            tmp_dir = os.path.join(td, "tmp")
+
+            calls = []
+
+            def _fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                out_arg = next(
+                    (t for t in cmd if isinstance(t, str) and t.startswith("-o")), None
+                )
+                if out_arg and len(calls) == 1:
+                    out_dir = out_arg[2:]
+                    self._write_minimal_tar(os.path.join(out_dir, "inner.tar"))
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            with (
+                mock.patch.object(self.m, "safe_subprocess_run", side_effect=_fake_run),
+                mock.patch.object(
+                    self.m, "should_use_rar_extractor", return_value=True
+                ),
+            ):
+                ok = self.m.try_extract(
+                    archive_path,
+                    None,
+                    tmp_dir,
+                    zip_decode=932,
+                    enable_rar=True,
+                    sfx_detector=None,
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual(2, len(calls))
+
+            out1 = next(
+                t for t in calls[0] if isinstance(t, str) and t.startswith("-o")
+            )[2:]
+            out2 = next(
+                t for t in calls[1] if isinstance(t, str) and t.startswith("-o")
+            )[2:]
+
+            self.assertEqual(tmp_dir, out2)
+            self.assertNotEqual(tmp_dir, out1)
+            self.assertEqual(os.path.dirname(tmp_dir), os.path.dirname(out1))
+            self.assertFalse(out1.startswith(tmp_dir + os.sep))
+
+            for cmd in calls:
+                self.assertEqual("7z", cmd[0])
+                self.assertEqual("x", cmd[1])
+                self.assertIn("-pDUMMYPASSWORD", cmd)
+                self.assertFalse(
+                    any(isinstance(t, str) and t.startswith("-mcp=") for t in cmd)
+                )
+
+            self.assertFalse(os.path.exists(out1))
+
+    def test_try_extract_tarball_accepts_valid_inner_tar_without_tar_suffix(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "a.tar.gz")
+            with open(archive_path, "wb") as f:
+                f.write(b"")
+            tmp_dir = os.path.join(td, "tmp")
+
+            calls = []
+
+            def _fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                out_arg = next(
+                    (t for t in cmd if isinstance(t, str) and t.startswith("-o")), None
+                )
+                if out_arg and len(calls) == 1:
+                    out_dir = out_arg[2:]
+                    self._write_minimal_tar(os.path.join(out_dir, "oddname"))
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            with mock.patch.object(
+                self.m, "safe_subprocess_run", side_effect=_fake_run
+            ):
+                ok = self.m.try_extract(archive_path, None, tmp_dir)
+
+            self.assertTrue(ok)
+            self.assertEqual(2, len(calls))
+            stage_dir = next(
+                t for t in calls[0] if isinstance(t, str) and t.startswith("-o")
+            )[2:]
+            self.assertEqual(os.path.join(stage_dir, "oddname"), calls[1][2])
+
+    def test_try_extract_tarball_fails_when_stage_dir_creation_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "a.tgz")
+            with open(archive_path, "wb") as f:
+                f.write(b"")
+            tmp_dir = os.path.join(td, "tmp")
+
+            fixed_uuid = SimpleNamespace(hex="fixed")
+            stage_basename = (
+                os.path.basename(tmp_dir) + ".tarball_stage." + fixed_uuid.hex
+            )
+            stage_dir = os.path.join(os.path.dirname(tmp_dir), stage_basename)
+
+            def _fake_makedirs(path, exist_ok=True, debug=False):
+                if path == stage_dir:
+                    return False
+                os.makedirs(path, exist_ok=True)
+                return True
+
+            with (
+                mock.patch.object(self.m.uuid, "uuid4", return_value=fixed_uuid),
+                mock.patch.object(self.m, "safe_makedirs", side_effect=_fake_makedirs),
+                mock.patch.object(self.m, "safe_subprocess_run") as run,
+            ):
+                self.assertFalse(self.m.try_extract(archive_path, None, tmp_dir))
+                run.assert_not_called()
+
+    def test_try_extract_tarball_fails_when_outer_extract_command_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "a.tar.gz")
+            with open(archive_path, "wb") as f:
+                f.write(b"")
+            tmp_dir = os.path.join(td, "tmp")
+
+            fixed_uuid = SimpleNamespace(hex="fixed")
+            calls = []
+
+            def _fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                return SimpleNamespace(returncode=2, stdout=b"", stderr=b"boom")
+
+            with (
+                mock.patch.object(self.m.uuid, "uuid4", return_value=fixed_uuid),
+                mock.patch.object(self.m, "safe_subprocess_run", side_effect=_fake_run),
+            ):
+                self.assertFalse(self.m.try_extract(archive_path, None, tmp_dir))
+
+            self.assertEqual(1, len(calls))
+            out_dir = next(
+                t for t in calls[0] if isinstance(t, str) and t.startswith("-o")
+            )[2:]
+            self.assertNotEqual(tmp_dir, out_dir)
+            self.assertEqual(os.path.dirname(tmp_dir), os.path.dirname(out_dir))
+            self.assertFalse(out_dir.startswith(tmp_dir + os.sep))
+
+    def test_try_extract_tarball_inner_tar_cleanup_failure_returns_false(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "a.txz")
+            with open(archive_path, "wb") as f:
+                f.write(b"")
+            tmp_dir = os.path.join(td, "tmp")
+
+            calls = []
+
+            def _fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                out_arg = next(
+                    (t for t in cmd if isinstance(t, str) and t.startswith("-o")),
+                    None,
+                )
+                if out_arg and len(calls) == 1:
+                    out_dir = out_arg[2:]
+                    self._write_minimal_tar(os.path.join(out_dir, "inner.tar"))
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            with (
+                mock.patch.object(self.m, "safe_subprocess_run", side_effect=_fake_run),
+                mock.patch.object(self.m, "safe_remove", return_value=False) as rm,
+                mock.patch.object(self.m, "safe_rmtree", return_value=True),
+            ):
+                self.assertFalse(self.m.try_extract(archive_path, None, tmp_dir))
+
+            self.assertEqual(2, len(calls))
+            self.assertEqual(1, rm.call_count)
+
+    def test_try_extract_tarball_stage_requires_single_regular_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "a.tgz")
+            with open(archive_path, "wb") as f:
+                f.write(b"")
+            tmp_dir = os.path.join(td, "tmp")
+
+            def _fake_run_no_output(cmd, **kwargs):
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            with mock.patch.object(
+                self.m, "safe_subprocess_run", side_effect=_fake_run_no_output
+            ) as run:
+                self.assertFalse(self.m.try_extract(archive_path, None, tmp_dir))
+                self.assertEqual(1, run.call_count)
+
+            def _fake_run_multiple(cmd, **kwargs):
+                out_dir = next(
+                    t for t in cmd if isinstance(t, str) and t.startswith("-o")
+                )[2:]
+                with open(os.path.join(out_dir, "a.tar"), "wb") as f1:
+                    f1.write(b"")
+                with open(os.path.join(out_dir, "b.tar"), "wb") as f2:
+                    f2.write(b"")
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            with mock.patch.object(
+                self.m, "safe_subprocess_run", side_effect=_fake_run_multiple
+            ) as run:
+                self.assertFalse(self.m.try_extract(archive_path, None, tmp_dir))
+                self.assertEqual(1, run.call_count)
+
+            def _fake_run_directory(cmd, **kwargs):
+                out_dir = next(
+                    t for t in cmd if isinstance(t, str) and t.startswith("-o")
+                )[2:]
+                os.makedirs(os.path.join(out_dir, "inner"))
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            with mock.patch.object(
+                self.m, "safe_subprocess_run", side_effect=_fake_run_directory
+            ) as run:
+                self.assertFalse(self.m.try_extract(archive_path, None, tmp_dir))
+                self.assertEqual(1, run.call_count)
+
+            def _fake_run_non_tar(cmd, **kwargs):
+                out_dir = next(
+                    t for t in cmd if isinstance(t, str) and t.startswith("-o")
+                )[2:]
+                with open(
+                    os.path.join(out_dir, "inner.txt"), "w", encoding="utf-8"
+                ) as f3:
+                    f3.write("x")
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            with mock.patch.object(
+                self.m, "safe_subprocess_run", side_effect=_fake_run_non_tar
+            ) as run:
+                self.assertFalse(self.m.try_extract(archive_path, None, tmp_dir))
+                self.assertEqual(1, run.call_count)
+
+    def test_try_extract_tarball_stage_rejects_inner_tar_with_bogus_header(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "a.tgz")
+            with open(archive_path, "wb") as f:
+                f.write(b"")
+            tmp_dir = os.path.join(td, "tmp")
+
+            calls = []
+
+            def _fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                out_dir = next(
+                    t for t in cmd if isinstance(t, str) and t.startswith("-o")
+                )[2:]
+                if len(calls) == 1:
+                    with open(os.path.join(out_dir, "inner.tar"), "wb") as f:
+                        f.write(b"X" * 512)
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            with mock.patch.object(
+                self.m, "safe_subprocess_run", side_effect=_fake_run
+            ) as run:
+                ok = self.m.try_extract(archive_path, None, tmp_dir)
+
+            self.assertEqual(1, run.call_count)
+            self.assertFalse(ok)
+
+    def test_try_extract_tarball_stage2_failure_returns_false(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "a.txz")
+            with open(archive_path, "wb") as f:
+                f.write(b"")
+            tmp_dir = os.path.join(td, "tmp")
+
+            calls = []
+
+            def _fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                if len(calls) == 1:
+                    out_dir = next(
+                        t for t in cmd if isinstance(t, str) and t.startswith("-o")
+                    )[2:]
+                    self._write_minimal_tar(os.path.join(out_dir, "inner.tar"))
+                    return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+                return SimpleNamespace(returncode=2, stdout=b"", stderr=b"boom")
+
+            with mock.patch.object(
+                self.m, "safe_subprocess_run", side_effect=_fake_run
+            ):
+                self.assertFalse(self.m.try_extract(archive_path, None, tmp_dir))
+            self.assertEqual(2, len(calls))
+
+    def test_try_extract_tarball_cleanup_failure_returns_false(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "a.tbz2")
+            with open(archive_path, "wb") as f:
+                f.write(b"")
+            tmp_dir = os.path.join(td, "tmp")
+
+            calls = []
+
+            def _fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                if len(calls) == 1:
+                    out_dir = next(
+                        t for t in cmd if isinstance(t, str) and t.startswith("-o")
+                    )[2:]
+                    self._write_minimal_tar(os.path.join(out_dir, "inner.tar"))
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            with (
+                mock.patch.object(self.m, "safe_subprocess_run", side_effect=_fake_run),
+                mock.patch.object(self.m, "safe_rmtree", return_value=False),
+            ):
+                self.assertFalse(self.m.try_extract(archive_path, None, tmp_dir))
+            self.assertEqual(2, len(calls))
+
+    def test_try_extract_tarball_cleanup_does_not_delete_payload_named_like_stage(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "a.tar.xz")
+            with open(archive_path, "wb") as f:
+                f.write(b"")
+            tmp_dir = os.path.join(td, "tmp")
+            os.makedirs(tmp_dir)
+
+            fixed_uuid = SimpleNamespace(hex="fixed")
+            stage_basename = (
+                os.path.basename(tmp_dir) + ".tarball_stage." + fixed_uuid.hex
+            )
+            collision_dir = os.path.join(tmp_dir, stage_basename)
+            os.makedirs(collision_dir)
+
+            calls = []
+
+            def _fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                if len(calls) == 1:
+                    out_dir = next(
+                        t for t in cmd if isinstance(t, str) and t.startswith("-o")
+                    )[2:]
+                    self._write_minimal_tar(os.path.join(out_dir, "inner.tar"))
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            with (
+                mock.patch.object(self.m, "safe_subprocess_run", side_effect=_fake_run),
+                mock.patch.object(self.m.uuid, "uuid4", return_value=fixed_uuid),
+            ):
+                ok = self.m.try_extract(archive_path, None, tmp_dir)
+
+            self.assertTrue(ok)
+            self.assertTrue(os.path.isdir(collision_dir))
+            self.assertEqual(2, len(calls))
 
 
 class TestZipEncodingHelpers(unittest.TestCase):

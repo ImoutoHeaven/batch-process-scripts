@@ -1,6 +1,6 @@
 # advDecompress
 
-一个跨平台（Windows 10 / Debian 12 等）高级批量解压脚本，支持递归扫描目录、自动识别并处理多种归档格式（7z / RAR / ZIP / 自解压 EXE 等），同时提供多线程、传统 ZIP 编码修复、RAR CLI 优先、灵活的解压策略、全局锁等丰富功能，方便在大规模文件清理、备份整理、资源归档等场景下使用。
+一个跨平台（Windows 10 / Debian 12 等）高级批量解压脚本，支持递归扫描目录、自动识别并处理多种归档格式（7z / RAR / ZIP / TAR / 自解压 EXE 等），同时提供多线程、传统 ZIP 编码修复、RAR CLI 优先、灵活的解压策略、全局锁等丰富功能，方便在大规模文件清理、备份整理、资源归档等场景下使用。
 
 > **许可：** 本项目采用 MIT 许可证。
 
@@ -9,6 +9,7 @@
 ## 功能特色
 
 * **格式丰富**：内建 7-Zip（须自行安装）作为主解压引擎，可选调用 RAR CLI 处理 RAR/SFX。
+* **TAR 系列**：支持 `.tar` / `.tar.gz` / `.tgz` / `.tar.bz2` / `.tbz2` / `.tar.xz` / `.txz`；tarball 会在一次运行中解到最终内容（不会在输出目录留下中间 `.tar`）。
 * **递归扫描**：可按深度范围过滤子目录，自动判断单卷 / 多卷、SFX、传统编码 ZIP 等复杂情况。
 * **灵活策略**：内置 10+ 种解压策略，可根据文件数量、目录深度等自动选择输出结构。
 * **传统 ZIP 支持**：自动/手动转码（Shift-JIS、GBK…），尽量解决乱码问题。
@@ -71,7 +72,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `--fail-to`, `-ft` | `-fp move` 时的目标目录 | - |
 | `-n`, `--dry-run` | 预览模式，不真正解压 | 关闭 |
 | `-v`, `--verbose` | 详细日志 | 关闭 |
-| `--skip-7z` / `--skip-rar` / `--skip-zip` / `--skip-exe` | 跳过对应单卷格式 | - |
+| `--skip-7z` / `--skip-rar` / `--skip-zip` / `--skip-exe` / `--skip-tar` | 跳过对应单卷格式 | - |
 | `--skip-7z-multi` / `--skip-rar-multi` / `--skip-zip-multi` / `--skip-exe-multi` | 跳过对应多卷格式 | - |
 | `--no-lock` | 禁用全局锁（多实例慎用） | 关闭 |
 | `--lock-timeout` | 获取锁最大重试次数 | 30 |
