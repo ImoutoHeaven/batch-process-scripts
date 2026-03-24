@@ -9,3 +9,4 @@ __pycache__/
 .worktrees/
 docs/plans
 docs/superpowers/
+advArchiver/dist/

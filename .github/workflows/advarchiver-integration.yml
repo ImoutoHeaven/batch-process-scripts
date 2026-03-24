@@ -1,0 +1,41 @@
+name: advArchiver Integration
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  real-cli-guardrails:
+    runs-on: self-hosted
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Verify required archive binaries
+        run: |
+          python3 - <<'PY'
+          import shutil
+          import sys
+
+          required = ["7z", "rar", "tar", "parpar", "gzip", "xz", "bzip2"]
+          missing = [name for name in required if shutil.which(name) is None]
+          if missing:
+              sys.exit("Missing required binaries: " + ", ".join(missing))
+          PY
+
+      - name: Smoke test maintained entrypoint help
+        run: python3 advArchiver/advArchiver.py --help
+
+      - name: Build generated single-file entrypoint
+        run: python3 advArchiver/scripts/build_single_file.py
+
+      - name: Run build contract and real-binary guardrails
+        run: python3 -m unittest advArchiver.tests.test_build_single_file advArchiver.tests.test_real_cli_guardrails -v
+
+      - name: Smoke test generated entrypoint help
+        run: python3 advArchiver/dist/advArchiver.py --help
