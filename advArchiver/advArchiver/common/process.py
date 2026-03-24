@@ -12,13 +12,13 @@ class MissingToolError(RuntimeError):
 
 
 TAR_FORMAT_TOOLING = {
-    "tar": ("tar",),
-    "tar.gz": ("tar", "gzip"),
-    "tgz": ("tar", "gzip"),
-    "tar.xz": ("tar", "xz"),
-    "txz": ("tar", "xz"),
-    "tar.bz2": ("tar", "bzip2"),
-    "tbz2": ("tar", "bzip2"),
+    "tar": ("7z",),
+    "tar.gz": ("7z",),
+    "tgz": ("7z",),
+    "tar.xz": ("7z",),
+    "txz": ("7z",),
+    "tar.bz2": ("7z",),
+    "tbz2": ("7z",),
 }
 
 

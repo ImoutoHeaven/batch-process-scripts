@@ -34,9 +34,9 @@
 
 - `python3 -m unittest advArchiver.tests.test_build_single_file advArchiver.tests.test_real_cli_guardrails -v` runs the blocking build-contract and real-binary guardrail suites.
 - The suite exercises the maintained CLI surface via `python3 advArchiver/advArchiver.py {7z,rar,zip,tar} ...` rather than calling the shared engine directly.
-- The suite covers real archive creation for `7z`, `rar`, `zip`, and `tar`, output suffix and location checks, `7z` split recovery staying external-only, TAR alias suffix preservation, and `--no-rec` versus default recovery behavior.
+- The suite covers real archive creation for `7z`, `rar`, `zip`, and `tar`, output suffix and location checks, `7z` split recovery staying external-only, tar-family archive creation uses `7z`, tar directory inputs archive contents like `zip` and `7z`, TAR alias suffix preservation, and `--no-rec` versus default recovery behavior.
 - Local runs skip the binary-dependent assertions when a required tool is unavailable.
-- `.github/workflows/advarchiver-integration.yml` is the blocking CI lane that provisions a self-hosted runner, verifies the required binaries and tar compression helpers (`gzip`, `xz`, `bzip2`) are present, smoke-tests `advArchiver/advArchiver.py --help`, runs `advArchiver/scripts/build_single_file.py`, and executes `advArchiver.tests.test_build_single_file` plus `advArchiver.tests.test_real_cli_guardrails`.
+- `.github/workflows/advarchiver-integration.yml` is the blocking CI lane that provisions a self-hosted runner, verifies the required binaries (`7z`, `rar`, `parpar`) are present, smoke-tests `advArchiver/advArchiver.py --help`, runs `advArchiver/scripts/build_single_file.py`, and executes `advArchiver.tests.test_build_single_file` plus `advArchiver.tests.test_real_cli_guardrails`; tar helper binaries are no longer required maintained dependencies.
 
 ## Backend Summary
 
@@ -60,6 +60,8 @@
 - Uses `--format` instead of `--profile`.
 - Supported formats: `tar`, `tar.gz`, `tgz`, `tar.xz`, `txz`, `tar.bz2`, `tbz2`.
 - No password or split-volume support. Recovery is external `parpar` only.
+- Tar-family archive creation uses `7z`; tar helper binaries are no longer required maintained dependencies.
+- Directory inputs archive contents like `zip` and `7z` instead of preserving the top-level folder inside tar-family archives.
 
 ## Compatibility Inventory
 

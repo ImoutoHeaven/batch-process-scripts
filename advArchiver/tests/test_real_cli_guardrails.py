@@ -16,14 +16,22 @@ WORKFLOW_PATH = WORKTREE_ROOT / ".github" / "workflows" / "advarchiver-integrati
 REQUIRED_GUARDRAIL_CASES = {
     "test_7z_real_archive_creation",
     "test_7z_out_root_preserves_legacy_placement",
+    "test_assert_tar_directory_members_are_contents_only_rejects_top_level_input_folder",
+    "test_compressed_tar_family_suffix_matrix_matches_maintained_aliases",
     "test_rar_real_archive_creation",
     "test_zip_real_archive_creation",
+    "test_tar_directory_input_archives_contents_only",
     "test_tar_real_archive_creation",
+    "test_tgz_real_archive_creation_is_readable_as_tar_family",
     "test_output_suffix_and_location_checks",
     "test_7z_split_recovery_external_only",
     "test_tar_alias_suffixes_preserved",
     "test_no_rec_vs_default_recovery_behavior",
 }
+
+
+def tar_backend_module():
+    return importlib.import_module("advArchiver.advArchiver.backends.tar")
 
 
 def require_tools_or_skip(testcase, *tool_names):
@@ -33,10 +41,32 @@ def require_tools_or_skip(testcase, *tool_names):
 
 
 def require_tar_format_or_skip(testcase, format_name):
-    module = importlib.import_module("advArchiver.advArchiver.backends.tar")
+    module = tar_backend_module()
     backend = module.TarBackend()
     required = backend.required_tools_for_format(format_name)
     require_tools_or_skip(testcase, *required)
+
+
+def compressed_tar_family_suffixes():
+    module = tar_backend_module()
+    return {
+        format_name: suffix
+        for format_name, suffix in module.FORMAT_TO_SUFFIX.items()
+        if format_name != "tar"
+    }
+
+
+def assert_tar_directory_members_are_contents_only(
+    testcase, member_names, top_level_name
+):
+    normalized_names = [name.rstrip("/") for name in member_names]
+    testcase.assertTrue(
+        all(
+            name != top_level_name and not name.startswith(f"{top_level_name}/")
+            for name in normalized_names
+        ),
+        msg=f"unexpected top-level tar members: {normalized_names}",
+    )
 
 
 def write_source_file(root, rel_path, content):
@@ -93,6 +123,54 @@ def run_cli_once(testcase, backend_name, source_file, out_dir, **options):
 
 
 class TestRealCliGuardrails(unittest.TestCase):
+    def _assert_real_tar_family_archive(self, format_name, suffix):
+        require_tar_format_or_skip(self, format_name)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "source"
+            source_file = write_source_file(source_root, "movie.txt", "payload")
+            out_dir = root / "out"
+
+            run_cli_once(
+                self,
+                "tar",
+                source_file,
+                out_dir,
+                format=format_name,
+                no_rec=True,
+            )
+
+            archive_path = out_dir / f"movie{suffix}"
+            self.assertTrue(archive_path.exists())
+            self.assertTrue(archive_path.name.endswith(suffix))
+            with tarfile.open(archive_path, "r:*") as handle:
+                self.assertEqual(handle.getnames(), ["movie.txt"])
+
+    def test_compressed_tar_family_suffix_matrix_matches_maintained_aliases(self):
+        self.assertEqual(
+            compressed_tar_family_suffixes(),
+            {
+                "tar.gz": ".tar.gz",
+                "tgz": ".tgz",
+                "tar.xz": ".tar.xz",
+                "txz": ".txz",
+                "tar.bz2": ".tar.bz2",
+                "tbz2": ".tbz2",
+            },
+        )
+
+    def test_assert_tar_directory_members_are_contents_only_rejects_top_level_input_folder(
+        self,
+    ):
+        for member_names in (["foo", "nested/file.txt"], ["foo/nested/file.txt"]):
+            with self.subTest(member_names=member_names):
+                with self.assertRaises(AssertionError):
+                    assert_tar_directory_members_are_contents_only(
+                        self,
+                        member_names,
+                        top_level_name="foo",
+                    )
+
     def test_guardrails_cover_required_real_binary_cases(self):
         declared_cases = {
             name
@@ -102,7 +180,7 @@ class TestRealCliGuardrails(unittest.TestCase):
             not in {
                 "test_blocking_workflow_runs_build_and_guardrails",
                 "test_guardrails_cover_required_real_binary_cases",
-                "test_tar_guardrail_skips_without_required_binaries",
+                "test_tar_guardrail_skips_without_7z",
             }
         }
         self.assertTrue(REQUIRED_GUARDRAIL_CASES.issubset(declared_cases))
@@ -111,17 +189,22 @@ class TestRealCliGuardrails(unittest.TestCase):
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertIn("real-cli-guardrails", workflow)
         self.assertIn("self-hosted", workflow)
-        self.assertIn("gzip", workflow)
-        self.assertIn("xz", workflow)
-        self.assertIn("bzip2", workflow)
+        self.assertIn('required = ["7z", "rar", "parpar"]', workflow)
+        self.assertNotIn('"tar"', workflow)
+        self.assertNotIn('"gzip"', workflow)
+        self.assertNotIn('"xz"', workflow)
+        self.assertNotIn('"bzip2"', workflow)
         self.assertIn("advArchiver/scripts/build_single_file.py", workflow)
         self.assertIn("advArchiver.tests.test_build_single_file", workflow)
         self.assertIn("advArchiver.tests.test_real_cli_guardrails", workflow)
         self.assertIn("advArchiver/advArchiver.py --help", workflow)
 
-    def test_tar_guardrail_skips_without_required_binaries(self):
+    def test_tar_guardrail_skips_without_7z(self):
         with self.assertRaises(unittest.SkipTest):
-            with mock.patch("shutil.which", return_value=None):
+            with mock.patch(
+                "shutil.which",
+                side_effect=lambda name: None if name == "7z" else f"/bin/{name}",
+            ):
                 require_tar_format_or_skip(self, "tar.gz")
 
     def test_7z_real_archive_creation(self):
@@ -206,6 +289,37 @@ class TestRealCliGuardrails(unittest.TestCase):
             with tarfile.open(archive_path, "r") as handle:
                 self.assertEqual(handle.getnames(), ["movie.txt"])
 
+    def test_tar_directory_input_archives_contents_only(self):
+        require_tar_format_or_skip(self, "tar")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "source"
+            nested = source_root / "foo" / "nested"
+            write_source_file(nested, "file.txt", "payload")
+            out_dir = root / "out"
+
+            run_cli_once(
+                self,
+                "tar",
+                source_root / "foo",
+                out_dir,
+                format="tar",
+                no_rec=True,
+            )
+
+            with tarfile.open(out_dir / "foo.tar", "r") as handle:
+                members = handle.getmembers()
+
+            member_names = [member.name for member in members]
+            file_names = [member.name for member in members if member.isfile()]
+
+            assert_tar_directory_members_are_contents_only(
+                self,
+                member_names,
+                top_level_name="foo",
+            )
+            self.assertEqual(file_names, ["nested/file.txt"])
+
     def test_output_suffix_and_location_checks(self):
         requirements = {
             "7z": (".7z", {"no_rec": True, "profile": "best"}, ("7z",)),
@@ -214,7 +328,7 @@ class TestRealCliGuardrails(unittest.TestCase):
             "tar": (
                 ".tar.gz",
                 {"format": "tar.gz", "no_rec": True},
-                ("tar", "gzip"),
+                ("7z",),
             ),
         }
         for backend_name, (suffix, options, tools) in requirements.items():
@@ -291,8 +405,13 @@ class TestRealCliGuardrails(unittest.TestCase):
                     with tarfile.open(archive_path, "r:*") as handle:
                         self.assertEqual(handle.getnames(), ["sample.txt"])
 
+    def test_tgz_real_archive_creation_is_readable_as_tar_family(self):
+        for format_name, suffix in compressed_tar_family_suffixes().items():
+            with self.subTest(format=format_name):
+                self._assert_real_tar_family_archive(format_name, suffix)
+
     def test_no_rec_vs_default_recovery_behavior(self):
-        require_tools_or_skip(self, "tar", "parpar")
+        require_tools_or_skip(self, "7z", "parpar")
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             source_root = root / "source"

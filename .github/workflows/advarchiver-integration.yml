@@ -22,7 +22,7 @@ jobs:
           import shutil
           import sys
 
-          required = ["7z", "rar", "tar", "parpar", "gzip", "xz", "bzip2"]
+          required = ["7z", "rar", "parpar"]
           missing = [name for name in required if shutil.which(name) is None]
           if missing:
               sys.exit("Missing required binaries: " + ", ".join(missing))

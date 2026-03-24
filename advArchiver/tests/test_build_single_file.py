@@ -43,3 +43,13 @@ class TestBuildSingleFile(unittest.TestCase):
         self.assertIn("advArchiver/scripts/build_single_file.py", content)
         self.assertIn("advArchiver/tests/test_real_cli_guardrails.py", content)
         self.assertIn(".github/workflows/advarchiver-integration.yml", content)
+        self.assertIn("tar-family archive creation uses `7z`", content)
+        self.assertIn(
+            "tar helper binaries are no longer required maintained dependencies",
+            content,
+        )
+        self.assertIn(
+            "directory inputs archive contents like `zip` and `7z`",
+            content,
+        )
+        self.assertNotIn("tar compression helpers", content)

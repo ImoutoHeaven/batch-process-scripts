@@ -24,14 +24,14 @@ FORMAT_TO_SUFFIX = {
     "tar.bz2": ".tar.bz2",
     "tbz2": ".tbz2",
 }
-FORMAT_TO_CREATE_FLAG = {
-    "tar": "-cf",
-    "tar.gz": "-czf",
-    "tgz": "-czf",
-    "tar.xz": "-cJf",
-    "txz": "-cJf",
-    "tar.bz2": "-cjf",
-    "tbz2": "-cjf",
+FORMAT_TO_7Z_TYPE = {
+    "tar": None,
+    "tar.gz": "-tgzip",
+    "tgz": "-tgzip",
+    "tar.xz": "-txz",
+    "txz": "-txz",
+    "tar.bz2": "-tbzip2",
+    "tbz2": "-tbzip2",
 }
 
 
@@ -51,26 +51,24 @@ def _job_output_stem(job):
     return os.path.basename(job.rel_path.rstrip("/\\"))
 
 
-def _archive_source_parts(job):
-    normalized_path = job.item_path.rstrip("/\\")
-    parent_dir = os.path.dirname(normalized_path)
-    item_name = os.path.basename(normalized_path)
-    return parent_dir, item_name
+def _archive_source_path(job):
+    if job.item_type == "folder":
+        return os.path.join(job.item_path, "*")
+    return job.item_path
 
 
-def build_command(job, args):
+def build_command_plan(job, args):
     format_name = validate_format(getattr(args, "format", None))
-    archive_path = os.path.join(job.tmp_dir, output_name("temp_archive", format_name))
-    parent_dir, item_name = _archive_source_parts(job)
-    return [
-        "tar",
-        FORMAT_TO_CREATE_FLAG[format_name],
-        archive_path,
-        "-C",
-        parent_dir,
-        "--",
-        item_name,
-    ]
+    temp_tar = os.path.join(job.tmp_dir, "temp_archive.tar")
+    source_path = _archive_source_path(job)
+    plan = [["7z", "a", "-ttar", temp_tar, source_path]]
+
+    compression_type = FORMAT_TO_7Z_TYPE[format_name]
+    if compression_type is not None:
+        final_temp = os.path.join(job.tmp_dir, output_name("temp_archive", format_name))
+        plan.append(["7z", "a", compression_type, final_temp, temp_tar])
+
+    return plan
 
 
 def find_and_rename_tar_file(
@@ -151,24 +149,27 @@ class TarBackend(BackendBase):
 
     def execute_job(self, job, args):
         format_name = validate_format(getattr(args, "format", None))
-        command = build_command(job, args)
-        command_string = process.format_command(command)
+        command_plan = build_command_plan(job, args)
+        preview = " && ".join(
+            process.format_command(command) for command in command_plan
+        )
         if getattr(args, "dry_run", False):
             return models.BackendExecutionResult(
-                archive_result=models.ArchiveExecutionResult(command=command_string)
+                archive_result=models.ArchiveExecutionResult(command=preview)
             )
 
-        result = process.run_command(command, debug=getattr(args, "debug", False))
-        if result.returncode != 0:
-            return models.BackendExecutionResult(
-                archive_result=models.ArchiveExecutionResult(
-                    error_code=result.returncode,
-                    error_msg=(
-                        result.stderr or result.stdout or "tar command failed"
-                    ).strip(),
-                    command=command_string,
+        for command in command_plan:
+            result = process.run_command(command, debug=getattr(args, "debug", False))
+            if result.returncode != 0:
+                return models.BackendExecutionResult(
+                    archive_result=models.ArchiveExecutionResult(
+                        error_code=result.returncode,
+                        error_msg=(
+                            result.stderr or result.stdout or "tar command failed"
+                        ).strip(),
+                        command=process.format_command(command),
+                    )
                 )
-            )
 
         renamed, archive_files = find_and_rename_tar_file(
             "temp_archive",
@@ -181,14 +182,14 @@ class TarBackend(BackendBase):
             return models.BackendExecutionResult(
                 archive_result=models.ArchiveExecutionResult(
                     error_msg="failed to locate and rename tar output artifact",
-                    command=command_string,
+                    command=preview,
                 )
             )
 
         return models.BackendExecutionResult(
             archive_result=models.ArchiveExecutionResult(
                 archive_files=archive_files,
-                command=command_string,
+                command=preview,
             )
         )
 
