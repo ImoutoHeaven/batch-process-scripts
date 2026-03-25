@@ -66,7 +66,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `-des`, `--detect-elf-sfx` | 启用 ELF SFX 检测（Linux），默认关闭以减少扫描开销 | 关闭 |
 | `-t`, `--threads` | 并行解压线程数 | 1 |
 | `-dp`, `--decompress-policy` | 解压策略（下节详述） | `2-collect` |
-| `-sp`, `--success-policy` | 解压成功后：`delete` / `asis` / `move` | `asis` |
+| `-sp`, `--success-policy` | 解压成功后：`delete` / `asis` / `move`（默认事务模式下在单个事务成功落位/完成 finalize 后执行） | `asis` |
 | `--success-to`, `-st` | `-sp move` 时的目标目录 | - |
 | `-fp`, `--fail-policy` | 解压失败后：`asis` / `move` | `asis` |
 | `--fail-to`, `-ft` | `-fp move` 时的目标目录 | - |
@@ -76,7 +76,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `--skip-7z-multi` / `--skip-rar-multi` / `--skip-zip-multi` / `--skip-exe-multi` | 跳过对应多卷格式 | - |
 | `--no-lock` | 禁用全局锁（多实例慎用） | 关闭 |
 | `--lock-timeout` | 获取锁最大重试次数 | 30 |
-| `--legacy` | 使用旧版非事务化流程（不启用 journal / 恢复） | 关闭 |
+| `--legacy` | 切回旧版非事务化流程（默认是事务化流程，启用 journal / 恢复） | 关闭 |
 | `--degrade-cross-volume` | 允许跨卷降级 copy+delete（降低原子性） | 关闭 |
 | `--conflict-mode` | 事务化落位冲突策略：`fail` / `suffix` | `fail` |
 | `--keep-journal-days` | DONE 事务 journal 保留天数 | 7 |
@@ -91,6 +91,14 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 
 > 事务模式下的工作目录统一放在输出根目录的 `.advdecompress_work/` 下（不再在每个子输出目录生成）。
 > 默认无论成功或失败都会清理该目录；如需保留以便恢复或排查，可用 `-scj false` 或 `-fcj false` 关闭清理。
+
+## 事务模式说明（默认）
+
+* 默认使用事务化流程；`--legacy` 才会切回旧版非事务化流程。
+* 单个事务一旦成功落位并完成 finalize，就会立刻执行该事务自己的成功后处理（例如 `-sp delete` / `-sp move`）；不是 extract 成功后立刻处理源归档，也不再等待整批归档都提取完成。
+* 同一 `output_dir` 的事务仍通过 `output_dir.lock` 串行落位；多线程下先完成提取的事务可能先落位，因此同目录内的命名/冲突处理顺序可能不同于扫描顺序。
+* 多线程只保留受 orchestration window / `--threads` 约束的在途提取任务，不会先把整批归档都提取完再统一落位。
+* 因此磁盘峰值主要受并发度与同目录串行点影响，不再随着整批归档数量线性累积。
 
 ## 解压策略详解（`-dp/--decompress-policy`）
 

@@ -35,6 +35,7 @@ from typing import List, Dict, Optional, Union, Tuple
 import stat
 import hashlib
 from collections import Counter
+from queue import SimpleQueue
 
 # Global verbose flag
 VERBOSE = False
@@ -5527,79 +5528,174 @@ def _place_and_finalize_txn(txn, *, args, recovery=False):
         raise
 
 
-def _run_transactional(processor, archives, *, args):
-    output_base = _output_base_from_args(args)
-    _recover_all_outputs(output_base, args=args)
-
-    results = []
-    if args.threads == 1:
-        for a in archives:
-            results.append(
-                _extract_phase(processor, a, args=args, output_base=output_base)
-            )
-    else:
-        reset_interrupt_flag()
-        with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            futures = {
-                executor.submit(
-                    _extract_phase, processor, a, args=args, output_base=output_base
-                ): a
-                for a in archives
-            }
-            for future in as_completed(futures):
-                check_interrupt()
-                results.append(future.result())
-
-    txns = []
-    clean_output_dirs = set()
-    for r in results:
-        if not r:
-            continue
-        if r.get("kind") == "txn":
-            txn = r["txn"]
-            clean_output_dirs.add(txn.get("output_dir"))
-            if txn.get("state") == TXN_STATE_EXTRACTED:
-                txns.append(txn)
-        elif r.get("kind") == "skipped":
-            processor.skipped_archives.append(r["archive_path"])
-        elif r.get("kind") == "dry_run":
-            processor.skipped_archives.append(r["archive_path"])
-        elif r.get("kind") in ("failed", "txn_failed"):
-            processor.failed_archives.append(
-                r.get("archive_path") or r.get("txn", {}).get("archive_path")
-            )
-            if r.get("kind") == "txn_failed":
-                clean_output_dirs.add(r.get("txn", {}).get("output_dir"))
-
-    groups = {}
-    for txn in txns:
-        groups.setdefault(txn["output_dir"], []).append(txn)
-
-    for output_dir, group in groups.items():
-        group.sort(key=lambda t: t.get("archive_path", ""))
-        work_root = _work_root(output_dir, output_base)
-        lock_path = os.path.join(work_root, "locks", "output_dir.lock")
-        lock = FileLock(
-            lock_path,
-            timeout_ms=args.output_lock_timeout_ms,
-            retry_ms=args.output_lock_retry_ms,
-            debug=VERBOSE,
-        )
+def _finalize_one_txn(txn, *, processor, args, output_base):
+    output_dir = txn["output_dir"]
+    work_root = _work_root(output_dir, output_base)
+    lock_path = os.path.join(work_root, "locks", "output_dir.lock")
+    lock = FileLock(
+        lock_path,
+        timeout_ms=args.output_lock_timeout_ms,
+        retry_ms=args.output_lock_retry_ms,
+        debug=VERBOSE,
+    )
+    try:
         with lock:
-            for txn in group:
+            _place_and_finalize_txn(txn, args=args)
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        print(f"Error placing {txn.get('archive_path')}: {e}")
+        processor.failed_archives.append(txn.get("archive_path"))
+        return False
+
+    processor.successful_archives.append(txn["archive_path"])
+    return True
+
+
+def _handle_transactional_result(
+    result, *, processor, args, output_base, touched_output_dirs
+):
+    if not result:
+        return
+
+    kind = result.get("kind")
+    if kind == "txn":
+        txn = result["txn"]
+        output_dir = txn.get("output_dir")
+        if output_dir:
+            touched_output_dirs.add(output_dir)
+        _finalize_one_txn(txn, processor=processor, args=args, output_base=output_base)
+        return
+
+    if kind in ("skipped", "dry_run"):
+        processor.skipped_archives.append(result["archive_path"])
+        return
+
+    if kind in ("failed", "txn_failed"):
+        txn = result.get("txn") or {}
+        output_dir = txn.get("output_dir")
+        if output_dir:
+            touched_output_dirs.add(output_dir)
+        processor.failed_archives.append(
+            result.get("archive_path") or txn.get("archive_path")
+        )
+
+
+def _cleanup_one_transactional_output_dir(
+    output_dir, *, output_base, args, should_clean
+):
+    work_root = _work_root(output_dir, output_base)
+    lock_path = os.path.join(work_root, "locks", "output_dir.lock")
+    lock = FileLock(
+        lock_path,
+        timeout_ms=args.output_lock_timeout_ms,
+        retry_ms=args.output_lock_retry_ms,
+        debug=VERBOSE,
+    )
+    try:
+        with lock:
+            try:
+                _garbage_collect(
+                    output_dir,
+                    output_base=output_base,
+                    keep_journal_days=args.keep_journal_days,
+                )
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(f"  Warning: Could not garbage collect {output_dir}: {e}")
+
+            if should_clean:
                 try:
-                    _place_and_finalize_txn(txn, args=args)
-                    processor.successful_archives.append(txn["archive_path"])
+                    safe_rmtree(work_root, VERBOSE)
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
-                    print(f"Error placing {txn.get('archive_path')}: {e}")
-                    processor.failed_archives.append(txn.get("archive_path"))
-            _garbage_collect(
-                output_dir,
+                    print(f"  Warning: Could not clean journal dir {work_root}: {e}")
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        print(f"  Warning: Could not acquire cleanup lock for {output_dir}: {e}")
+
+
+def _run_transactional(processor, archives, *, args):
+    output_base = _output_base_from_args(args)
+    current_run_touched_output_dirs = set()
+    _recover_all_outputs(output_base, args=args)
+
+    if args.threads == 1:
+        for a in archives:
+            result = _extract_phase(processor, a, args=args, output_base=output_base)
+            _handle_transactional_result(
+                result,
+                processor=processor,
+                args=args,
                 output_base=output_base,
-                keep_journal_days=args.keep_journal_days,
+                touched_output_dirs=current_run_touched_output_dirs,
             )
+    else:
+        reset_interrupt_flag()
+        executor = ThreadPoolExecutor(max_workers=args.threads)
+        futures = {}
+        archive_iter = iter(archives)
+        completed_futures = SimpleQueue()
+
+        def submit_next():
+            check_interrupt()
+            try:
+                archive = next(archive_iter)
+            except StopIteration:
+                return False
+
+            future = executor.submit(
+                _extract_phase, processor, archive, args=args, output_base=output_base
+            )
+            futures[future] = archive
+            future.add_done_callback(completed_futures.put)
+            return True
+
+        shutdown_wait = True
+        try:
+            for _ in range(args.threads):
+                if not submit_next():
+                    break
+
+            while futures:
+                future = completed_futures.get()
+                if future not in futures:
+                    continue
+                futures.pop(future, None)
+                check_interrupt()
+                result = future.result()
+                _handle_transactional_result(
+                    result,
+                    processor=processor,
+                    args=args,
+                    output_base=output_base,
+                    touched_output_dirs=current_run_touched_output_dirs,
+                )
+                submit_next()
+        except KeyboardInterrupt:
+            set_interrupt_flag()
+            shutdown_wait = False
+            for future in list(futures):
+                if not future.done():
+                    future.cancel()
+            raise
+        except Exception as e:
+            if "KeyboardInterrupt" in str(e) or "Interrupt requested" in str(e):
+                set_interrupt_flag()
+                shutdown_wait = False
+                for future in list(futures):
+                    if not future.done():
+                        future.cancel()
+                raise KeyboardInterrupt("Worker thread interrupted")
+            raise
+        finally:
+            try:
+                executor.shutdown(wait=shutdown_wait)
+            except Exception:
+                pass
 
     should_clean = False
     if processor.failed_archives:
@@ -5607,34 +5703,26 @@ def _run_transactional(processor, archives, *, args):
     else:
         should_clean = getattr(args, "success_clean_journal", False)
 
+    for output_dir in sorted(current_run_touched_output_dirs):
+        if not output_dir:
+            continue
+        _cleanup_one_transactional_output_dir(
+            output_dir,
+            output_base=output_base,
+            args=args,
+            should_clean=should_clean,
+        )
+
     if should_clean:
-        for output_dir in clean_output_dirs:
-            if not output_dir:
-                continue
-            work_root = _work_root(output_dir, output_base)
-            lock_path = os.path.join(work_root, "locks", "output_dir.lock")
-            lock = FileLock(
-                lock_path,
-                timeout_ms=args.output_lock_timeout_ms,
-                retry_ms=args.output_lock_retry_ms,
-                debug=VERBOSE,
-            )
-            try:
-                with lock:
-                    pass
-                safe_rmtree(work_root, VERBOSE)
-            except Exception as e:
-                print(f"  Warning: Could not clean journal dir {work_root}: {e}")
-        if clean_output_dirs:
-            work_base = _work_base(output_base)
-            try:
-                safe_rmtree(os.path.join(work_base, "outputs"), VERBOSE)
-            except Exception:
-                pass
-            try:
-                safe_rmtree(work_base, VERBOSE)
-            except Exception:
-                pass
+        work_base = _work_base(output_base)
+        try:
+            safe_rmdir(os.path.join(work_base, "outputs"), VERBOSE)
+        except Exception:
+            pass
+        try:
+            safe_rmdir(work_base, VERBOSE)
+        except Exception:
+            pass
 
 
 # ==================== End Transactional Mode ====================

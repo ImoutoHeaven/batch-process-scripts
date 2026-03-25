@@ -3,7 +3,9 @@ import os
 import tempfile
 import unittest
 import importlib.util
+import threading
 import types
+from concurrent.futures import Future, as_completed as futures_as_completed
 from multiprocessing import Process, Pipe
 from types import SimpleNamespace
 from unittest import mock
@@ -19,6 +21,16 @@ def _load_advdecompress_module():
     spec.loader.exec_module(module)
     module.VERBOSE = False
     return module
+
+
+class HashedFuture(Future):
+    def __init__(self, name, forced_hash):
+        super().__init__()
+        self.name = name
+        self._forced_hash = forced_hash
+
+    def __hash__(self):
+        return self._forced_hash
 
 
 class TestTxnPrimitives(unittest.TestCase):
@@ -60,6 +72,100 @@ class TestTxnPrimitives(unittest.TestCase):
         }
         args.update(overrides)
         return SimpleNamespace(**args)
+
+    def _make_txn_result(self, archive_path, *, output_dir, output_base):
+        name = os.path.basename(archive_path)
+        return {
+            "kind": "txn",
+            "txn": {
+                "archive_path": archive_path,
+                "output_dir": output_dir,
+                "state": self.m.TXN_STATE_EXTRACTED,
+                "txn_id": name.replace(".", "_"),
+                "paths": {"work_root": os.path.join(output_base, "work", name)},
+            },
+        }
+
+    def _make_txn(self, archive_path, *, output_dir, output_base, work_root=None):
+        txn = self._make_txn_result(
+            archive_path,
+            output_dir=output_dir,
+            output_base=output_base,
+        )["txn"]
+        if work_root is not None:
+            txn["paths"]["work_root"] = work_root
+        return txn
+
+    def _make_async_executor_class(
+        self, *, submitted=None, future_hashes=None, event_log=None, tracker=None
+    ):
+        submitted = submitted if submitted is not None else []
+        future_hashes = future_hashes or {}
+
+        class FakeExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+                self._threads = []
+                self._slots = threading.Semaphore(max_workers)
+
+            def submit(self, fn, processor, archive_path, *, args, output_base):
+                name = os.path.basename(archive_path)
+                submitted.append(name)
+                if event_log is not None:
+                    event_log.append(f"submit:{name}")
+                if tracker is not None:
+                    tracker["outstanding"] += 1
+                    tracker["max_outstanding"] = max(
+                        tracker["max_outstanding"], tracker["outstanding"]
+                    )
+                future = HashedFuture(
+                    name, future_hashes.get(name, 1000 + len(submitted))
+                )
+
+                def runner():
+                    self._slots.acquire()
+                    try:
+                        result = fn(
+                            processor, archive_path, args=args, output_base=output_base
+                        )
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                    else:
+                        future.set_result(result)
+                    finally:
+                        if tracker is not None:
+                            tracker["outstanding"] -= 1
+                        self._slots.release()
+
+                thread = threading.Thread(target=runner, name=f"fake-extract-{name}")
+                thread.start()
+                self._threads.append(thread)
+                return future
+
+            def shutdown(self, wait=True):
+                if not wait:
+                    return None
+                for thread in self._threads:
+                    thread.join(timeout=5)
+                return None
+
+        return FakeExecutor
+
+    def _pick_done_future_reorder_hashes(self):
+        for hash_b in range(32):
+            for hash_c in range(32):
+                if hash_b == hash_c:
+                    continue
+                future_b = HashedFuture("b.zip", hash_b)
+                future_c = HashedFuture("c.zip", hash_c)
+                future_b.set_result("b")
+                future_c.set_result("c")
+                order = [
+                    future.name for future in futures_as_completed([future_b, future_c])
+                ]
+                if order == ["c.zip", "b.zip"]:
+                    return {"b.zip": hash_b, "c.zip": hash_c}
+        self.fail("Could not reproduce done-future reordering")
 
     def test_atomic_write_json(self):
         with tempfile.TemporaryDirectory() as td:
@@ -231,6 +337,1031 @@ class TestTxnPrimitives(unittest.TestCase):
             with open(txn["paths"]["txn_json"], "r", encoding="utf-8") as f:
                 saved = json.load(f)
             self.assertNotEqual(saved["state"], self.m.TXN_STATE_DONE)
+
+    def test_run_transactional_streams_finalize_in_single_thread(self):
+        events = []
+
+        def fake_extract(processor, archive_path, *, args, output_base):
+            name = os.path.basename(archive_path)
+            events.append(f"extract:{name}")
+            return {
+                "kind": "txn",
+                "txn": {
+                    "archive_path": archive_path,
+                    "output_dir": os.path.join(output_base, "out"),
+                    "state": self.m.TXN_STATE_EXTRACTED,
+                    "txn_id": name.replace(".", "_"),
+                    "paths": {"work_root": os.path.join(output_base, "work")},
+                },
+            }
+
+        def fake_finalize(txn, *, args, recovery=False):
+            events.append(f"finalize:{os.path.basename(txn['archive_path'])}")
+
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                threads=1,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+                conflict_mode="fail",
+            )
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            archives = [os.path.join(td, "a.zip"), os.path.join(td, "b.zip")]
+
+            with (
+                mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
+                mock.patch.object(
+                    self.m, "_place_and_finalize_txn", side_effect=fake_finalize
+                ),
+                mock.patch.object(self.m, "_recover_all_outputs"),
+                mock.patch.object(self.m, "_garbage_collect"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+            ):
+                self.m._run_transactional(processor, archives, args=args)
+
+        self.assertLess(events.index("finalize:a.zip"), events.index("extract:b.zip"))
+        self.assertEqual(archives, processor.successful_archives)
+
+    def test_run_transactional_bounds_inflight_extracts_and_streams_finalize(self):
+        events = []
+        submitted = []
+        tracker = {"outstanding": 0, "max_outstanding": 0}
+        allow_b_finish = threading.Event()
+        b_started = threading.Event()
+
+        FakeExecutor = self._make_async_executor_class(
+            submitted=submitted,
+            event_log=events,
+            tracker=tracker,
+        )
+
+        def fake_extract(processor, archive_path, *, args, output_base):
+            name = os.path.basename(archive_path)
+            events.append(f"extract-start:{name}")
+            if name == "b.zip":
+                b_started.set()
+                self.assertTrue(allow_b_finish.wait(timeout=1))
+            events.append(f"extract-end:{name}")
+            return self._make_txn_result(
+                archive_path,
+                output_dir=os.path.join(output_base, name.replace(".zip", "")),
+                output_base=output_base,
+            )
+
+        def fake_finalize(txn, *, processor, args, output_base):
+            name = os.path.basename(txn["archive_path"])
+            events.append(f"finalize:{name}")
+            processor.successful_archives.append(txn["archive_path"])
+            if name == "a.zip":
+                self.assertTrue(b_started.wait(timeout=1))
+                allow_b_finish.set()
+
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                threads=2,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+                conflict_mode="fail",
+            )
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            archives = [
+                os.path.join(td, "a.zip"),
+                os.path.join(td, "b.zip"),
+                os.path.join(td, "c.zip"),
+            ]
+
+            with (
+                mock.patch.object(self.m, "ThreadPoolExecutor", FakeExecutor),
+                mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
+                mock.patch.object(
+                    self.m, "_finalize_one_txn", side_effect=fake_finalize
+                ),
+                mock.patch.object(self.m, "_recover_all_outputs"),
+                mock.patch.object(self.m, "_garbage_collect"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+            ):
+                self.m._run_transactional(processor, archives, args=args)
+
+        self.assertEqual(["a.zip", "b.zip", "c.zip"], submitted)
+        self.assertLess(events.index("finalize:a.zip"), events.index("submit:c.zip"))
+        self.assertLess(
+            events.index("finalize:a.zip"), events.index("extract-end:b.zip")
+        )
+        self.assertLessEqual(tracker["max_outstanding"], args.threads)
+        self.assertCountEqual(archives, processor.successful_archives)
+
+    def test_run_transactional_same_output_finalize_order_follows_extract_completion(
+        self,
+    ):
+        events = []
+        b_extract_done = threading.Event()
+
+        class CallbackReadyFuture(Future):
+            def __init__(self):
+                super().__init__()
+                self.callback_registered = threading.Event()
+
+            def add_done_callback(self, fn):
+                result = super().add_done_callback(fn)
+                self.callback_registered.set()
+                return result
+
+        class FakeExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+                self._threads = []
+                self._slots = threading.Semaphore(max_workers)
+
+            def submit(self, fn, processor, archive_path, *, args, output_base):
+                name = os.path.basename(archive_path)
+                events.append(f"submit:{name}")
+                future = CallbackReadyFuture()
+
+                def runner():
+                    self._slots.acquire()
+                    try:
+                        if not future.callback_registered.wait(timeout=1):
+                            raise AssertionError(
+                                f"callback not registered for {name} before execution"
+                            )
+                        result = fn(
+                            processor, archive_path, args=args, output_base=output_base
+                        )
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                    else:
+                        future.set_result(result)
+                    finally:
+                        self._slots.release()
+
+                thread = threading.Thread(target=runner, name=f"same-output-{name}")
+                thread.start()
+                self._threads.append(thread)
+                return future
+
+            def shutdown(self, wait=True):
+                if not wait:
+                    return None
+                for thread in self._threads:
+                    thread.join(timeout=5)
+                return None
+
+        def fake_extract(processor, archive_path, *, args, output_base):
+            name = os.path.basename(archive_path)
+            events.append(f"extract-start:{name}")
+            if name == "a.zip":
+                self.assertTrue(b_extract_done.wait(timeout=1))
+            events.append(f"extract-end:{name}")
+            if name == "b.zip":
+                b_extract_done.set()
+
+            return self._make_txn_result(
+                archive_path,
+                output_dir=os.path.join(output_base, "shared-out"),
+                output_base=output_base,
+            )
+
+        def fake_finalize(txn, *, processor, args, output_base):
+            name = os.path.basename(txn["archive_path"])
+            events.append(f"finalize:{name}")
+            processor.successful_archives.append(txn["archive_path"])
+
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                threads=3,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+                conflict_mode="fail",
+            )
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            archives = [
+                os.path.join(td, "a.zip"),
+                os.path.join(td, "b.zip"),
+            ]
+
+            with (
+                mock.patch.object(self.m, "ThreadPoolExecutor", FakeExecutor),
+                mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
+                mock.patch.object(self.m, "_recover_all_outputs"),
+                mock.patch.object(self.m, "_garbage_collect"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m, "_finalize_one_txn", side_effect=fake_finalize
+                ),
+            ):
+                self.m._run_transactional(processor, archives, args=args)
+
+        self.assertEqual(
+            ["extract-end:b.zip", "extract-end:a.zip"],
+            [event for event in events if event.startswith("extract-end:")],
+        )
+        self.assertLess(
+            events.index("extract-end:b.zip"), events.index("finalize:b.zip")
+        )
+        self.assertEqual(
+            ["finalize:b.zip", "finalize:a.zip"],
+            [event for event in events if event.startswith("finalize:")],
+        )
+        self.assertEqual(
+            ["b.zip", "a.zip"],
+            [os.path.basename(path) for path in processor.successful_archives],
+        )
+
+    def test_run_transactional_serializes_finalize_per_output_dir(self):
+        active = 0
+        max_active = 0
+        start_gate = threading.Barrier(2)
+
+        def fake_finalize(txn, *, args, recovery=False):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                threading.Event().wait(0.05)
+            finally:
+                active -= 1
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=5,
+            )
+            output_base = args.output
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            output_dir = os.path.join(output_base, "shared")
+            txns = [
+                self._make_txn(
+                    os.path.join(td, name),
+                    output_dir=output_dir,
+                    output_base=output_base,
+                )
+                for name in ("a.zip", "b.zip")
+            ]
+
+            def run_finalize(txn):
+                start_gate.wait(timeout=1)
+                self.m._finalize_one_txn(
+                    txn,
+                    processor=processor,
+                    args=args,
+                    output_base=output_base,
+                )
+
+            with mock.patch.object(
+                self.m, "_place_and_finalize_txn", side_effect=fake_finalize
+            ):
+                threads = [
+                    threading.Thread(target=run_finalize, args=(txn,)) for txn in txns
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5)
+
+        self.assertEqual(1, max_active)
+        self.assertCountEqual(
+            [os.path.join(td, "a.zip"), os.path.join(td, "b.zip")],
+            processor.successful_archives,
+        )
+        self.assertEqual([], processor.failed_archives)
+
+    def test_finalize_one_txn_uses_existing_output_dir_lock_path(self):
+        acquired = []
+        finalized = []
+
+        class FakeLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                acquired.append(path)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+            )
+            output_base = args.output
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            output_dir = os.path.join(output_base, "target")
+            archive_path = os.path.join(td, "a.zip")
+            txn = self._make_txn(
+                archive_path,
+                output_dir=output_dir,
+                output_base=output_base,
+                work_root=os.path.join(td, "wrong-work-root"),
+            )
+            expected_lock_path = os.path.join(
+                self.m._work_root(output_dir, output_base),
+                "locks",
+                "output_dir.lock",
+            )
+
+            with (
+                mock.patch.object(self.m, "FileLock", FakeLock),
+                mock.patch.object(
+                    self.m,
+                    "_place_and_finalize_txn",
+                    side_effect=lambda txn, *, args, recovery=False: finalized.append(
+                        txn["archive_path"]
+                    ),
+                ),
+            ):
+                self.m._finalize_one_txn(
+                    txn,
+                    processor=processor,
+                    args=args,
+                    output_base=output_base,
+                )
+
+        self.assertEqual([expected_lock_path], acquired)
+        self.assertEqual([archive_path], finalized)
+        self.assertEqual([archive_path], processor.successful_archives)
+        self.assertEqual([], processor.failed_archives)
+
+    def test_run_transactional_finalize_failure_does_not_block_later_txns(self):
+        def fake_finalize(txn, *, args, recovery=False):
+            if os.path.basename(txn["archive_path"]) == "fail.zip":
+                raise RuntimeError("boom")
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+            )
+            output_base = args.output
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            touched_output_dirs = set()
+            failing_archive = os.path.join(td, "fail.zip")
+            succeeding_archive = os.path.join(td, "ok.zip")
+
+            with mock.patch.object(
+                self.m, "_place_and_finalize_txn", side_effect=fake_finalize
+            ):
+                self.m._handle_transactional_result(
+                    {
+                        "kind": "txn",
+                        "txn": self._make_txn(
+                            failing_archive,
+                            output_dir=os.path.join(output_base, "fail-out"),
+                            output_base=output_base,
+                        ),
+                    },
+                    processor=processor,
+                    args=args,
+                    output_base=output_base,
+                    touched_output_dirs=touched_output_dirs,
+                )
+                self.m._handle_transactional_result(
+                    {
+                        "kind": "txn",
+                        "txn": self._make_txn(
+                            succeeding_archive,
+                            output_dir=os.path.join(output_base, "ok-out"),
+                            output_base=output_base,
+                        ),
+                    },
+                    processor=processor,
+                    args=args,
+                    output_base=output_base,
+                    touched_output_dirs=touched_output_dirs,
+                )
+
+        self.assertEqual([failing_archive], processor.failed_archives)
+        self.assertEqual([succeeding_archive], processor.successful_archives)
+        self.assertEqual(
+            {
+                os.path.join(output_base, "fail-out"),
+                os.path.join(output_base, "ok-out"),
+            },
+            touched_output_dirs,
+        )
+
+    def test_finalize_one_txn_lock_timeout_is_recorded_per_txn(self):
+        acquired = []
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+            )
+            output_base = args.output
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            touched_output_dirs = set()
+            timeout_output_dir = os.path.join(output_base, "timeout-out")
+            success_output_dir = os.path.join(output_base, "ok-out")
+            timeout_archive = os.path.join(td, "timeout.zip")
+            success_archive = os.path.join(td, "ok.zip")
+            expected_lock_path = os.path.join(
+                self.m._work_root(timeout_output_dir, output_base),
+                "locks",
+                "output_dir.lock",
+            )
+
+            class FakeLock:
+                def __init__(self, path, timeout_ms, retry_ms, debug):
+                    self.path = path
+                    acquired.append(path)
+
+                def __enter__(self):
+                    if self.path == expected_lock_path:
+                        raise TimeoutError(f"Could not acquire lock: {self.path}")
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            with (
+                mock.patch.object(self.m, "FileLock", FakeLock),
+                mock.patch.object(self.m, "_place_and_finalize_txn", return_value=None),
+            ):
+                self.m._handle_transactional_result(
+                    {
+                        "kind": "txn",
+                        "txn": self._make_txn(
+                            timeout_archive,
+                            output_dir=timeout_output_dir,
+                            output_base=output_base,
+                        ),
+                    },
+                    processor=processor,
+                    args=args,
+                    output_base=output_base,
+                    touched_output_dirs=touched_output_dirs,
+                )
+                self.m._handle_transactional_result(
+                    {
+                        "kind": "txn",
+                        "txn": self._make_txn(
+                            success_archive,
+                            output_dir=success_output_dir,
+                            output_base=output_base,
+                        ),
+                    },
+                    processor=processor,
+                    args=args,
+                    output_base=output_base,
+                    touched_output_dirs=touched_output_dirs,
+                )
+
+        self.assertEqual(expected_lock_path, acquired[0])
+        self.assertEqual([timeout_archive], processor.failed_archives)
+        self.assertEqual([success_archive], processor.successful_archives)
+        self.assertEqual(
+            {timeout_output_dir, success_output_dir},
+            touched_output_dirs,
+        )
+
+    def test_run_transactional_recovers_existing_txns_before_new_work(self):
+        events = []
+
+        def fake_place_and_finalize(txn, *, args, recovery=False):
+            label = "recover" if recovery else "finalize"
+            events.append(f"{label}:{os.path.basename(txn['archive_path'])}")
+
+        def fake_extract(processor, archive_path, *, args, output_base):
+            events.append(f"extract:{os.path.basename(archive_path)}")
+            return {"kind": "dry_run", "archive_path": archive_path}
+
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                threads=1,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+                conflict_mode="fail",
+            )
+            output_base = args.output
+            output_dir = os.path.join(output_base, "recovered-out")
+            stale_archive = os.path.join(td, "stale.zip")
+            txn = self.m._txn_create(
+                archive_path=stale_archive,
+                volumes=[],
+                output_dir=output_dir,
+                output_base=output_base,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self.m._txn_snapshot(txn)
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            archives = [os.path.join(td, "new.zip")]
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_place_and_finalize_txn",
+                    side_effect=fake_place_and_finalize,
+                ),
+                mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
+                mock.patch.object(self.m, "_garbage_collect"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+            ):
+                self.m._run_transactional(processor, archives, args=args)
+
+        self.assertEqual(
+            ["recover:stale.zip", "extract:new.zip"],
+            [
+                event
+                for event in events
+                if event.startswith("recover:") or event.startswith("extract:")
+            ],
+        )
+
+    def test_run_transactional_preserves_recovery_only_failed_work_root(self):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                threads=1,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
+                success_clean_journal=True,
+                fail_clean_journal=False,
+                conflict_mode="fail",
+            )
+            output_base = args.output
+            output_dir = os.path.join(output_base, "stale-failed-out")
+            txn = self.m._txn_create(
+                archive_path=os.path.join(td, "stale-failed.zip"),
+                volumes=[],
+                output_dir=output_dir,
+                output_base=output_base,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "PLACE_FAILED",
+                "message": "stale failure",
+                "at": self.m._now_iso(),
+            }
+            self.m._txn_snapshot(txn)
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            work_root = self.m._work_root(output_dir, output_base)
+
+            with mock.patch.object(self.m, "FileLock", DummyLock):
+                self.m._run_transactional(processor, [], args=args)
+
+            self.assertTrue(os.path.isdir(work_root))
+            with open(txn["paths"]["txn_json"], "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertEqual(self.m.TXN_STATE_FAILED, saved["state"])
+
+    def test_run_transactional_preserves_recovery_failed_work_root(self):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def fake_place_and_finalize(txn, *, args, recovery=False):
+            if recovery:
+                raise RuntimeError("boom during recovery")
+            self.fail("unexpected non-recovery finalize")
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                threads=1,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
+                success_clean_journal=True,
+                fail_clean_journal=False,
+                conflict_mode="fail",
+            )
+            output_base = args.output
+            output_dir = os.path.join(output_base, "recovery-failed-out")
+            txn = self.m._txn_create(
+                archive_path=os.path.join(td, "recover-me.zip"),
+                volumes=[],
+                output_dir=output_dir,
+                output_base=output_base,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self.m._txn_snapshot(txn)
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            work_root = self.m._work_root(output_dir, output_base)
+
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_place_and_finalize_txn",
+                    side_effect=fake_place_and_finalize,
+                ),
+            ):
+                self.m._run_transactional(processor, [], args=args)
+
+            self.assertTrue(os.path.isdir(work_root))
+            with open(txn["paths"]["txn_json"], "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertEqual(self.m.TXN_STATE_FAILED, saved["state"])
+            self.assertEqual("RECOVER_FAILED", saved["error"]["type"])
+
+    def test_run_transactional_preserves_recovery_only_failed_work_root_when_cleaning_current_run_outputs(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                threads=1,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
+                success_clean_journal=True,
+                fail_clean_journal=False,
+                conflict_mode="fail",
+            )
+            output_base = args.output
+            recovery_output_dir = os.path.join(output_base, "stale-failed-out")
+            recovery_txn = self.m._txn_create(
+                archive_path=os.path.join(td, "stale-failed.zip"),
+                volumes=[],
+                output_dir=recovery_output_dir,
+                output_base=output_base,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            recovery_txn["state"] = self.m.TXN_STATE_FAILED
+            recovery_txn["error"] = {
+                "type": "PLACE_FAILED",
+                "message": "stale failure",
+                "at": self.m._now_iso(),
+            }
+            self.m._txn_snapshot(recovery_txn)
+
+            current_archive = os.path.join(td, "new.zip")
+            current_output_dir = os.path.join(output_base, "new-out")
+
+            def fake_extract(processor, archive_path, *, args, output_base):
+                return {
+                    "kind": "txn",
+                    "txn": self._make_txn(
+                        archive_path,
+                        output_dir=current_output_dir,
+                        output_base=output_base,
+                    ),
+                }
+
+            def fake_finalize_one_txn(txn, *, processor, args, output_base):
+                processor.successful_archives.append(txn["archive_path"])
+                return True
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            recovery_work_root = self.m._work_root(recovery_output_dir, output_base)
+
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
+                mock.patch.object(
+                    self.m,
+                    "_finalize_one_txn",
+                    side_effect=fake_finalize_one_txn,
+                ),
+            ):
+                self.m._run_transactional(processor, [current_archive], args=args)
+
+            self.assertEqual([current_archive], processor.successful_archives)
+            self.assertTrue(os.path.isdir(recovery_work_root))
+            with open(recovery_txn["paths"]["txn_json"], "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertEqual(self.m.TXN_STATE_FAILED, saved["state"])
+
+    def test_run_transactional_garbage_collects_touched_output_dirs_under_lock(self):
+        gc_calls = []
+        work_root_cleanup_calls = []
+        active_locks = set()
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                threads=1,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
+                success_clean_journal=False,
+                fail_clean_journal=True,
+                conflict_mode="fail",
+            )
+            output_base = args.output
+            success_archive = os.path.join(td, "ok.zip")
+            failed_archive = os.path.join(td, "fail.zip")
+            success_output_dir = os.path.join(output_base, "ok-out")
+            failed_output_dir = os.path.join(output_base, "fail-out")
+            expected_lock_paths = {
+                success_output_dir: os.path.join(
+                    self.m._work_root(success_output_dir, output_base),
+                    "locks",
+                    "output_dir.lock",
+                ),
+                failed_output_dir: os.path.join(
+                    self.m._work_root(failed_output_dir, output_base),
+                    "locks",
+                    "output_dir.lock",
+                ),
+            }
+            work_root_to_output_dir = {
+                self.m._work_root(success_output_dir, output_base): success_output_dir,
+                self.m._work_root(failed_output_dir, output_base): failed_output_dir,
+            }
+
+            def fake_extract(processor, archive_path, *, args, output_base):
+                name = os.path.basename(archive_path)
+                if name == "ok.zip":
+                    return {
+                        "kind": "txn",
+                        "txn": self._make_txn(
+                            archive_path,
+                            output_dir=success_output_dir,
+                            output_base=output_base,
+                        ),
+                    }
+                if name == "fail.zip":
+                    return {
+                        "kind": "txn_failed",
+                        "archive_path": archive_path,
+                        "txn": self._make_txn(
+                            archive_path,
+                            output_dir=failed_output_dir,
+                            output_base=output_base,
+                        ),
+                    }
+                self.fail(f"unexpected archive: {archive_path}")
+
+            def fake_finalize_one_txn(txn, *, processor, args, output_base):
+                processor.successful_archives.append(txn["archive_path"])
+                return True
+
+            class FakeLock:
+                def __init__(self, path, timeout_ms, retry_ms, debug):
+                    self.path = path
+
+                def __enter__(self):
+                    active_locks.add(self.path)
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    active_locks.remove(self.path)
+                    return False
+
+            def fake_garbage_collect(output_dir, *, output_base, keep_journal_days):
+                gc_calls.append((output_dir, set(active_locks)))
+
+            def fake_rmtree(path, debug=False):
+                output_dir = work_root_to_output_dir.get(path)
+                if output_dir is not None:
+                    work_root_cleanup_calls.append((path, set(active_locks)))
+                return True
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            archives = [success_archive, failed_archive]
+
+            with (
+                mock.patch.object(self.m, "_recover_all_outputs"),
+                mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
+                mock.patch.object(
+                    self.m, "_finalize_one_txn", side_effect=fake_finalize_one_txn
+                ),
+                mock.patch.object(
+                    self.m, "_garbage_collect", side_effect=fake_garbage_collect
+                ),
+                mock.patch.object(self.m, "safe_rmtree", side_effect=fake_rmtree),
+                mock.patch.object(self.m, "FileLock", FakeLock),
+            ):
+                self.m._run_transactional(processor, archives, args=args)
+
+        self.assertEqual([success_archive], processor.successful_archives)
+        self.assertEqual([failed_archive], processor.failed_archives)
+        self.assertCountEqual(
+            [
+                (success_output_dir, {expected_lock_paths[success_output_dir]}),
+                (failed_output_dir, {expected_lock_paths[failed_output_dir]}),
+            ],
+            gc_calls,
+        )
+        self.assertCountEqual(
+            [
+                (
+                    self.m._work_root(success_output_dir, output_base),
+                    {expected_lock_paths[success_output_dir]},
+                ),
+                (
+                    self.m._work_root(failed_output_dir, output_base),
+                    {expected_lock_paths[failed_output_dir]},
+                ),
+            ],
+            work_root_cleanup_calls,
+        )
+
+    def test_run_transactional_cleanup_lock_timeout_stays_best_effort(self):
+        gc_calls = []
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                threads=1,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+                conflict_mode="fail",
+            )
+            output_base = args.output
+            timeout_archive = os.path.join(td, "timeout.zip")
+            success_archive = os.path.join(td, "ok.zip")
+            timeout_output_dir = os.path.join(output_base, "a-timeout-out")
+            success_output_dir = os.path.join(output_base, "z-ok-out")
+            timeout_lock_path = os.path.join(
+                self.m._work_root(timeout_output_dir, output_base),
+                "locks",
+                "output_dir.lock",
+            )
+
+            def fake_extract(processor, archive_path, *, args, output_base):
+                if archive_path == timeout_archive:
+                    return {
+                        "kind": "txn",
+                        "txn": self._make_txn(
+                            archive_path,
+                            output_dir=timeout_output_dir,
+                            output_base=output_base,
+                        ),
+                    }
+                if archive_path == success_archive:
+                    return {
+                        "kind": "txn",
+                        "txn": self._make_txn(
+                            archive_path,
+                            output_dir=success_output_dir,
+                            output_base=output_base,
+                        ),
+                    }
+                self.fail(f"unexpected archive: {archive_path}")
+
+            class FakeLock:
+                def __init__(self, path, timeout_ms, retry_ms, debug):
+                    self.path = path
+
+                def __enter__(self):
+                    if self.path == timeout_lock_path:
+                        raise TimeoutError(f"Could not acquire lock: {self.path}")
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            def fake_garbage_collect(output_dir, *, output_base, keep_journal_days):
+                gc_calls.append(output_dir)
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+
+            with (
+                mock.patch.object(self.m, "_recover_all_outputs"),
+                mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
+                mock.patch.object(self.m, "_place_and_finalize_txn", return_value=None),
+                mock.patch.object(
+                    self.m, "_garbage_collect", side_effect=fake_garbage_collect
+                ),
+                mock.patch.object(self.m, "FileLock", FakeLock),
+            ):
+                result = self.m._run_transactional(
+                    processor,
+                    [timeout_archive, success_archive],
+                    args=args,
+                )
+
+        self.assertIsNone(result)
+        self.assertEqual([timeout_archive], processor.failed_archives)
+        self.assertEqual([success_archive], processor.successful_archives)
+        self.assertEqual([success_output_dir], gc_calls)
 
     def test_find_archives_recognizes_single_zip(self):
         with tempfile.TemporaryDirectory() as td:
