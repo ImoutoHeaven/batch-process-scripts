@@ -188,16 +188,18 @@ class TestRealCliGuardrails(unittest.TestCase):
     def test_blocking_workflow_runs_build_and_guardrails(self):
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertIn("real-cli-guardrails", workflow)
-        self.assertIn("self-hosted", workflow)
-        self.assertIn('required = ["7z", "rar", "parpar"]', workflow)
-        self.assertNotIn('"tar"', workflow)
-        self.assertNotIn('"gzip"', workflow)
-        self.assertNotIn('"xz"', workflow)
-        self.assertNotIn('"bzip2"', workflow)
-        self.assertIn("advArchiver/scripts/build_single_file.py", workflow)
-        self.assertIn("advArchiver.tests.test_build_single_file", workflow)
-        self.assertIn("advArchiver.tests.test_real_cli_guardrails", workflow)
-        self.assertIn("advArchiver/advArchiver.py --help", workflow)
+        self.assertIn("ubuntu-22.04", workflow)
+        self.assertNotIn("self-hosted", workflow)
+        self.assertIn("docker build", workflow)
+        self.assertIn("docker run", workflow)
+        self.assertIn("--platform linux/amd64", workflow)
+        self.assertIn("advArchiver/Dockerfile", workflow)
+        self.assertIn("advarchiver-test", workflow)
+        self.assertNotIn("actions/setup-node@v4", workflow)
+        self.assertNotIn("sudo add-apt-repository -y multiverse", workflow)
+        self.assertNotIn("sudo apt-get install -y p7zip-full rar", workflow)
+        self.assertNotIn("npm install -g @animetosho/parpar", workflow)
+        self.assertNotIn('required = ["7z", "rar", "parpar"]', workflow)
 
     def test_tar_guardrail_skips_without_7z(self):
         with self.assertRaises(unittest.SkipTest):

@@ -14,7 +14,9 @@
 - `advArchiver/dist/advArchiver.py`: generated single-file output created by `advArchiver/scripts/build_single_file.py`.
 - `advArchiver/tests/`: parser, backend policy, deprecation, and engine coverage.
 - `advArchiver/tests/test_real_cli_guardrails.py`: real-binary guardrails for archive creation, suffix rules, recovery policy, and maintained workflow drift.
-- `.github/workflows/advarchiver-integration.yml`: blocking self-hosted integration lane for build generation and real-binary guardrails.
+- `.github/workflows/advarchiver-integration.yml`: blocking GitHub-hosted integration lane that builds and runs the shared Docker test image.
+- `advArchiver/Dockerfile`: single Ubuntu 22.04 test image used by both local Docker runs and GitHub Actions.
+- `advArchiver/scripts/run_ci_guardrails.sh`: container entrypoint that verifies required binaries, builds the generated script, and runs the guardrail suites.
 
 ## Maintained CLI Surface
 
@@ -29,6 +31,8 @@
 - Generate the single-file distribution script with `python3 advArchiver/scripts/build_single_file.py`.
 - The builder emits `advArchiver/dist/advArchiver.py`, marks it `AUTO-GENERATED, DO NOT EDIT`, and only packages the maintained modules under `advArchiver/advArchiver/`.
 - `advArchiver/dist/advArchiver.py` is a generated artifact, not the source of truth. Re-run `advArchiver/scripts/build_single_file.py` after source changes instead of editing the dist file by hand.
+- Local and CI guardrails share the same container flow: `docker build --platform linux/amd64 -t advarchiver-test -f advArchiver/Dockerfile .` then `docker run --rm --platform linux/amd64 advarchiver-test`.
+- The Docker test image pins `@animetosho/parpar@0.4.5` and uses the same `linux/amd64` toolchain locally and in GitHub Actions so arm64 hosts can emulate the CI environment instead of relying on host packages.
 
 ## Real-Binary Guardrails
 
@@ -36,7 +40,7 @@
 - The suite exercises the maintained CLI surface via `python3 advArchiver/advArchiver.py {7z,rar,zip,tar} ...` rather than calling the shared engine directly.
 - The suite covers real archive creation for `7z`, `rar`, `zip`, and `tar`, output suffix and location checks, `7z` split recovery staying external-only, tar-family archive creation uses `7z`, tar directory inputs archive contents like `zip` and `7z`, TAR alias suffix preservation, and `--no-rec` versus default recovery behavior.
 - Local runs skip the binary-dependent assertions when a required tool is unavailable.
-- `.github/workflows/advarchiver-integration.yml` is the blocking CI lane that provisions a self-hosted runner, verifies the required binaries (`7z`, `rar`, `parpar`) are present, smoke-tests `advArchiver/advArchiver.py --help`, runs `advArchiver/scripts/build_single_file.py`, and executes `advArchiver.tests.test_build_single_file` plus `advArchiver.tests.test_real_cli_guardrails`; tar helper binaries are no longer required maintained dependencies.
+- `.github/workflows/advarchiver-integration.yml` is the blocking CI lane that runs on `ubuntu-22.04`, builds `advarchiver-test` from `advArchiver/Dockerfile` for `linux/amd64`, and runs that image so GitHub Actions and local Docker use the same pinned toolchain and test entrypoint; tar helper binaries are no longer required maintained dependencies.
 
 ## Backend Summary
 

@@ -6,36 +6,13 @@ on:
 
 jobs:
   real-cli-guardrails:
-    runs-on: self-hosted
+    runs-on: ubuntu-22.04
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: Verify required archive binaries
-        run: |
-          python3 - <<'PY'
-          import shutil
-          import sys
-
-          required = ["7z", "rar", "parpar"]
-          missing = [name for name in required if shutil.which(name) is None]
-          if missing:
-              sys.exit("Missing required binaries: " + ", ".join(missing))
-          PY
-
-      - name: Smoke test maintained entrypoint help
-        run: python3 advArchiver/advArchiver.py --help
-
-      - name: Build generated single-file entrypoint
-        run: python3 advArchiver/scripts/build_single_file.py
+      - name: Build advArchiver test image
+        run: docker build --platform linux/amd64 -t advarchiver-test -f advArchiver/Dockerfile .
 
       - name: Run build contract and real-binary guardrails
-        run: python3 -m unittest advArchiver.tests.test_build_single_file advArchiver.tests.test_real_cli_guardrails -v
-
-      - name: Smoke test generated entrypoint help
-        run: python3 advArchiver/dist/advArchiver.py --help
+        run: docker run --rm --platform linux/amd64 advarchiver-test
