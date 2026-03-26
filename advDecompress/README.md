@@ -66,7 +66,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `-des`, `--detect-elf-sfx` | 启用 ELF SFX 检测（Linux），默认关闭以减少扫描开销 | 关闭 |
 | `-t`, `--threads` | 并行解压线程数 | 1 |
 | `-dp`, `--decompress-policy` | 解压策略（下节详述） | `2-collect` |
-| `-sp`, `--success-policy` | 解压成功后：`delete` / `asis` / `move`（默认事务模式下在单个事务成功落位/完成 finalize 后执行） | `asis` |
+| `-sp`, `--success-policy` | 解压成功后：`delete` / `asis` / `move`（事务模式下 `delete` 会在 durability barrier 成功后才删除源归档） | `asis` |
 | `--success-to`, `-st` | `-sp move` 时的目标目录 | - |
 | `-fp`, `--fail-policy` | 解压失败后：`asis` / `move` | `asis` |
 | `--fail-to`, `-ft` | `-fp move` 时的目标目录 | - |
@@ -79,9 +79,11 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `--legacy` | 切回旧版非事务化流程（默认是事务化流程，启用 journal / 恢复） | 关闭 |
 | `--degrade-cross-volume` | 允许跨卷降级 copy+delete（降低原子性） | 关闭 |
 | `--conflict-mode` | 事务化落位冲突策略：`fail` / `suffix` | `fail` |
-| `--keep-journal-days` | DONE 事务 journal 保留天数 | 7 |
-| `-scj`, `--success-clean-journal` | 若本轮全部成功则删除 `.advdecompress_work`（可用 `-scj false` 关闭） | 开启 |
-| `-fcj`, `--fail-clean-journal` | 若本轮存在失败也删除 `.advdecompress_work`（可用 `-fcj false` 关闭） | 开启 |
+| `--no-durability` | 关闭事务模式的 durability barrier；与 `-sp delete` 不兼容 | 关闭 |
+| `--fsync-files` | durability 策略：`auto` / `none`；`-sp delete` 下必须为 `auto` | `auto` |
+| `--keep-journal-days` | 终态事务 journal 的 GC 保留天数（仍可恢复 / 可重试的记录不会因 TTL 删除） | 7 |
+| `-scj`, `--success-clean-journal` | 数据集进入终态且最终全部成功时删除 `.advdecompress_work`（可用 `-scj false` 关闭） | 开启 |
+| `-fcj`, `--fail-clean-journal` | 数据集进入终态且存在最终失败时删除 `.advdecompress_work`（可用 `-fcj false` 关闭） | 开启 |
 | `-dr`, `--depth-range` | 扫描深度范围，如 `0-2` / `1` | 全深度 |
 | `--fix-ext`, `-fe` | 启用扩展名修复（按文件头识别） | 关闭 |
 | `--safe-fix-ext`, `-sfe` | 启用安全扩展名修复（追加正确扩展名） | 关闭 |
@@ -89,16 +91,23 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 
 ---
 
-> 事务模式下的工作目录统一放在输出根目录的 `.advdecompress_work/` 下（不再在每个子输出目录生成）。
-> 默认无论成功或失败都会清理该目录；如需保留以便恢复或排查，可用 `-scj false` 或 `-fcj false` 关闭清理。
+> 事务模式下的工作目录统一放在输出根目录的 `.advdecompress_work/` 下，其中 `dataset_manifest.json` 用于记录本轮数据集并驱动严格恢复。
+> 默认不会在仍有可恢复 / 可重试状态时清掉该目录；是否删除整个 `.advdecompress_work/` 取决于数据集终态后的 `-scj` / `-fcj`，旧 journal 则按 `--keep-journal-days` 在不影响恢复时回收。
+> 若 `.advdecompress_work/` 已存在但缺少 `dataset_manifest.json`，该状态也视为不兼容且不可恢复，需先删除整个 `.advdecompress_work/` 后再重新开始。
 
 ## 事务模式说明（默认）
 
 * 默认使用事务化流程；`--legacy` 才会切回旧版非事务化流程。
-* 单个事务一旦成功落位并完成 finalize，就会立刻执行该事务自己的成功后处理（例如 `-sp delete` / `-sp move`）；不是 extract 成功后立刻处理源归档，也不再等待整批归档都提取完成。
+* 首次运行会把本轮待处理归档列表、顺序与关键参数写入 `.advdecompress_work/dataset_manifest.json`。
+* 之后恢复遵循**严格数据集恢复**：只继续 manifest 中已有的归档，不会在恢复时重新发现并纳入后来新增的归档；如需把后来新增的归档也纳入处理，请删除 `.advdecompress_work/` 后重新开始新一轮运行。
+* 能直接续跑完成的归档会继续完成，不会重新解压；必须重试的归档只重跑对应单个归档。
+* 若命令指纹不一致，或 manifest 记录的归档缺失、大小变化、时间戳变化等，脚本会拒绝恢复，并明确提示先删除 `.advdecompress_work/` 后再重新开始。
+* 单个事务一旦成功落位并通过 durability barrier，就会立刻执行该事务自己的成功后处理（例如 `-sp delete` / `-sp move`）；不是 extract 成功后立刻处理源归档，也不再等待整批归档都提取完成。
+* `-sp delete` 只有在事务 journal 与已落位输出都通过 durability barrier 后才会删除源归档；因此不能与 `--no-durability` 或 `--fsync-files none` 同用，且 Windows 下的事务模式不支持 `-sp delete`。
 * 同一 `output_dir` 的事务仍通过 `output_dir.lock` 串行落位；多线程下先完成提取的事务可能先落位，因此同目录内的命名/冲突处理顺序可能不同于扫描顺序。
 * 多线程只保留受 orchestration window / `--threads` 约束的在途提取任务，不会先把整批归档都提取完再统一落位。
 * 因此磁盘峰值主要受并发度与同目录串行点影响，不再随着整批归档数量线性累积。
+* `--keep-journal-days` 只会回收已收敛到终态的旧 journal；仍可恢复 / 可重试的记录会保留，避免把恢复现场提前清掉。
 
 ## 解压策略详解（`-dp/--decompress-policy`）
 
@@ -121,8 +130,6 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 >
 > 事务化模式（默认）已支持全部解压策略；`--legacy` 仅用于回退旧版流程。
 >
-> Durability 边界：默认只对 `txn.wal` 与 `txn.json` 做 best-effort `fsync`，不逐文件刷盘输出内容。
-
 ---
 
 ## 扩展名修复功能详解
