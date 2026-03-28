@@ -96,6 +96,7 @@ class TestTxnPrimitives(unittest.TestCase):
             "success_clean_journal": False,
             "fail_clean_journal": False,
             "legacy": False,
+            "unsafe_windows_delete": False,
             "no_lock": False,
             "no_durability": False,
         }
@@ -177,6 +178,12 @@ class TestTxnPrimitives(unittest.TestCase):
         for attr, flag in bool_flags:
             if getattr(args, attr, False):
                 argv.append(flag)
+
+        if getattr(args, "unsafe_windows_delete", False):
+            argv.append("--unsafe-windows-delete")
+
+        if getattr(args, "legacy", False):
+            argv.append("--legacy")
 
         return argv
 
@@ -530,6 +537,50 @@ class TestTxnPrimitives(unittest.TestCase):
             failed_archives=[],
             skipped_archives=[],
         )
+
+    def _assert_windows_unsafe_delete_barrier_failure(
+        self,
+        fixture,
+        *,
+        fsync_file_side_effect,
+        expected_error_text,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        archive_path = os.path.abspath(fixture["archive_path"])
+        archive_id = self.m._dataset_manifest_archive_id(archive_path)
+        fixture["args"].unsafe_windows_delete = True
+
+        with (
+            mock.patch.object(self.m.os, "name", "nt"),
+            mock.patch.object(self.m, "FileLock", DummyLock),
+            mock.patch.object(
+                self.m, "_fsync_file", side_effect=fsync_file_side_effect
+            ),
+            mock.patch.object(self.m, "_fsync_dir", return_value=True),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+        self.assertIn(expected_error_text, str(ctx.exception))
+        self.assertTrue(os.path.exists(archive_path))
+        with open(fixture["txn"]["paths"]["txn_json"], "r", encoding="utf-8") as f:
+            saved_txn = json.load(f)
+        manifest = self.m._load_dataset_manifest(fixture["output_root"])
+        manifest_entry = manifest["archives"][archive_id]
+        self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+        self.assertEqual("DURABILITY_FAILED", saved_txn["error"]["type"])
+        self.assertEqual("recoverable", manifest_entry["state"])
+        self.assertEqual("unknown", manifest_entry["final_disposition"])
+        self.assertIsNone(manifest_entry["finalized_at"])
 
     def _age_txn_journal(self, txn, *, timestamp=1):
         os.utime(txn["paths"]["journal_dir"], (timestamp, timestamp))
@@ -1223,6 +1274,72 @@ class TestTxnPrimitives(unittest.TestCase):
             ):
                 self.assertNotIn(excluded_key, base_fingerprint["fields"])
 
+    def test_make_processing_args_defaults_unsafe_windows_delete_false(self):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(td)
+
+        self.assertFalse(args.unsafe_windows_delete)
+
+    def test_argv_for_main_emits_unsafe_windows_delete_and_legacy_flags(self):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                unsafe_windows_delete=True,
+                legacy=True,
+            )
+
+        argv = self._argv_for_main(args)
+
+        self.assertIn("--unsafe-windows-delete", argv)
+        self.assertIn("--legacy", argv)
+
+    def test_command_fingerprint_tracks_effective_unsafe_windows_delete(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            safe_args = self._make_processing_args(input_root, output=output_root)
+            legacy_flagged_args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                legacy=True,
+                unsafe_windows_delete=True,
+            )
+            non_windows_delete_flagged_args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                unsafe_windows_delete=True,
+            )
+            windows_unsafe_args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                unsafe_windows_delete=True,
+            )
+
+            with mock.patch.object(self.m.os, "name", "nt"):
+                safe_fp = self.m._build_command_fingerprint(safe_args)
+                legacy_flagged_fp = self.m._build_command_fingerprint(
+                    legacy_flagged_args
+                )
+                windows_unsafe_fp = self.m._build_command_fingerprint(
+                    windows_unsafe_args
+                )
+
+            non_windows_delete_fp = self.m._build_command_fingerprint(
+                non_windows_delete_flagged_args
+            )
+
+            self.assertIn("unsafe_windows_delete", safe_fp["fields"])
+            self.assertFalse(safe_fp["fields"]["unsafe_windows_delete"])
+            self.assertFalse(legacy_flagged_fp["fields"]["unsafe_windows_delete"])
+            self.assertTrue(windows_unsafe_fp["fields"]["unsafe_windows_delete"])
+            self.assertFalse(non_windows_delete_fp["fields"]["unsafe_windows_delete"])
+
     def test_resume_rejects_manifest_fingerprint_mismatch(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
@@ -1396,6 +1513,91 @@ class TestTxnPrimitives(unittest.TestCase):
                 self.assertEqual(manifest_before, f.read())
             with open(txn_json_path, "rb") as f:
                 self.assertEqual(txn_before, f.read())
+
+    def test_run_transactional_rejects_fingerprint_mismatch_for_unsafe_windows_delete(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["alpha.zip"],
+            )
+            safe_args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+            )
+            unsafe_args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                unsafe_windows_delete=True,
+            )
+
+            with mock.patch.object(self.m.os, "name", "nt"):
+                baseline_fingerprint = self.m._build_command_fingerprint(unsafe_args)
+
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=baseline_fingerprint,
+            )
+
+            txn = self.m._txn_create(
+                archive_path=discovered[0]["archive_path"],
+                volumes=discovered[0]["volumes"],
+                output_dir=discovered[0]["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self.m._txn_snapshot(txn)
+
+            processor = types.SimpleNamespace(
+                successful_archives=[],
+                failed_archives=[],
+                skipped_archives=[],
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(
+                    self.m,
+                    "_recover_all_outputs",
+                    side_effect=AssertionError(
+                        "recovery should not start before strict unsafe_windows_delete resume validation"
+                    ),
+                ),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "extract should not start before strict unsafe_windows_delete resume validation"
+                    ),
+                ),
+            ):
+                result = self.m._run_transactional(
+                    processor,
+                    [discovered[0]["archive_path"]],
+                    args=safe_args,
+                )
+
+            self.assertFalse(result)
+            self.assertIn("command fingerprint", stdout.getvalue().lower())
+            self.assertEqual([], processor.successful_archives)
+            self.assertEqual([], processor.failed_archives)
+            self.assertEqual([], processor.skipped_archives)
 
     def test_resume_rejects_legacy_workdir_without_manifest(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3930,6 +4132,238 @@ class TestTxnPrimitives(unittest.TestCase):
             fix_archive_ext.assert_not_called()
             processor.find_archives.assert_not_called()
 
+    def test_help_describes_windows_delete_gate_and_legacy_exemption(self):
+        stdout = io.StringIO()
+
+        with (
+            contextlib.redirect_stdout(stdout),
+            mock.patch.object(self.m.sys, "argv", ["advDecompress.py", "--help"]),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            self.m.main()
+
+        self.assertEqual(0, ctx.exception.code)
+        help_text = " ".join(stdout.getvalue().split())
+        help_text = help_text.replace(
+            "--unsafe- windows-delete", "--unsafe-windows-delete"
+        )
+        self.assertIn("--unsafe-windows-delete", help_text)
+        self.assertIn(
+            "Windows transactional -sp delete requires --unsafe-windows-delete",
+            help_text,
+        )
+        self.assertIn(
+            "Legacy -sp delete does not require --unsafe-windows-delete",
+            help_text,
+        )
+        self.assertIn(
+            "best-effort payload directory durability before source deletion on Windows",
+            help_text,
+        )
+
+    def test_main_rejects_windows_transactional_delete_without_unsafe_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m.sys, "argv", self._argv_for_main(args)),
+                mock.patch.object(
+                    self.m,
+                    "safe_subprocess_run",
+                    return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+                ),
+                mock.patch.object(self.m, "ArchiveProcessor") as archive_processor_ctor,
+                mock.patch.object(self.m, "fix_archive_ext") as fix_archive_ext,
+            ):
+                exit_code = self.m.main()
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("--unsafe-windows-delete", stdout.getvalue())
+            archive_processor_ctor.assert_not_called()
+            fix_archive_ext.assert_not_called()
+
+    def test_main_allows_windows_transactional_delete_with_unsafe_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                unsafe_windows_delete=True,
+            )
+            processor = types.SimpleNamespace(
+                find_archives=mock.Mock(return_value=[]),
+                successful_archives=[],
+                failed_archives=[],
+                skipped_archives=[],
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m.sys, "argv", self._argv_for_main(args)),
+                mock.patch.object(
+                    self.m,
+                    "safe_subprocess_run",
+                    return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+                ),
+                mock.patch.object(
+                    self.m, "ArchiveProcessor", return_value=processor
+                ) as archive_processor_ctor,
+                mock.patch.object(self.m, "fix_archive_ext") as fix_archive_ext,
+            ):
+                exit_code = self.m.main()
+
+            self.assertEqual(0, exit_code)
+            self.assertNotIn("--unsafe-windows-delete is required", stdout.getvalue())
+            archive_processor_ctor.assert_called_once()
+            fix_archive_ext.assert_called_once()
+            processor.find_archives.assert_called_once_with(os.path.abspath(input_root))
+
+    def test_main_allows_windows_legacy_delete_without_unsafe_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                legacy=True,
+            )
+            processor = types.SimpleNamespace(
+                find_archives=mock.Mock(return_value=[]),
+                successful_archives=[],
+                failed_archives=[],
+                skipped_archives=[],
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m.sys, "argv", self._argv_for_main(args)),
+                mock.patch.object(
+                    self.m,
+                    "safe_subprocess_run",
+                    return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+                ),
+                mock.patch.object(
+                    self.m, "ArchiveProcessor", return_value=processor
+                ) as archive_processor_ctor,
+                mock.patch.object(self.m, "fix_archive_ext") as fix_archive_ext,
+            ):
+                exit_code = self.m.main()
+
+            self.assertEqual(0, exit_code)
+            self.assertNotIn("--unsafe-windows-delete is required", stdout.getvalue())
+            archive_processor_ctor.assert_called_once()
+            fix_archive_ext.assert_called_once()
+            processor.find_archives.assert_called_once_with(os.path.abspath(input_root))
+
+    def test_validate_delete_durability_args_rejects_no_durability_before_windows_unsafe_gate(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                success_policy="delete",
+                no_durability=True,
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+            ):
+                result = self.m._validate_delete_durability_args(args)
+
+            self.assertFalse(result)
+            self.assertIn("--no-durability", stdout.getvalue())
+            self.assertNotIn("--unsafe-windows-delete", stdout.getvalue())
+
+    def test_validate_delete_durability_args_allows_legacy_delete_with_no_durability_on_windows(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                success_policy="delete",
+                legacy=True,
+                no_durability=True,
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+            ):
+                result = self.m._validate_delete_durability_args(args)
+
+            self.assertTrue(result)
+            self.assertEqual("", stdout.getvalue())
+
+    def test_validate_delete_durability_args_rejects_fsync_files_none_before_windows_unsafe_gate(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                success_policy="delete",
+                fsync_files="none",
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+            ):
+                result = self.m._validate_delete_durability_args(args)
+
+            self.assertFalse(result)
+            self.assertIn("--fsync-files none", stdout.getvalue())
+            self.assertNotIn("--unsafe-windows-delete", stdout.getvalue())
+
+    def test_validate_delete_durability_args_allows_legacy_delete_with_fsync_files_none_on_windows(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                success_policy="delete",
+                legacy=True,
+                fsync_files="none",
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+            ):
+                result = self.m._validate_delete_durability_args(args)
+
+            self.assertTrue(result)
+            self.assertEqual("", stdout.getvalue())
+
     def test_main_dry_run_with_fix_ext_does_not_rename_inputs(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
@@ -4043,6 +4477,116 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual("recoverable", manifest_entry["state"])
             self.assertEqual("unknown", manifest_entry["final_disposition"])
             self.assertIsNone(manifest_entry["finalized_at"])
+
+    def test_windows_unsafe_delete_still_attempts_payload_directory_fsync(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_delete_barrier_txn_fixture(td)
+            fixture["args"].unsafe_windows_delete = True
+            expected_payload_dirs = [
+                os.path.abspath(path) for path in fixture["expected_payload_dirs"]
+            ]
+            fsynced_dirs = []
+
+            class DummyLock:
+                def __init__(self, path, timeout_ms, retry_ms, debug):
+                    self.path = path
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            def fail_payload_dir_fsync(path, debug=False):
+                fsynced_dirs.append(os.path.abspath(path))
+                return False
+
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "same_volume", return_value=True),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(
+                    self.m, "_fsync_dir", side_effect=fail_payload_dir_fsync
+                ),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            for path in expected_payload_dirs:
+                self.assertIn(path, fsynced_dirs)
+
+    def test_windows_unsafe_delete_tolerates_payload_directory_fsync_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_delete_barrier_txn_fixture(td)
+            fixture["args"].unsafe_windows_delete = True
+
+            class DummyLock:
+                def __init__(self, path, timeout_ms, retry_ms, debug):
+                    self.path = path
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "same_volume", return_value=True),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=False),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            manifest_entry = manifest["archives"][
+                self.m._dataset_manifest_archive_id(fixture["archive_path"])
+            ]
+            self.assertFalse(os.path.exists(os.path.abspath(fixture["archive_path"])))
+            self.assertEqual("succeeded", manifest_entry["state"])
+
+    def test_windows_unsafe_delete_keeps_wal_fsync_failure_blocking(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_delete_barrier_txn_fixture(td)
+            wal_path = os.path.abspath(fixture["txn"]["paths"]["wal"])
+
+            def fail_on_wal_fsync(path, debug=False):
+                return os.path.abspath(path) != wal_path
+
+            self._assert_windows_unsafe_delete_barrier_failure(
+                fixture,
+                fsync_file_side_effect=fail_on_wal_fsync,
+                expected_error_text="journal_fsync_failed:wal",
+            )
+
+    def test_windows_unsafe_delete_keeps_txn_json_fsync_failure_blocking(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_delete_barrier_txn_fixture(td)
+            txn_json_path = os.path.abspath(fixture["txn"]["paths"]["txn_json"])
+
+            def fail_on_txn_json_fsync(path, debug=False):
+                return os.path.abspath(path) != txn_json_path
+
+            self._assert_windows_unsafe_delete_barrier_failure(
+                fixture,
+                fsync_file_side_effect=fail_on_txn_json_fsync,
+                expected_error_text="journal_fsync_failed:txn_json",
+            )
+
+    def test_windows_unsafe_delete_keeps_payload_file_fsync_failure_blocking(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_delete_barrier_txn_fixture(td)
+            payload_path = os.path.abspath(fixture["expected_payload_files"][0])
+
+            def fail_on_payload_file_fsync(path, debug=False):
+                return os.path.abspath(path) != payload_path
+
+            self._assert_windows_unsafe_delete_barrier_failure(
+                fixture,
+                fsync_file_side_effect=fail_on_payload_file_fsync,
+                expected_error_text="payload_fsync_failed:file:",
+            )
 
     def test_delete_durability_failure_stays_recoverable_across_resume_plan_rebuild(
         self,
@@ -4230,6 +4774,585 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
             self.assertEqual("DURABILITY_FAILED", saved_txn["error"]["type"])
+
+    def test_delete_unsafe_windows_missing_input_allows_terminal_manifest_entry(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="succeeded",
+            )
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+            entry["state"] = "succeeded"
+            entry["final_disposition"] = "success:delete-unsafe-windows"
+
+            with mock.patch.object(self.m.os, "name", "nt"):
+                self.assertTrue(
+                    self.m._manifest_archive_allows_missing_input(
+                        manifest,
+                        entry,
+                        fixture["output_root"],
+                    )
+                )
+
+    def test_delete_unsafe_windows_source_finalization_resume_recognizes_success(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="delete",
+            )
+            txn = fixture["txn"]
+            fixture["args"].unsafe_windows_delete = True
+            txn["state"] = self.m.TXN_STATE_PLACED
+            self.m._set_source_finalization_plan(
+                txn,
+                manifest_state="succeeded",
+                final_disposition="success:delete-unsafe-windows",
+                txn_terminal_state=self.m.TXN_STATE_DONE,
+            )
+            self.m._txn_snapshot(txn)
+
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "same_volume", return_value=True),
+            ):
+                resumed = self.m._resume_source_finalization_if_needed(
+                    txn,
+                    args=fixture["args"],
+                )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            self.assertTrue(resumed)
+            self.assertFalse(os.path.exists(fixture["archive_path"]))
+            self.assertEqual(self.m.TXN_STATE_DONE, txn["state"])
+            self.assertEqual("succeeded", entry["state"])
+            self.assertEqual(
+                "success:delete-unsafe-windows",
+                entry["final_disposition"],
+            )
+
+    def test_delete_unsafe_windows_resume_source_finalization_emits_per_txn_warning(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="delete",
+            )
+            txn = fixture["txn"]
+            fixture["args"].unsafe_windows_delete = True
+            txn["state"] = self.m.TXN_STATE_PLACED
+            self.m._set_source_finalization_plan(
+                txn,
+                manifest_state="succeeded",
+                final_disposition="success:delete-unsafe-windows",
+                txn_terminal_state=self.m.TXN_STATE_DONE,
+            )
+            self.m._txn_snapshot(txn)
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "same_volume", return_value=True),
+            ):
+                resumed = self.m._resume_source_finalization_if_needed(
+                    txn,
+                    args=fixture["args"],
+                )
+
+            output = stdout.getvalue().lower()
+            self.assertTrue(resumed)
+            self.assertIn("best-effort payload directory durability", output)
+            self.assertIn(
+                "source archives are deleted after transactional placement anyway",
+                output,
+            )
+
+    def test_delete_unsafe_windows_startup_warning_emitted_for_windows_transactional_delete(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                unsafe_windows_delete=True,
+            )
+            processor = types.SimpleNamespace(
+                successful_archives=[],
+                failed_archives=[],
+                skipped_archives=[],
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+            ):
+                result = self.m._run_transactional(processor, [], args=args)
+
+            output = stdout.getvalue().lower()
+            self.assertIsNone(result)
+            self.assertIn("best-effort payload directory durability", output)
+            self.assertIn(
+                "source archives are deleted after transactional placement anyway",
+                output,
+            )
+
+    def test_delete_unsafe_windows_startup_warning_not_emitted_for_windows_transactional_dry_run(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "dry-run.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"dry-run")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                unsafe_windows_delete=True,
+                dry_run=True,
+            )
+            processor = self._make_transactional_processor_stub()
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+            ):
+                result = self.m._run_transactional(processor, [archive_path], args=args)
+
+            output = stdout.getvalue().lower()
+            self.assertTrue(result)
+            self.assertNotIn("best-effort payload directory durability", output)
+            self.assertNotIn(
+                "source archives are deleted after transactional placement anyway",
+                output,
+            )
+            self.assertEqual(
+                [os.path.abspath(archive_path)], processor.skipped_archives
+            )
+
+    def test_delete_unsafe_windows_startup_warning_not_emitted_when_strict_resume_validation_rejects_run(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["alpha.zip"],
+            )
+            baseline_args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+            )
+            resume_args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                unsafe_windows_delete=True,
+            )
+
+            with mock.patch.object(self.m.os, "name", "nt"):
+                baseline_fingerprint = self.m._build_command_fingerprint(baseline_args)
+
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=baseline_fingerprint,
+            )
+
+            processor = types.SimpleNamespace(
+                successful_archives=[],
+                failed_archives=[],
+                skipped_archives=[],
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+            ):
+                result = self.m._run_transactional(
+                    processor,
+                    [discovered[0]["archive_path"]],
+                    args=resume_args,
+                )
+
+            output = stdout.getvalue().lower()
+            self.assertFalse(result)
+            self.assertIn("command fingerprint", output)
+            self.assertNotIn("best-effort payload directory durability", output)
+            self.assertNotIn(
+                "source archives are deleted after transactional placement anyway",
+                output,
+            )
+
+    def test_delete_unsafe_windows_per_txn_warning_emitted_before_source_finalization(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="delete",
+            )
+            fixture["args"].unsafe_windows_delete = True
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "same_volume", return_value=True),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            output = stdout.getvalue().lower()
+            self.assertIn("best-effort payload directory durability", output)
+            self.assertIn(
+                "source archives are deleted after transactional placement anyway",
+                output,
+            )
+
+    def test_delete_unsafe_windows_warning_not_emitted_for_windows_legacy_delete(self):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            startup_args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                legacy=True,
+                unsafe_windows_delete=True,
+            )
+            processor = types.SimpleNamespace(
+                successful_archives=[],
+                failed_archives=[],
+                skipped_archives=[],
+            )
+            startup_stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(startup_stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+            ):
+                result = self.m._run_transactional(processor, [], args=startup_args)
+
+            finalize_root = os.path.join(td, "finalize")
+            os.makedirs(finalize_root)
+            fixture = self._make_success_finalization_txn_fixture(
+                finalize_root,
+                success_policy="delete",
+            )
+            fixture["args"].legacy = True
+            fixture["args"].unsafe_windows_delete = True
+            finalize_stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(finalize_stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "same_volume", return_value=True),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            self.assertIsNone(result)
+            self.assertNotIn(
+                "best-effort payload directory durability",
+                startup_stdout.getvalue().lower(),
+            )
+            self.assertNotIn(
+                "source archives are deleted after transactional placement anyway",
+                startup_stdout.getvalue().lower(),
+            )
+            self.assertNotIn(
+                "best-effort payload directory durability",
+                finalize_stdout.getvalue().lower(),
+            )
+            self.assertNotIn(
+                "source archives are deleted after transactional placement anyway",
+                finalize_stdout.getvalue().lower(),
+            )
+
+    def test_delete_unsafe_windows_warning_not_emitted_for_non_windows_transactional_delete(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            startup_args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                unsafe_windows_delete=True,
+            )
+            processor = types.SimpleNamespace(
+                successful_archives=[],
+                failed_archives=[],
+                skipped_archives=[],
+            )
+            startup_stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(startup_stdout),
+                mock.patch.object(self.m.os, "name", "posix"),
+            ):
+                result = self.m._run_transactional(processor, [], args=startup_args)
+
+            finalize_root = os.path.join(td, "finalize")
+            os.makedirs(finalize_root)
+            fixture = self._make_success_finalization_txn_fixture(
+                finalize_root,
+                success_policy="delete",
+            )
+            fixture["args"].unsafe_windows_delete = True
+            finalize_stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(finalize_stdout),
+                mock.patch.object(self.m.os, "name", "posix"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "same_volume", return_value=True),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            self.assertIsNone(result)
+            self.assertNotIn(
+                "best-effort payload directory durability",
+                startup_stdout.getvalue().lower(),
+            )
+            self.assertNotIn(
+                "source archives are deleted after transactional placement anyway",
+                startup_stdout.getvalue().lower(),
+            )
+            self.assertNotIn(
+                "best-effort payload directory durability",
+                finalize_stdout.getvalue().lower(),
+            )
+            self.assertNotIn(
+                "source archives are deleted after transactional placement anyway",
+                finalize_stdout.getvalue().lower(),
+            )
+
+    def test_delete_unsafe_windows_final_disposition_written_on_success(self):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="delete",
+            )
+            fixture["args"].unsafe_windows_delete = True
+
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "same_volume", return_value=True),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            self.assertEqual("succeeded", entry["state"])
+            self.assertEqual(
+                "success:delete-unsafe-windows",
+                entry["final_disposition"],
+            )
+            self.assertFalse(os.path.exists(os.path.abspath(fixture["archive_path"])))
+
+    def test_delete_unsafe_windows_resume_converges_persisted_source_finalization_plan(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="delete",
+            )
+            fixture["args"].unsafe_windows_delete = True
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+            real_snapshot = self.m._txn_snapshot
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            with mock.patch.object(self.m.os, "name", "nt"):
+                manifest["command_fingerprint"] = self.m._build_command_fingerprint(
+                    fixture["args"]
+                )
+            self.m._save_dataset_manifest(manifest)
+
+            def crash_after_plan_persisted(txn):
+                real_snapshot(txn)
+                plan = self.m._txn_source_finalization_plan(txn)
+                if (
+                    plan is not None
+                    and plan["final_disposition"] == "success:delete-unsafe-windows"
+                    and txn.get("state")
+                    in (self.m.TXN_STATE_PLACED, self.m.TXN_STATE_DURABLE)
+                ):
+                    raise SystemExit(
+                        "crash-after-unsafe-delete-source-finalization-plan"
+                    )
+
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "same_volume", return_value=True),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m, "_txn_snapshot", side_effect=crash_after_plan_persisted
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            self.assertTrue(os.path.exists(archive_path))
+
+            processor = types.SimpleNamespace(
+                successful_archives=[],
+                failed_archives=[],
+                skipped_archives=[],
+            )
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "same_volume", return_value=True),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "resume should converge persisted unsafe delete finalization plan without re-extract"
+                    ),
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(processor, [], args=fixture["args"])
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(
+                resumed_entry, fixture["output_root"]
+            )
+
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertEqual([archive_path], processor.successful_archives)
+            self.assertEqual([], processor.failed_archives)
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual(
+                "success:delete-unsafe-windows",
+                resumed_entry["final_disposition"],
+            )
+            self.assertEqual(self.m.TXN_STATE_DONE, resumed_txn["state"])
 
     def test_terminal_delete_manifest_reopens_without_missing_source_drift(self):
         class DummyLock:
@@ -5867,7 +6990,7 @@ class TestTxnPrimitives(unittest.TestCase):
             with mock.patch.object(self.m.os, "name", "nt"):
                 self.assertFalse(self.m._fsync_dir(td))
 
-    def test_run_transactional_rejects_delete_on_unsupported_windows_directory_durability(
+    def test_run_transactional_rejects_windows_transactional_delete_without_unsafe_flag(
         self,
     ):
         with tempfile.TemporaryDirectory() as td:
@@ -5896,9 +7019,72 @@ class TestTxnPrimitives(unittest.TestCase):
                 result = self.m._run_transactional(processor, [], args=args)
 
             self.assertIs(False, result)
-            self.assertIn("windows", stdout.getvalue().lower())
-            self.assertIn("-sp delete", stdout.getvalue())
+            self.assertIn("--unsafe-windows-delete", stdout.getvalue())
             self.assertFalse(os.path.exists(self.m._dataset_manifest_path(output_root)))
+
+    def test_run_transactional_allows_windows_transactional_delete_with_unsafe_flag(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                fsync_files="auto",
+                unsafe_windows_delete=True,
+            )
+            processor = types.SimpleNamespace(
+                successful_archives=[],
+                failed_archives=[],
+                skipped_archives=[],
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+            ):
+                result = self.m._run_transactional(processor, [], args=args)
+
+            self.assertIsNone(result)
+            self.assertNotIn("--unsafe-windows-delete is required", stdout.getvalue())
+
+    def test_run_transactional_allows_windows_legacy_delete_without_unsafe_flag(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                fsync_files="auto",
+                legacy=True,
+            )
+            processor = types.SimpleNamespace(
+                successful_archives=[],
+                failed_archives=[],
+                skipped_archives=[],
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.os, "name", "nt"),
+            ):
+                result = self.m._run_transactional(processor, [], args=args)
+
+            self.assertIsNone(result)
+            self.assertNotIn("--unsafe-windows-delete is required", stdout.getvalue())
 
     def test_delete_durability_barrier_fsyncs_empty_created_directories(self):
         with tempfile.TemporaryDirectory() as td:

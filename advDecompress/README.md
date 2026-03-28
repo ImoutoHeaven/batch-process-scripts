@@ -66,7 +66,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `-des`, `--detect-elf-sfx` | 启用 ELF SFX 检测（Linux），默认关闭以减少扫描开销 | 关闭 |
 | `-t`, `--threads` | 并行解压线程数 | 1 |
 | `-dp`, `--decompress-policy` | 解压策略（下节详述） | `2-collect` |
-| `-sp`, `--success-policy` | 解压成功后：`delete` / `asis` / `move`（事务模式下 `delete` 会在 durability barrier 成功后才删除源归档） | `asis` |
+| `-sp`, `--success-policy` | 解压成功后：`delete` / `asis` / `move`（事务模式下 `delete` 会在 durability barrier 成功后才删除源归档；Windows 事务模式需配合 `--unsafe-windows-delete`，并在删除前仅提供 best-effort payload directory durability） | `asis` |
 | `--success-to`, `-st` | `-sp move` 时的目标目录 | - |
 | `-fp`, `--fail-policy` | 解压失败后：`asis` / `move` | `asis` |
 | `--fail-to`, `-ft` | `-fp move` 时的目标目录 | - |
@@ -76,7 +76,8 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `--skip-7z-multi` / `--skip-rar-multi` / `--skip-zip-multi` / `--skip-exe-multi` | 跳过对应多卷格式 | - |
 | `--no-lock` | 禁用全局锁（多实例慎用） | 关闭 |
 | `--lock-timeout` | 获取锁最大重试次数 | 30 |
-| `--legacy` | 切回旧版非事务化流程（默认是事务化流程，启用 journal / 恢复） | 关闭 |
+| `--legacy` | 切回旧版非事务化流程（默认是事务化流程，启用 journal / 恢复；legacy `-sp delete` 不要求 `--unsafe-windows-delete`） | 关闭 |
+| `--unsafe-windows-delete` | 仅允许 Windows 事务模式下的 `-sp delete` 继续执行；legacy 模式不依赖此开关 | 关闭 |
 | `--degrade-cross-volume` | 允许跨卷降级 copy+delete（降低原子性） | 关闭 |
 | `--conflict-mode` | 事务化落位冲突策略：`fail` / `suffix` | `fail` |
 | `--no-durability` | 关闭事务模式的 durability barrier；与 `-sp delete` 不兼容 | 关闭 |
@@ -103,7 +104,8 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 * 能直接续跑完成的归档会继续完成，不会重新解压；必须重试的归档只重跑对应单个归档。
 * 若命令指纹不一致，或 manifest 记录的归档缺失、大小变化、时间戳变化等，脚本会拒绝恢复，并明确提示先删除 `.advdecompress_work/` 后再重新开始。
 * 单个事务一旦成功落位并通过 durability barrier，就会立刻执行该事务自己的成功后处理（例如 `-sp delete` / `-sp move`）；不是 extract 成功后立刻处理源归档，也不再等待整批归档都提取完成。
-* `-sp delete` 只有在事务 journal 与已落位输出都通过 durability barrier 后才会删除源归档；因此不能与 `--no-durability` 或 `--fsync-files none` 同用，且 Windows 下的事务模式不支持 `-sp delete`。
+* `-sp delete` 只有在事务 journal 与已落位输出都通过 durability barrier 后才会删除源归档；因此不能与 `--no-durability` 或 `--fsync-files none` 同用。
+* Windows 下的事务模式若要使用 `-sp delete`，必须显式加上 `--unsafe-windows-delete`；此时删除前仍会尝试 payload directory durability，但该部分只提供 best-effort 保证，源归档仍会在事务化落位后删除。
 * 同一 `output_dir` 的事务仍通过 `output_dir.lock` 串行落位；多线程下先完成提取的事务可能先落位，因此同目录内的命名/冲突处理顺序可能不同于扫描顺序。
 * 多线程只保留受 orchestration window / `--threads` 约束的在途提取任务，不会先把整批归档都提取完再统一落位。
 * 因此磁盘峰值主要受并发度与同目录串行点影响，不再随着整批归档数量线性累积。
@@ -199,6 +201,9 @@ a python advDecompress.py D:\Downloads -o D:\Unpacked -t 8 -dp 3-collect
 
 # 仅处理第一层目录下的 RAR，并在成功后删除原归档
 a python advDecompress.py /data/backups -er -dr 0 -sp delete --skip-zip --skip-7z
+
+# Windows 事务模式下显式允许 delete
+python advDecompress.py D:\Downloads -o D:\Unpacked -sp delete --unsafe-windows-delete
 
 # 处理多卷 ZIP，若遭遇传统编码则自动解码
 python advDecompress.py archive.zip -tzp decode-auto -enable-rar

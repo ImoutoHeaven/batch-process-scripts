@@ -4231,6 +4231,68 @@ def _dataset_manifest_archive_id(archive_path):
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+_SUCCESSFUL_SOURCE_FINALIZATION_DISPOSITIONS = {
+    "success:delete": "delete",
+    "success:delete-unsafe-windows": "delete",
+    "success:move": "move",
+}
+
+_WINDOWS_UNSAFE_DELETE_WARNING_TEXT = (
+    "best-effort payload directory durability on Windows; "
+    "source archives are deleted after transactional placement anyway."
+)
+
+
+def _resolve_effective_delete_mode(args):
+    if getattr(args, "success_policy", None) != "delete":
+        return "not_delete"
+
+    if bool(getattr(args, "legacy", False)):
+        return "legacy_delete"
+
+    if os.name == "nt":
+        if bool(getattr(args, "unsafe_windows_delete", False)):
+            return "txn_delete_unsafe_windows"
+        return "txn_delete_blocked_windows"
+
+    return "txn_delete"
+
+
+def _success_disposition_for_delete_mode(delete_mode, success_policy):
+    normalized_success_policy = success_policy or "asis"
+    if normalized_success_policy != "delete":
+        return f"success:{normalized_success_policy}"
+
+    if delete_mode == "txn_delete_unsafe_windows":
+        return "success:delete-unsafe-windows"
+
+    return "success:delete"
+
+
+def _warn_windows_unsafe_delete_startup(args):
+    if _resolve_effective_delete_mode(args) != "txn_delete_unsafe_windows":
+        return
+    if bool(getattr(args, "_unsafe_windows_delete_startup_warned", False)):
+        return
+
+    print(
+        "Warning: Windows transactional -sp delete uses "
+        + _WINDOWS_UNSAFE_DELETE_WARNING_TEXT
+    )
+    setattr(args, "_unsafe_windows_delete_startup_warned", True)
+
+
+def _warn_windows_unsafe_delete_before_source_finalization(txn, *, args):
+    if _resolve_effective_delete_mode(args) != "txn_delete_unsafe_windows":
+        return
+
+    print(
+        "  Warning: Finalizing transactional source deletion for "
+        f"{os.path.abspath(txn['archive_path'])} with "
+        + _WINDOWS_UNSAFE_DELETE_WARNING_TEXT
+    )
+
+
 def _normalize_command_fingerprint_fields(args):
     depth_range = getattr(args, "depth_range", None)
     if depth_range:
@@ -4239,6 +4301,8 @@ def _normalize_command_fingerprint_fields(args):
     fix_extension_threshold = getattr(args, "fix_extension_threshold", None)
     if fix_extension_threshold is not None:
         fix_extension_threshold = parse_file_size(str(fix_extension_threshold))
+
+    resolved_delete_mode = _resolve_effective_delete_mode(args)
 
     return {
         "path": os.path.abspath(args.path),
@@ -4272,6 +4336,7 @@ def _normalize_command_fingerprint_fields(args):
         "detect_elf_sfx": bool(getattr(args, "detect_elf_sfx", False)),
         "decompress_policy": getattr(args, "decompress_policy", None),
         "success_policy": getattr(args, "success_policy", None),
+        "unsafe_windows_delete": resolved_delete_mode == "txn_delete_unsafe_windows",
         "success_to": (
             os.path.abspath(args.success_to)
             if getattr(args, "success_to", None)
@@ -4335,7 +4400,16 @@ def _manifest_fail_policy_from_manifest(manifest):
 
 
 def _manifest_success_disposition_from_manifest(manifest):
-    return f"success:{_manifest_success_policy_from_manifest(manifest)}"
+    fields = _manifest_command_fingerprint_fields(manifest)
+    success_policy = fields.get("success_policy") or "asis"
+    delete_mode = "not_delete"
+    if success_policy == "delete":
+        delete_mode = (
+            "txn_delete_unsafe_windows"
+            if bool(fields.get("unsafe_windows_delete", False))
+            else "txn_delete"
+        )
+    return _success_disposition_for_delete_mode(delete_mode, success_policy)
 
 
 def _manifest_failure_disposition_from_manifest(manifest):
@@ -4418,14 +4492,21 @@ def _txn_has_incomplete_source_finalization(txn):
 
 def _manifest_archive_allows_missing_input(manifest, manifest_archive, output_base):
     final_disposition = manifest_archive.get("final_disposition")
-    if manifest_archive.get("state") in (
-        "succeeded",
-        "failed",
-    ) and final_disposition in (
-        "success:delete",
-        "success:move",
-        "failure:move",
-        "skipped:traditional_zip_moved",
+    if (
+        manifest_archive.get("state")
+        in (
+            "succeeded",
+            "failed",
+        )
+        and final_disposition in _SUCCESSFUL_SOURCE_FINALIZATION_DISPOSITIONS
+        or (
+            manifest_archive.get("state") in ("succeeded", "failed")
+            and final_disposition
+            in (
+                "failure:move",
+                "skipped:traditional_zip_moved",
+            )
+        )
     ):
         return True
     return _txn_allows_missing_manifest_input(manifest, manifest_archive, output_base)
@@ -4799,26 +4880,32 @@ def _validate_strict_resume_startup(args):
 
 
 def _validate_delete_durability_args(args):
-    if getattr(args, "success_policy", None) != "delete":
+    delete_mode = _resolve_effective_delete_mode(args)
+
+    if delete_mode == "not_delete":
         return True
 
-    if os.name == "nt":
-        print(
-            "Error: -sp delete requires payload directory durability, which is not supported on Windows in transactional mode."
-        )
-        return False
+    if delete_mode == "legacy_delete":
+        return True
 
     if getattr(args, "no_durability", False):
         print(
-            "Error: -sp delete requires payload durability; --no-durability is invalid with -sp delete."
+            "Error: Transactional -sp delete requires payload durability; --no-durability is invalid with -sp delete."
         )
         return False
 
     if getattr(args, "fsync_files", "auto") == "none":
         print(
-            "Error: -sp delete requires payload durability; --fsync-files none is invalid with -sp delete."
+            "Error: Transactional -sp delete requires payload durability; --fsync-files none is invalid with -sp delete."
         )
         return False
+
+    if delete_mode == "txn_delete_blocked_windows":
+        print(
+            "Error: Windows transactional -sp delete requires --unsafe-windows-delete to allow best-effort payload directory durability before source deletion."
+        )
+        return False
+
     return True
 
 
@@ -4989,7 +5076,10 @@ _MANIFEST_UNSET = object()
 
 
 def _manifest_success_disposition(args):
-    return f"success:{getattr(args, 'success_policy', 'asis') or 'asis'}"
+    return _success_disposition_for_delete_mode(
+        _resolve_effective_delete_mode(args),
+        getattr(args, "success_policy", "asis"),
+    )
 
 
 def _manifest_failure_disposition(args):
@@ -6182,7 +6272,13 @@ def _commit_incoming(txn, *, degrade_cross_volume=False):
     _txn_snapshot(txn)
 
 
-def _durability_barrier(txn, *, fsync_files="auto", success_policy="asis"):
+def _durability_barrier(
+    txn,
+    *,
+    fsync_files="auto",
+    success_policy="asis",
+    delete_mode="not_delete",
+):
     if fsync_files == "none":
         if success_policy == "delete":
             raise RuntimeError(
@@ -6203,8 +6299,11 @@ def _durability_barrier(txn, *, fsync_files="auto", success_policy="asis"):
     for path in touched_files:
         if not _fsync_file(path, debug=VERBOSE):
             raise RuntimeError(f"payload_fsync_failed:file:{path}")
+
+    allow_best_effort_payload_dir_fsync = delete_mode == "txn_delete_unsafe_windows"
     for path in touched_dirs:
-        if not _fsync_dir(path, debug=VERBOSE):
+        dir_fsynced = _fsync_dir(path, debug=VERBOSE)
+        if not dir_fsynced and not allow_best_effort_payload_dir_fsync:
             raise RuntimeError(f"payload_fsync_failed:dir:{path}")
 
 
@@ -6286,7 +6385,10 @@ def _txn_source_finalization_completed(txn):
     if any(safe_exists(volume, VERBOSE) for volume in volumes):
         return False
 
-    if plan["final_disposition"] == "success:delete":
+    source_finalization_kind = _SUCCESSFUL_SOURCE_FINALIZATION_DISPOSITIONS.get(
+        plan["final_disposition"]
+    )
+    if source_finalization_kind == "delete":
         trash_dir = (txn.get("paths") or {}).get("trash_dir")
         return not (trash_dir and safe_exists(trash_dir, VERBOSE))
 
@@ -6411,7 +6513,7 @@ def _resume_source_finalization_if_needed(txn, *, args):
         txn["state"] = TXN_STATE_SOURCE_FINALIZED
         _txn_snapshot(txn)
         return _complete_source_finalization_plan(txn) is not None
-    if disposition in ("success:delete", "success:move"):
+    if disposition in _SUCCESSFUL_SOURCE_FINALIZATION_DISPOSITIONS:
         _finalize_sources_success(txn, args=args)
     elif disposition == "failure:move":
         _finalize_sources_failure(txn["volumes"], args=args, txn=txn)
@@ -6430,6 +6532,8 @@ def _finalize_sources_success(txn, *, args):
     success_policy = args.success_policy
     if success_policy == "asis":
         return
+
+    _warn_windows_unsafe_delete_before_source_finalization(txn, args=args)
 
     volumes = txn["volumes"]
     output_dir = txn["output_dir"]
@@ -7444,6 +7548,7 @@ def _place_and_finalize_txn(txn, *, args, recovery=False):
                 txn,
                 fsync_files=args.fsync_files,
                 success_policy=args.success_policy,
+                delete_mode=_resolve_effective_delete_mode(args),
             )
             txn["state"] = TXN_STATE_DURABLE
             _txn_snapshot(txn)
@@ -7685,6 +7790,8 @@ def _run_transactional(processor, archives, *, args):
             current_run_touched_output_dirs=set(),
         )
         return True
+
+    _warn_windows_unsafe_delete_startup(args)
 
     manifest = _load_dataset_manifest(output_base)
     if manifest is None:
@@ -10492,7 +10599,7 @@ def main():
         "--success-policy",
         choices=["delete", "asis", "move"],
         default="asis",
-        help="Policy for successful extractions (default: asis)",
+        help="Policy for successful extractions (default: asis). Windows transactional -sp delete requires --unsafe-windows-delete. Legacy -sp delete does not require --unsafe-windows-delete.",
     )
 
     parser.add_argument(
@@ -10593,7 +10700,12 @@ def main():
     parser.add_argument(
         "--legacy",
         action="store_true",
-        help="Use legacy non-transactional pipeline (no journal/recovery).",
+        help="Use legacy non-transactional pipeline (no journal/recovery). Legacy -sp delete does not require --unsafe-windows-delete.",
+    )
+    parser.add_argument(
+        "--unsafe-windows-delete",
+        action="store_true",
+        help="Allow best-effort transactional source deletion on Windows when used with -sp delete. This flag is inert outside Windows transactional delete.",
     )
     parser.add_argument(
         "--degrade-cross-volume",
@@ -10639,13 +10751,13 @@ def main():
     parser.add_argument(
         "--no-durability",
         action="store_true",
-        help="Disable durability barrier (fsync) before finalizing sources.",
+        help="Disable durability barrier (fsync) before finalizing sources. Invalid with transactional -sp delete, including Windows runs gated by --unsafe-windows-delete; legacy -sp delete remains exempt from the unsafe gate.",
     )
     parser.add_argument(
         "--fsync-files",
         choices=["auto", "none"],
         default="auto",
-        help="Durability fsync strategy (default: auto). auto: fsync WAL + txn.json for non-destructive cases, and automatically upgrades to payload durability fsyncs when -sp delete is used.",
+        help="Durability fsync strategy (default: auto). auto: fsync WAL + txn.json for non-destructive cases and automatically upgrades to payload durability fsyncs when transactional -sp delete is used. On Windows, --unsafe-windows-delete enables only best-effort payload directory durability before source deletion on Windows.",
     )
     parser.add_argument(
         "--success-clean-journal",
