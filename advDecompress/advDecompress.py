@@ -4043,9 +4043,31 @@ def _now_iso():
 def _fsync_file(path, debug=False):
     try:
         safe_path = safe_path_for_operation(path, debug)
-        with open(safe_path, "rb") as f:
-            os.fsync(f.fileno())
-        return True
+        if os.name != "nt":
+            with open(safe_path, "rb") as f:
+                os.fsync(f.fileno())
+            return True
+
+        binary_flag = getattr(os, "O_BINARY", 0)
+        flags_to_try = [
+            os.O_RDWR | binary_flag,
+            os.O_WRONLY | binary_flag,
+        ]
+
+        for flags in flags_to_try:
+            try:
+                fd = os.open(safe_path, flags)
+            except OSError:
+                continue
+            try:
+                os.fsync(fd)
+                return True
+            except OSError:
+                return False
+            finally:
+                os.close(fd)
+
+        return False
     except Exception:
         return False
 

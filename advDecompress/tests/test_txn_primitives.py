@@ -878,6 +878,9 @@ class TestTxnPrimitives(unittest.TestCase):
                     return {"b.zip": hash_b, "c.zip": hash_c}
         self.fail("Could not reproduce done-future reordering")
 
+    def _windows_binary_flag(self):
+        return getattr(self.m.os, "O_BINARY", 0)
+
     def test_atomic_write_json(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "txn.json")
@@ -3979,6 +3982,114 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual(failure_txn["txn_id"], failure_entry["last_txn_id"])
             self.assertEqual(failure_txn["error"], failure_entry["error"])
 
+    def test_fsync_file_windows_uses_rdwr_before_wronly(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            temp_path = f.name
+
+        try:
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m.os, "open", return_value=99) as open_mock,
+                mock.patch.object(self.m.os, "fsync") as fsync_mock,
+                mock.patch.object(self.m.os, "close") as close_mock,
+            ):
+                result = self.m._fsync_file(temp_path)
+
+            self.assertTrue(result)
+            open_mock.assert_called_once()
+            self.assertEqual(
+                self.m.os.O_RDWR | self._windows_binary_flag(),
+                open_mock.call_args_list[0].args[1],
+            )
+            fsync_mock.assert_called_once_with(99)
+            close_mock.assert_called_once_with(99)
+        finally:
+            os.unlink(temp_path)
+
+    def test_fsync_file_windows_falls_back_to_wronly(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            temp_path = f.name
+
+        try:
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(
+                    self.m.os,
+                    "open",
+                    side_effect=[OSError("rdwr failed"), 123],
+                ) as open_mock,
+                mock.patch.object(self.m.os, "fsync") as fsync_mock,
+                mock.patch.object(self.m.os, "close") as close_mock,
+            ):
+                result = self.m._fsync_file(temp_path)
+
+            self.assertTrue(result)
+            self.assertEqual(2, open_mock.call_count)
+            self.assertEqual(
+                self.m.os.O_WRONLY | self._windows_binary_flag(),
+                open_mock.call_args_list[1].args[1],
+            )
+            fsync_mock.assert_called_once_with(123)
+            close_mock.assert_called_once_with(123)
+        finally:
+            os.unlink(temp_path)
+
+    def test_fsync_file_windows_returns_false_when_all_opens_fail(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            temp_path = f.name
+
+        try:
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(
+                    self.m.os,
+                    "open",
+                    side_effect=[OSError("rdwr failed"), OSError("wronly failed")],
+                ) as open_mock,
+                mock.patch.object(self.m.os, "fsync") as fsync_mock,
+            ):
+                result = self.m._fsync_file(temp_path)
+
+            self.assertFalse(result)
+            self.assertEqual(2, open_mock.call_count)
+            fsync_mock.assert_not_called()
+        finally:
+            os.unlink(temp_path)
+
+    def test_fsync_file_windows_returns_false_when_fsync_fails(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            temp_path = f.name
+
+        try:
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m.os, "open", return_value=456) as open_mock,
+                mock.patch.object(
+                    self.m.os,
+                    "fsync",
+                    side_effect=OSError("fsync failed"),
+                ) as fsync_mock,
+                mock.patch.object(self.m.os, "close") as close_mock,
+            ):
+                result = self.m._fsync_file(temp_path)
+
+            self.assertFalse(result)
+            open_mock.assert_called_once()
+            fsync_mock.assert_called_once_with(456)
+            close_mock.assert_called_once_with(456)
+        finally:
+            os.unlink(temp_path)
+
+    def test_fsync_file_linux_host_succeeds_for_real_file(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            temp_path = f.name
+
+        try:
+            with mock.patch.object(self.m.os, "name", "posix"):
+                self.assertTrue(self.m._fsync_file(temp_path))
+        finally:
+            os.unlink(temp_path)
+
     def test_delete_success_policy_requires_payload_durability_barrier(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_delete_barrier_txn_fixture(td)
@@ -4545,6 +4656,86 @@ class TestTxnPrimitives(unittest.TestCase):
             ]
             self.assertFalse(os.path.exists(os.path.abspath(fixture["archive_path"])))
             self.assertEqual("succeeded", manifest_entry["state"])
+
+    def test_windows_unsafe_delete_real_fsync_file_path_reaches_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_delete_barrier_txn_fixture(td)
+            fixture["args"].unsafe_windows_delete = True
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            expected_open_paths = {
+                os.path.abspath(fixture["txn"]["paths"]["wal"]),
+                os.path.abspath(fixture["txn"]["paths"]["txn_json"]),
+            }
+            expected_open_paths.update(
+                os.path.abspath(path) for path in fixture["expected_payload_files"]
+            )
+            open_calls = []
+            helper_opened_fds = []
+            helper_closed_fds = []
+            barrier_called = {"value": False}
+            next_fd = {"value": 100}
+            original_barrier = self.m._durability_barrier
+
+            class DummyLock:
+                def __init__(self, path, timeout_ms, retry_ms, debug):
+                    self.path = path
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            def fake_open(path, flags):
+                normalized_path = os.path.abspath(path)
+                open_calls.append((normalized_path, flags))
+                if normalized_path not in expected_open_paths:
+                    raise AssertionError(
+                        f"Unexpected helper-path fsync open: {normalized_path}"
+                    )
+                fd = next_fd["value"]
+                next_fd["value"] += 1
+                helper_opened_fds.append(fd)
+                return fd
+
+            def fake_fsync(fd):
+                return None
+
+            def fake_close(fd):
+                helper_closed_fds.append(fd)
+
+            def tracking_barrier(*args, **kwargs):
+                barrier_called["value"] = True
+                with (
+                    mock.patch.object(self.m.os, "open", side_effect=fake_open),
+                    mock.patch.object(self.m.os, "fsync", side_effect=fake_fsync),
+                    mock.patch.object(self.m.os, "close", side_effect=fake_close),
+                ):
+                    return original_barrier(*args, **kwargs)
+
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "same_volume", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(self.m, "_durability_barrier", new=tracking_barrier),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            manifest_entry = manifest["archives"][archive_id]
+            opened_paths = {path for path, _flags in open_calls}
+
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertEqual("succeeded", manifest_entry["state"])
+            self.assertEqual(
+                "success:delete-unsafe-windows",
+                manifest_entry["final_disposition"],
+            )
+            self.assertTrue(expected_open_paths.issubset(opened_paths))
+            self.assertIs(True, barrier_called["value"])
+            self.assertCountEqual(helper_opened_fds, helper_closed_fds)
 
     def test_windows_unsafe_delete_keeps_wal_fsync_failure_blocking(self):
         with tempfile.TemporaryDirectory() as td:
