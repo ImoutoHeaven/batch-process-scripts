@@ -881,6 +881,38 @@ class TestTxnPrimitives(unittest.TestCase):
     def _windows_binary_flag(self):
         return getattr(self.m.os, "O_BINARY", 0)
 
+    @contextlib.contextmanager
+    def _mock_windows_short_path_destination_bug(self, *, remove_after_existing_hits=1):
+        alias_names = {
+            "txn.json": "TXN~1.JSO",
+            "dataset_manifest.json": "DATASE~1.JSO",
+        }
+        existing_hits = {}
+
+        def fake_short_path_name(path):
+            abs_path = os.path.abspath(os.path.expandvars(path))
+            alias_name = alias_names.get(os.path.basename(abs_path).lower())
+            if alias_name is None:
+                return abs_path
+            if not os.path.exists(abs_path):
+                return abs_path
+
+            existing_hits[abs_path] = existing_hits.get(abs_path, 0) + 1
+            if existing_hits[abs_path] < remove_after_existing_hits:
+                return abs_path
+
+            os.remove(abs_path)
+            return os.path.join(os.path.dirname(abs_path), alias_name)
+
+        with (
+            mock.patch.object(self.m.os, "name", "nt"),
+            mock.patch.object(self.m, "is_windows", return_value=True),
+            mock.patch.object(
+                self.m, "get_short_path_name", side_effect=fake_short_path_name
+            ),
+        ):
+            yield
+
     def test_atomic_write_json(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "txn.json")
@@ -890,6 +922,186 @@ class TestTxnPrimitives(unittest.TestCase):
                 loaded = json.load(f)
             self.assertEqual(loaded, data)
             self.assertFalse(os.path.exists(path + ".tmp"))
+
+    def test_atomic_write_json_repeated_writes_preserve_long_filename(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "txn.json")
+
+            with self._mock_windows_short_path_destination_bug(
+                remove_after_existing_hits=2
+            ):
+                self.m.atomic_write_json(path, {"round": 1}, debug=False)
+                self.m.atomic_write_json(path, {"round": 2}, debug=False)
+                self.m.atomic_write_json(path, {"round": 3}, debug=False)
+
+            self.assertTrue(os.path.exists(path))
+            self.assertFalse(os.path.exists(path + ".tmp"))
+
+            entries = sorted(os.listdir(td))
+            self.assertEqual(["txn.json"], entries)
+            self.assertEqual(
+                [],
+                [name for name in entries if name.upper().startswith("TXN~")],
+            )
+
+            with open(path, "r", encoding="utf-8") as f:
+                self.assertEqual({"round": 3}, json.load(f))
+
+    def test_patch_cmd_paths_uses_external_path_normalization_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "archive.zip")
+            output_dir = os.path.join(td, "out")
+            with open(archive_path, "wb") as f:
+                f.write(b"zip")
+            os.makedirs(output_dir)
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "normalize_external_cmd_path",
+                    side_effect=lambda path, debug=False: path + ".external",
+                    create=True,
+                ) as external_norm,
+                mock.patch.object(
+                    self.m,
+                    "normalize_local_fs_path",
+                    side_effect=lambda path, debug=False: path + ".local",
+                    create=True,
+                ) as local_norm,
+            ):
+                patched = self.m._patch_cmd_paths(
+                    ["7z", "x", archive_path, f"-o{output_dir}"]
+                )
+
+            self.assertEqual(
+                [
+                    "7z",
+                    "x",
+                    archive_path + ".external",
+                    f"-o{output_dir}.external",
+                ],
+                patched,
+            )
+            self.assertEqual(2, external_norm.call_count)
+            self.assertEqual(0, local_norm.call_count)
+
+    def test_local_filesystem_helpers_do_not_use_external_path_normalization(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "txn.json")
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "normalize_external_cmd_path",
+                    side_effect=AssertionError(
+                        "local filesystem helpers must not use external path normalization"
+                    ),
+                    create=True,
+                ),
+                mock.patch.object(
+                    self.m,
+                    "normalize_local_fs_path",
+                    side_effect=lambda value, debug=False: value,
+                    create=True,
+                ) as local_norm,
+            ):
+                self.m.atomic_write_json(path, {"round": 1}, debug=False)
+                self.assertTrue(self.m.safe_exists(path, debug=False))
+
+            self.assertGreaterEqual(local_norm.call_count, 2)
+
+    def test_is_password_correct_header_encryption_routes_7z_list_archive_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "archive.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"zip")
+
+            captured_cmds = []
+
+            def fake_run(cmd, **kwargs):
+                captured_cmds.append(cmd)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "normalize_external_cmd_path",
+                    side_effect=lambda path, debug=False: path + ".external",
+                    create=True,
+                ) as external_norm,
+                mock.patch.object(
+                    self.m,
+                    "normalize_local_fs_path",
+                    side_effect=AssertionError(
+                        "password probe must not use local filesystem normalization"
+                    ),
+                    create=True,
+                ),
+                mock.patch.object(self.m, "safe_subprocess_run", side_effect=fake_run),
+            ):
+                ok = self.m.is_password_correct(
+                    archive_path,
+                    "secret",
+                    encryption_status="encrypted_header",
+                )
+                patched = self.m._patch_cmd_paths(captured_cmds[0])
+
+            self.assertTrue(ok)
+            self.assertEqual(
+                [["7z", "l", "-slt", archive_path, "-psecret", "-y"]],
+                captured_cmds,
+            )
+            self.assertEqual(
+                ["7z", "l", "-slt", archive_path + ".external", "-psecret", "-y"],
+                patched,
+            )
+            self.assertEqual(1, external_norm.call_count)
+
+    def test_try_extract_builds_raw_commands_before_safe_subprocess_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = os.path.join(td, "archive.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"zip")
+            tmp_dir = os.path.join(td, "tmp")
+
+            seven_zip_calls = []
+            rar_calls = []
+
+            def fake_7z_run(cmd, **kwargs):
+                seven_zip_calls.append(cmd)
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            def fake_rar_run(cmd, **kwargs):
+                rar_calls.append(cmd)
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            with mock.patch.object(
+                self.m, "safe_subprocess_run", side_effect=fake_7z_run
+            ):
+                ok_7z = self.m.try_extract(archive_path, None, tmp_dir)
+
+            with (
+                mock.patch.object(
+                    self.m, "should_use_rar_extractor", return_value=True
+                ),
+                mock.patch.object(
+                    self.m, "safe_subprocess_run", side_effect=fake_rar_run
+                ),
+            ):
+                ok_rar = self.m.try_extract(
+                    archive_path, None, tmp_dir, enable_rar=True
+                )
+
+            self.assertTrue(ok_7z)
+            self.assertTrue(ok_rar)
+            self.assertEqual(
+                [["7z", "x", archive_path, f"-o{tmp_dir}", "-y", "-pDUMMYPASSWORD"]],
+                seven_zip_calls,
+            )
+            self.assertEqual(
+                [["rar", "x", archive_path, tmp_dir, "-pDUMMYPASSWORD", "-y"]],
+                rar_calls,
+            )
 
     def test_dataset_manifest_archive_entry_uses_safe_path_for_stat(self):
         with tempfile.TemporaryDirectory() as td:
@@ -924,7 +1136,7 @@ class TestTxnPrimitives(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    self.m, "safe_path_for_operation", side_effect=fake_safe_path
+                    self.m, "normalize_local_fs_path", side_effect=fake_safe_path
                 ),
                 mock.patch.object(self.m.os, "stat", side_effect=fake_stat),
             ):
@@ -1015,6 +1227,57 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual(
                 beta_stat.st_mtime_ns,
                 saved["archives"][expected_ids[1]]["identity"]["mtime_ns"],
+            )
+
+    def test_dataset_manifest_repeated_saves_preserve_long_filename(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["alpha.zip"],
+            )
+            fingerprint = self._make_manifest_command_fingerprint(
+                input_root,
+                output_root,
+            )
+
+            with self._mock_windows_short_path_destination_bug(
+                remove_after_existing_hits=2
+            ):
+                manifest = self.m._create_dataset_manifest(
+                    input_root=input_root,
+                    output_root=output_root,
+                    discovered_archives=discovered,
+                    command_fingerprint=fingerprint,
+                )
+                manifest_path = self.m._dataset_manifest_path(output_root)
+                work_dir = os.path.dirname(manifest_path)
+                self.m._save_dataset_manifest(manifest)
+                self.assertTrue(os.path.exists(manifest_path))
+                self.assertFalse(os.path.exists(manifest_path + ".tmp"))
+                self.assertEqual(
+                    [],
+                    [
+                        name
+                        for name in os.listdir(work_dir)
+                        if name.upper().startswith("DATASE~")
+                    ],
+                )
+                self.m._save_dataset_manifest(manifest)
+
+            entries = sorted(os.listdir(work_dir))
+
+            self.assertTrue(os.path.exists(manifest_path))
+            self.assertFalse(os.path.exists(manifest_path + ".tmp"))
+            self.assertIn("dataset_manifest.json", entries)
+            self.assertEqual(
+                [],
+                [name for name in entries if name.upper().startswith("DATASE~")],
             )
 
     def test_dataset_manifest_recomputes_progress_counts(self):
@@ -4736,6 +4999,65 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertTrue(expected_open_paths.issubset(opened_paths))
             self.assertIs(True, barrier_called["value"])
             self.assertCountEqual(helper_opened_fds, helper_closed_fds)
+
+    def test_windows_transactional_delete_repeated_txn_snapshot_preserves_txn_json_long_path(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "alpha.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"alpha")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_policy="delete",
+                unsafe_windows_delete=True,
+            )
+
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=os.path.join(output_root, "alpha"),
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            txn_json_path = txn["paths"]["txn_json"]
+            real_fsync_file = self.m._fsync_file
+
+            def assert_long_path_visible(path, debug=False):
+                if path == txn_json_path:
+                    self.assertTrue(
+                        os.path.exists(txn_json_path),
+                        "txn.json long path must exist at the fsync point",
+                    )
+                return real_fsync_file(path, debug=debug)
+
+            with (
+                self._mock_windows_short_path_destination_bug(
+                    remove_after_existing_hits=2
+                ),
+                mock.patch.object(
+                    self.m, "_fsync_file", side_effect=assert_long_path_visible
+                ),
+            ):
+                self.m._txn_snapshot(txn)
+                self.m._txn_snapshot(txn)
+                self.m._durability_barrier(
+                    txn,
+                    fsync_files="auto",
+                    delete_mode="txn_delete_unsafe_windows",
+                )
+
+            self.assertTrue(os.path.exists(txn_json_path))
 
     def test_windows_unsafe_delete_keeps_wal_fsync_failure_blocking(self):
         with tempfile.TemporaryDirectory() as td:

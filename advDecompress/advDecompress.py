@@ -2565,7 +2565,7 @@ def guess_zip_encoding(
     if VERBOSE:
         print(f"  DEBUG: 开始ZIP编码检测: {zip_path}")
 
-    safe_zip_path = safe_path_for_operation(zip_path, VERBOSE)
+    safe_zip_path = normalize_local_fs_path(zip_path, VERBOSE)
     filename_bytes = []
 
     try:
@@ -2916,7 +2916,7 @@ def is_traditional_zip(archive_path):
 
         import zipfile
 
-        safe_zip_path = safe_path_for_operation(archive_path, VERBOSE)
+        safe_zip_path = normalize_local_fs_path(archive_path, VERBOSE)
         with zipfile.ZipFile(safe_zip_path, "r") as zf:
             has_non_utf8_entry = False
             for info in zf.infolist():
@@ -3524,39 +3524,25 @@ def get_short_path_name(long_path):
         return long_path
 
 
-def safe_path_for_operation(path: str, debug: bool = False) -> str:
-    """
-    Windows路径安全处理：优先使用短路径避免兼容性问题
-    - 自动处理长路径问题（>260字符）
-    - 处理包含特殊字符的路径
-    - 确保与os.path模块良好配合
-    - 对非Windows系统直接返回原始路径
-    """
-    if not is_windows() or not path:
-        return path
+def normalize_local_fs_path(path: str, debug: bool = False) -> str:
+    abs_path = os.path.abspath(os.path.expandvars(path))
+    if debug:
+        print(f"  DEBUG: 使用本地文件系统路径: {abs_path}")
+    return abs_path
 
-    try:
-        # 先标准化路径
-        abs_path = os.path.abspath(os.path.expandvars(path))
 
-        # 优先尝试获取短路径（8.3格式）
-        short_path = get_short_path_name(abs_path)
-
-        # 如果成功获取到短路径且与原路径不同，则使用短路径
-        if short_path != abs_path:
-            if debug:
-                print(f"  DEBUG: 使用短路径: {path} -> {short_path}")
-            return short_path
-
-        # 如果无法获取短路径或短路径与原路径相同，则使用原路径
-        if debug:
-            print(f"  DEBUG: 使用原路径: {abs_path}")
+def normalize_external_cmd_path(path: str, debug: bool = False) -> str:
+    abs_path = os.path.abspath(os.path.expandvars(path))
+    if not is_windows():
         return abs_path
-
-    except Exception as e:
+    short_path = get_short_path_name(abs_path)
+    if short_path != abs_path:
         if debug:
-            print(f"  DEBUG: 路径处理失败 {path}: {e}")
-        return path
+            print(f"  DEBUG: 使用外部命令短路径: {path} -> {short_path}")
+        return short_path
+    if debug:
+        print(f"  DEBUG: 使用外部命令原路径: {abs_path}")
+    return abs_path
 
 
 def safe_open(file_path, mode="r", *args, **kwargs):
@@ -3565,7 +3551,7 @@ def safe_open(file_path, mode="r", *args, **kwargs):
     额外接受 keyword 参数 debug=True 开启调试输出。
     """
     debug = kwargs.pop("debug", False)
-    safe_path = safe_path_for_operation(file_path, debug)
+    safe_path = normalize_local_fs_path(file_path, debug)
     if debug:
         print(f"  DEBUG: safe_open -> {safe_path}")
     return open(safe_path, mode, *args, **kwargs)
@@ -3593,8 +3579,8 @@ def safe_glob(pattern: str, debug: bool = False, preserve_char_classes: bool = F
     if not dir_path:
         dir_path = "."
 
-    # 先对目录路径进行安全处理
-    safe_dir_path = safe_path_for_operation(dir_path, debug)
+    # 先对目录路径进行本地文件系统处理
+    safe_dir_path = normalize_local_fs_path(dir_path, debug)
 
     try:
         # 确保目录存在
@@ -3697,14 +3683,50 @@ def safe_glob(pattern: str, debug: bool = False, preserve_char_classes: bool = F
 def _patch_cmd_paths(cmd):
     """
     接受 list / tuple / str，返回替换了路径元素后的同类型对象。
-    规则：凡是现存的文件或目录，都调用 safe_path_for_operation 处理。
+    仅在这里执行子进程路径规范化。
     """
     if isinstance(cmd, (list, tuple)):
         patched = []
-        for token in cmd:
+        command_name = cmd[0].lower() if cmd and isinstance(cmd[0], str) else ""
+        seven_zip_archive_index = None
+        rar_path_indexes = set()
+
+        if command_name == "7z":
+            for index in range(2, len(cmd)):
+                token = cmd[index]
+                if isinstance(token, str) and not token.startswith("-"):
+                    seven_zip_archive_index = index
+                    break
+        elif command_name == "rar":
+            for index in range(2, len(cmd)):
+                token = cmd[index]
+                if isinstance(token, str) and not token.startswith("-"):
+                    rar_path_indexes.add(index)
+                    if len(rar_path_indexes) == 2:
+                        break
+
+        for index, token in enumerate(cmd):
             try:
-                if os.path.isabs(token) and safe_exists(token):
-                    patched.append(safe_path_for_operation(token))
+                if (
+                    command_name == "7z"
+                    and isinstance(token, str)
+                    and token.startswith("-o")
+                    and len(token) > 2
+                ):
+                    dest = token[2:]
+                    patched.append(f"-o{normalize_external_cmd_path(dest)}")
+                elif (
+                    command_name == "7z"
+                    and isinstance(token, str)
+                    and index == seven_zip_archive_index
+                ):
+                    patched.append(normalize_external_cmd_path(token))
+                elif (
+                    command_name == "rar"
+                    and isinstance(token, str)
+                    and index in rar_path_indexes
+                ):
+                    patched.append(normalize_external_cmd_path(token))
                 else:
                     patched.append(token)
             except Exception:
@@ -3716,7 +3738,7 @@ def _patch_cmd_paths(cmd):
 def safe_exists(path, debug=False):
     """安全的路径存在性检查"""
     try:
-        safe_path = safe_path_for_operation(path, debug)
+        safe_path = normalize_local_fs_path(path, debug)
         return os.path.exists(safe_path)
     except Exception as e:
         if debug:
@@ -3727,7 +3749,7 @@ def safe_exists(path, debug=False):
 def safe_isdir(path, debug=False):
     """安全的目录检查"""
     try:
-        safe_path = safe_path_for_operation(path, debug)
+        safe_path = normalize_local_fs_path(path, debug)
         return os.path.isdir(safe_path)
     except Exception as e:
         if debug:
@@ -3738,7 +3760,7 @@ def safe_isdir(path, debug=False):
 def safe_isfile(path, debug=False):
     """安全的文件检查"""
     try:
-        safe_path = safe_path_for_operation(path, debug)
+        safe_path = normalize_local_fs_path(path, debug)
         return os.path.isfile(safe_path)
     except Exception as e:
         if debug:
@@ -3749,7 +3771,7 @@ def safe_isfile(path, debug=False):
 def safe_makedirs(path, exist_ok=True, debug=False):
     """安全的目录创建"""
     try:
-        safe_path = safe_path_for_operation(path, debug)
+        safe_path = normalize_local_fs_path(path, debug)
         os.makedirs(safe_path, exist_ok=exist_ok)
         if debug:
             print(f"  DEBUG: 成功创建目录: {path}")
@@ -3763,7 +3785,7 @@ def safe_makedirs(path, exist_ok=True, debug=False):
 def safe_remove(path, debug=False):
     """安全的文件删除"""
     try:
-        safe_path = safe_path_for_operation(path, debug)
+        safe_path = normalize_local_fs_path(path, debug)
         os.remove(safe_path)
         if debug:
             print(f"  DEBUG: 成功删除文件: {path}")
@@ -3777,7 +3799,7 @@ def safe_remove(path, debug=False):
 def safe_rmdir(path, debug=False):
     """安全的空目录删除"""
     try:
-        safe_path = safe_path_for_operation(path, debug)
+        safe_path = normalize_local_fs_path(path, debug)
         os.rmdir(safe_path)
         if debug:
             print(f"  DEBUG: 成功删除目录: {path}")
@@ -3803,7 +3825,7 @@ def safe_rmtree(path, debug=False):
                 print(f"  DEBUG: 强制删除失败 {path_}: {e_inner}")
 
     try:
-        safe_path = safe_path_for_operation(path, debug)
+        safe_path = normalize_local_fs_path(path, debug)
         shutil.rmtree(safe_path, onerror=_onerror)
         if debug:
             print(f"  DEBUG: 成功递归删除目录: {path}")
@@ -3816,8 +3838,8 @@ def safe_rmtree(path, debug=False):
 
 def safe_move(src, dst, debug=False, overwrite=False):
     """安全的文件/目录移动/重命名（默认不覆盖目标）。"""
-    safe_src = safe_path_for_operation(src, debug)
-    safe_dst = safe_path_for_operation(dst, debug)
+    safe_src = normalize_local_fs_path(src, debug)
+    safe_dst = normalize_local_fs_path(dst, debug)
 
     if safe_exists(dst, debug):
         if not overwrite:
@@ -3841,7 +3863,7 @@ def safe_move(src, dst, debug=False, overwrite=False):
 def safe_walk(top, debug=False):
     """安全的目录遍历"""
     try:
-        safe_top = safe_path_for_operation(top, debug)
+        safe_top = normalize_local_fs_path(top, debug)
         for root, dirs, files in os.walk(safe_top):
             # 将短路径结果转换回相对于原始top的路径
             if safe_top != top:
@@ -4042,7 +4064,7 @@ def _now_iso():
 
 def _fsync_file(path, debug=False):
     try:
-        safe_path = safe_path_for_operation(path, debug)
+        safe_path = normalize_local_fs_path(path, debug)
         if os.name != "nt":
             with open(safe_path, "rb") as f:
                 os.fsync(f.fileno())
@@ -4076,7 +4098,7 @@ def _fsync_dir(path, debug=False):
     if os.name == "nt":
         return False
     try:
-        safe_path = safe_path_for_operation(path, debug)
+        safe_path = normalize_local_fs_path(path, debug)
         fd = os.open(safe_path, os.O_RDONLY)
         try:
             os.fsync(fd)
@@ -4091,8 +4113,8 @@ def atomic_write_json(path, data, debug=False):
     parent = os.path.dirname(path)
     safe_makedirs(parent, debug=debug)
     tmp = f"{path}.tmp"
-    safe_tmp = safe_path_for_operation(tmp, debug)
-    safe_final = safe_path_for_operation(path, debug)
+    safe_tmp = normalize_local_fs_path(tmp, debug)
+    safe_final = normalize_local_fs_path(path, debug)
 
     with open(safe_tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, sort_keys=True, indent=2)
@@ -4168,7 +4190,7 @@ class FileLock:
 
     def acquire(self):
         safe_makedirs(os.path.dirname(self.path), debug=self.debug)
-        safe_path = safe_path_for_operation(self.path, self.debug)
+        safe_path = normalize_local_fs_path(self.path, self.debug)
         start = time.time()
 
         f = open(safe_path, "a+b")
@@ -4607,7 +4629,8 @@ def _validate_manifest_archive_identity(manifest, manifest_archive, output_base)
         )
 
     try:
-        stat_result = os.stat(safe_path_for_operation(archive_path, VERBOSE))
+        safe_archive_path = normalize_local_fs_path(archive_path, VERBOSE)
+        stat_result = os.stat(safe_archive_path)
     except FileNotFoundError:
         return (
             f"Strict dataset resume detected input drift for manifest-listed archive "
@@ -4932,16 +4955,17 @@ def _validate_delete_durability_args(args):
 
 
 def _save_dataset_manifest(manifest):
-    atomic_write_json(
-        _dataset_manifest_path(manifest["output_root"]), manifest, debug=VERBOSE
+    manifest_path = normalize_local_fs_path(
+        _dataset_manifest_path(manifest["output_root"]), VERBOSE
     )
+    atomic_write_json(manifest_path, manifest, debug=VERBOSE)
 
 
 def _load_dataset_manifest(output_root):
     manifest_path = _dataset_manifest_path(output_root)
     if not safe_exists(manifest_path, VERBOSE):
         return None
-    safe_manifest_path = safe_path_for_operation(manifest_path, VERBOSE)
+    safe_manifest_path = normalize_local_fs_path(manifest_path, VERBOSE)
     try:
         with open(safe_manifest_path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -4958,7 +4982,7 @@ def _build_dataset_manifest_archive_entry(discovered_archive, discovered_order):
     volumes = [
         os.path.abspath(v) for v in discovered_archive.get("volumes", [archive_path])
     ]
-    safe_archive_path = safe_path_for_operation(archive_path, VERBOSE)
+    safe_archive_path = normalize_local_fs_path(archive_path, VERBOSE)
     stat_result = os.stat(safe_archive_path)
 
     return {
@@ -5303,8 +5327,8 @@ def _validate_environment_for_output_dir(
 
 
 def _atomic_rename(src, dst, *, degrade_cross_volume=False, debug=False):
-    safe_src = safe_path_for_operation(src, debug)
-    safe_dst = safe_path_for_operation(dst, debug)
+    safe_src = normalize_local_fs_path(src, debug)
+    safe_dst = normalize_local_fs_path(dst, debug)
     try:
         os.rename(safe_src, safe_dst)
     except OSError as e:
@@ -5331,7 +5355,7 @@ class WalWriter:
         self.fsync_every = int(fsync_every)
         self.debug = debug
         safe_makedirs(os.path.dirname(path), debug=debug)
-        safe_path = safe_path_for_operation(path, debug)
+        safe_path = normalize_local_fs_path(path, debug)
         self._f = open(safe_path, "a", encoding="utf-8")
         self._since_fsync = 0
 
@@ -5365,7 +5389,7 @@ def _replay_wal(wal_path):
     if not safe_exists(wal_path, VERBOSE):
         return plans_by_id, done_set
 
-    safe_wal = safe_path_for_operation(wal_path, VERBOSE)
+    safe_wal = normalize_local_fs_path(wal_path, VERBOSE)
     with open(safe_wal, "r", encoding="utf-8", errors="replace") as f:
         for raw_line in f:
             line = raw_line.strip()
@@ -6716,7 +6740,7 @@ def _garbage_collect(output_dir, *, output_base, keep_journal_days=7):
         if mtime >= cutoff:
             continue
         try:
-            safe_txn_json = safe_path_for_operation(txn_json, VERBOSE)
+            safe_txn_json = normalize_local_fs_path(txn_json, VERBOSE)
             with open(safe_txn_json, "r", encoding="utf-8") as f:
                 txn = json.load(f)
             if _gc_should_delete_journal(txn, manifest):
@@ -6752,7 +6776,7 @@ def _recover_output_dir(
             if not safe_exists(txn_json, VERBOSE):
                 continue
             try:
-                safe_txn_json = safe_path_for_operation(txn_json, VERBOSE)
+                safe_txn_json = normalize_local_fs_path(txn_json, VERBOSE)
                 with open(safe_txn_json, "r", encoding="utf-8") as f:
                     txn = json.load(f)
                 archive_path = txn.get("archive_path")
@@ -6845,7 +6869,7 @@ def _load_latest_txn_for_archive(manifest_archive, output_base):
         if not safe_exists(txn_json, VERBOSE):
             continue
         try:
-            safe_txn_json = safe_path_for_operation(txn_json, VERBOSE)
+            safe_txn_json = normalize_local_fs_path(txn_json, VERBOSE)
             with open(safe_txn_json, "r", encoding="utf-8") as f:
                 txn = json.load(f)
             if os.path.abspath(txn.get("archive_path", "")) != archive_path:
@@ -7148,7 +7172,7 @@ def _discover_output_dirs_for_recovery(output_base):
             if not safe_exists(txn_json, VERBOSE):
                 continue
             try:
-                safe_txn_json = safe_path_for_operation(txn_json, VERBOSE)
+                safe_txn_json = normalize_local_fs_path(txn_json, VERBOSE)
                 with open(safe_txn_json, "r", encoding="utf-8") as f:
                     txn = json.load(f)
                 output_dir = txn.get("output_dir")
@@ -8092,6 +8116,8 @@ def safe_subprocess_run(cmd, **kwargs):
     capture_err = kwargs.get("stderr") == subprocess.PIPE
 
     patched_cmd = _patch_cmd_paths(cmd)
+    if VERBOSE and patched_cmd != cmd:
+        print(f"  DEBUG: 子进程patched命令: {' '.join(map(str, patched_cmd))}")
 
     # Ensure subprocess has its own process group/session so we can terminate it reliably.
     if os.name == "nt":
@@ -8466,7 +8492,6 @@ def is_password_correct(archive_path, password, encryption_status="encrypted_con
             cmd = ["7z", "t", str(archive_path), f"-p{password}", "-y"]
             if VERBOSE:
                 print(f"  DEBUG: Using test command for content encryption test")
-        cmd = _patch_cmd_paths(cmd)
         result = safe_subprocess_run(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
@@ -8515,10 +8540,7 @@ def _zip_mcp_arg(zip_decode):
 def _run_7z_extract(
     src_archive, dest_dir, password, *, zip_decode=None, allow_zip_decode=False
 ):
-    safe_src = safe_path_for_operation(src_archive, VERBOSE)
-    safe_dest = safe_path_for_operation(dest_dir, VERBOSE)
-
-    cmd = ["7z", "x", safe_src, f"-o{safe_dest}", "-y"]
+    cmd = ["7z", "x", src_archive, f"-o{dest_dir}", "-y"]
     if password:
         cmd.append(f"-p{password}")
     else:
@@ -8532,12 +8554,11 @@ def _run_7z_extract(
                 print(f"  DEBUG: 添加ZIP代码页参数: {mcp_arg}")
 
     if VERBOSE:
-        print(f"  DEBUG: 7z命令: {' '.join(cmd)}")
-        print(f"  DEBUG: 原始路径: {src_archive}")
-        print(f"  DEBUG: 安全路径: {safe_src}")
+        print(f"  DEBUG: 7z原始archive路径: {src_archive}")
+        print(f"  DEBUG: 7z原始目标路径: {dest_dir}")
+        print(f"  DEBUG: 7z原始命令: {' '.join(cmd)}")
 
     check_interrupt()
-    cmd = _patch_cmd_paths(cmd)
     return safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -8680,11 +8701,7 @@ def try_extract(
             if VERBOSE:
                 print(f"  DEBUG: 使用RAR命令解压")
 
-            # 获取安全的路径（短路径）
-            safe_archive_path = safe_path_for_operation(archive_path, VERBOSE)
-            safe_tmp_dir = safe_path_for_operation(tmp_dir, VERBOSE)
-
-            cmd = ["rar", "x", safe_archive_path, safe_tmp_dir]
+            cmd = ["rar", "x", archive_path, tmp_dir]
 
             # 添加密码参数（如果有密码则使用，否则使用虚拟密码避免hang住）
             if password:
@@ -8696,14 +8713,13 @@ def try_extract(
             cmd.extend(["-y"])  # 自动回答yes
 
             if VERBOSE:
-                print(f"  DEBUG: RAR命令: {' '.join(cmd)}")
-                print(f"  DEBUG: 原始路径: {archive_path}")
-                print(f"  DEBUG: 安全路径: {safe_archive_path}")
+                print(f"  DEBUG: RAR原始archive路径: {archive_path}")
+                print(f"  DEBUG: RAR原始目标路径: {tmp_dir}")
+                print(f"  DEBUG: RAR原始命令: {' '.join(cmd)}")
 
             # Check interrupt before running command
             check_interrupt()
 
-            cmd = _patch_cmd_paths(cmd)
             result = safe_subprocess_run(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
@@ -8971,7 +8987,7 @@ def clean_temp_dir(temp_dir):
         return
 
     try:
-        safe_temp_dir = safe_path_for_operation(temp_dir, VERBOSE)
+        safe_temp_dir = normalize_local_fs_path(temp_dir, VERBOSE)
         # If there are no files anywhere under temp_dir, it's safe to delete the whole tree.
         has_files = False
         try:
@@ -8996,7 +9012,7 @@ def clean_temp_dir(temp_dir):
 
         suffix = f"{int(time.time())}_{uuid.uuid4().hex[:6]}"
         keep_dir = f"{temp_dir}.NOT_EMPTY_KEEP_{suffix}"
-        keep_dir_safe = safe_path_for_operation(keep_dir, VERBOSE)
+        keep_dir_safe = normalize_local_fs_path(keep_dir, VERBOSE)
         os.rename(safe_temp_dir, keep_dir_safe)
         print(f"  WARNING: 临时目录非空，已保留以便排查: {keep_dir}")
     except Exception as e:
@@ -9113,7 +9129,7 @@ def find_file_content(tmp_dir, debug=False):
     depth = 1
     while True:
         try:
-            safe_current = safe_path_for_operation(current, debug)
+            safe_current = normalize_local_fs_path(current, debug)
             names = os.listdir(safe_current)
         except Exception as e:
             if debug:
