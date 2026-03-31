@@ -7806,9 +7806,9 @@ def _cleanup_one_transactional_output_dir(
 
 def _run_transactional(processor, archives, *, args):
     output_base = _output_base_from_args(args)
-    if not _validate_delete_durability_args(args):
-        return False
     if not _validate_strict_resume_startup(args):
+        return False
+    if not _validate_delete_durability_args(args):
         return False
 
     if args.dry_run:
@@ -10874,9 +10874,6 @@ def main():
             print(f"Error: Path does not exist: {args.path}")
             return 1
 
-        if not _validate_delete_durability_args(args):
-            return 1
-
         if args.success_policy == "move" and not args.success_to:
             print("Error: --success-to is required when using -sp move")
             return 1
@@ -11020,6 +11017,9 @@ def main():
                 # Don't return error, just warn and continue with 7z fallback
 
         if not args.legacy and not _validate_strict_resume_startup(args):
+            return 1
+
+        if not _validate_delete_durability_args(args):
             return 1
 
         # Create processor and find archives
