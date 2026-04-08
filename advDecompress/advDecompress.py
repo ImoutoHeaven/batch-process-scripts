@@ -1766,23 +1766,54 @@ class ArchiveProcessor:
                 if VERBOSE:
                     print(f"  DEBUG: 移动传统ZIP文件到: {self.args.traditional_zip_to}")
 
-                # 移动文件保持目录结构
-                _finalize_traditional_zip_move(txn, args=self.args)
-                txn["state"] = TXN_STATE_SOURCE_FINALIZED
-                _txn_snapshot(txn)
+                try:
+                    _finalize_traditional_zip_move(txn, args=self.args)
+                    previous_state = txn.get("state")
+                    txn["state"] = TXN_STATE_SOURCE_FINALIZED
+                    try:
+                        _txn_snapshot(txn)
+                    except Exception:
+                        txn["state"] = previous_state
+                        raise
+                    _complete_source_finalization_plan(txn)
 
-                traditional_zip_to_abs = os.path.abspath(self.args.traditional_zip_to)
-                print(f"  Traditional ZIP moved to: {traditional_zip_to_abs}")
-                result["should_continue"] = False
-                result["reason"] = "传统ZIP已移动"
-                result["manifest_state"] = "succeeded"
-                result["manifest_final_disposition"] = "skipped:traditional_zip_moved"
-                return result
+                    traditional_zip_to_abs = os.path.abspath(self.args.traditional_zip_to)
+                    print(f"  Traditional ZIP moved to: {traditional_zip_to_abs}")
+                    result["should_continue"] = False
+                    result["reason"] = "传统ZIP已移动"
+                    result["manifest_state"] = "succeeded"
+                    result["manifest_final_disposition"] = "skipped:traditional_zip_moved"
+                    return result
+
+                except Exception as e:
+                    print(f"  Error moving traditional ZIP: {e}")
+                    if not _txn_is_closed_terminal_outcome(txn):
+                        _txn_abort(txn, "FAIL_FINALIZE_FAILED", e)
+                    result["should_continue"] = False
+                    result["reason"] = f"移动传统ZIP失败: {e}"
+                    if _txn_is_closed_terminal_outcome(txn):
+                        result["manifest_state"] = "succeeded"
+                        result["manifest_final_disposition"] = (
+                            "skipped:traditional_zip_moved"
+                        )
+                        result["manifest_error"] = None
+                    else:
+                        result["manifest_state"] = "retryable"
+                        result["manifest_final_disposition"] = "unknown"
+                        result["manifest_error"] = txn.get("error")
+                    return result
 
             except Exception as e:
                 print(f"  Error moving traditional ZIP: {e}")
                 result["should_continue"] = False
                 result["reason"] = f"移动传统ZIP失败: {e}"
+                result["manifest_state"] = "retryable"
+                result["manifest_final_disposition"] = "unknown"
+                result["manifest_error"] = {
+                    "type": "FAIL_FINALIZE_FAILED",
+                    "message": str(e),
+                    "at": _now_iso(),
+                }
                 return result
 
         # 处理decode-${int}策略
@@ -4094,19 +4125,131 @@ def _fsync_file(path, debug=False):
         return False
 
 
+class _FsyncDirResult:
+    __slots__ = ("ok", "detail")
+
+    def __init__(self, ok, detail=None):
+        self.ok = bool(ok)
+        self.detail = detail
+
+    def __bool__(self):
+        return self.ok
+
+
+def _format_win32_error_detail(operation, error_code):
+    if error_code in (None, 0):
+        return operation
+    try:
+        error_text = ctypes.FormatError(error_code).strip()
+    except Exception:
+        error_text = ""
+    if error_text:
+        return f"{operation}:winerr={error_code}:{error_text}"
+    return f"{operation}:winerr={error_code}"
+
+
+def _win32_last_error(kernel32):
+    get_last_error = getattr(kernel32, "GetLastError", None)
+    if get_last_error is None:
+        return None
+    try:
+        get_last_error.restype = ctypes.wintypes.DWORD
+    except Exception:
+        pass
+    try:
+        return int(get_last_error())
+    except Exception:
+        return None
+
+
+def _fsync_dir_error_message(prefix, path, result):
+    message = f"{prefix}:{path}"
+    detail = getattr(result, "detail", None)
+    if detail:
+        return f"{message}:{detail}"
+    return message
+
+
 def _fsync_dir(path, debug=False):
-    if os.name == "nt":
-        return False
     try:
         safe_path = normalize_local_fs_path(path, debug)
+        if os.name == "nt":
+            windll = getattr(ctypes, "windll", None)
+            if windll is None or not hasattr(windll, "kernel32"):
+                return _FsyncDirResult(False, "win32-api-unavailable")
+
+            kernel32 = windll.kernel32
+            create_file = getattr(kernel32, "CreateFileW", None)
+            flush_file_buffers = getattr(kernel32, "FlushFileBuffers", None)
+            close_handle = getattr(kernel32, "CloseHandle", None)
+            if not create_file or not flush_file_buffers or not close_handle:
+                return _FsyncDirResult(False, "win32-directory-flush-api-unavailable")
+
+            try:
+                create_file.argtypes = [
+                    ctypes.wintypes.LPCWSTR,
+                    ctypes.wintypes.DWORD,
+                    ctypes.wintypes.DWORD,
+                    ctypes.c_void_p,
+                    ctypes.wintypes.DWORD,
+                    ctypes.wintypes.DWORD,
+                    ctypes.wintypes.HANDLE,
+                ]
+                create_file.restype = ctypes.wintypes.HANDLE
+                flush_file_buffers.argtypes = [ctypes.wintypes.HANDLE]
+                flush_file_buffers.restype = ctypes.wintypes.BOOL
+                close_handle.argtypes = [ctypes.wintypes.HANDLE]
+                close_handle.restype = ctypes.wintypes.BOOL
+            except Exception:
+                pass
+
+            generic_write = 0x40000000
+            file_share_read = 0x00000001
+            file_share_write = 0x00000002
+            file_share_delete = 0x00000004
+            open_existing = 3
+            file_flag_backup_semantics = 0x02000000
+            invalid_handle_value = ctypes.wintypes.HANDLE(-1).value
+
+            handle = create_file(
+                safe_path,
+                generic_write,
+                file_share_read | file_share_write | file_share_delete,
+                None,
+                open_existing,
+                file_flag_backup_semantics,
+                None,
+            )
+            handle_value = getattr(handle, "value", handle)
+            if handle_value in (None, invalid_handle_value):
+                return _FsyncDirResult(
+                    False,
+                    _format_win32_error_detail(
+                        "CreateFileW",
+                        _win32_last_error(kernel32),
+                    ),
+                )
+            try:
+                if not flush_file_buffers(handle):
+                    return _FsyncDirResult(
+                        False,
+                        _format_win32_error_detail(
+                            "FlushFileBuffers",
+                            _win32_last_error(kernel32),
+                        ),
+                    )
+                return _FsyncDirResult(True)
+            finally:
+                close_handle(handle)
+
         fd = os.open(safe_path, os.O_RDONLY)
         try:
             os.fsync(fd)
         finally:
             os.close(fd)
-        return True
-    except Exception:
-        return False
+        return _FsyncDirResult(True)
+    except Exception as e:
+        return _FsyncDirResult(False, f"{type(e).__name__}:{e}")
 
 
 def atomic_write_json(path, data, debug=False):
@@ -4495,9 +4638,39 @@ def _txn_source_finalization_destinations_persisted(txn):
     return set(volumes).issubset(recorded_sources)
 
 
-def _txn_allows_missing_manifest_input(manifest, manifest_archive, output_base):
+def _txn_missing_input_matches_finalized_source_move(txn, missing_path):
+    if not missing_path:
+        return False
+
+    missing_path = os.path.abspath(missing_path)
+    for record in ((txn.get("placement") or {}).get("finalized_source_moves") or []):
+        src = record.get("src")
+        dst = record.get("dst")
+        if not src or not dst:
+            continue
+        src = os.path.abspath(src)
+        dst = os.path.abspath(dst)
+        if src != missing_path:
+            continue
+        if safe_exists(src, VERBOSE):
+            return False
+        return safe_exists(dst, VERBOSE)
+    return False
+
+
+def _txn_allows_missing_manifest_input(
+    manifest, manifest_archive, output_base, missing_path=None
+):
     latest_txn = _load_latest_txn_for_archive(manifest_archive, output_base)
     if latest_txn is None:
+        return False
+
+    if _txn_missing_input_matches_finalized_source_move(latest_txn, missing_path):
+        return True
+
+    if _txn_has_incomplete_source_finalization(latest_txn):
+        return False
+    if _txn_has_recovery_responsibility(latest_txn):
         return False
 
     if _txn_source_finalization_destinations_persisted(latest_txn):
@@ -4534,7 +4707,18 @@ def _txn_has_incomplete_source_finalization(txn):
     ) is not None and not _txn_source_finalization_completed(txn)
 
 
-def _manifest_archive_allows_missing_input(manifest, manifest_archive, output_base):
+def _manifest_archive_allows_missing_input(
+    manifest, manifest_archive, output_base, missing_path=None
+):
+    latest_txn = _load_latest_txn_for_archive(manifest_archive, output_base)
+    if latest_txn is not None:
+        if _txn_missing_input_matches_finalized_source_move(latest_txn, missing_path):
+            return True
+        if _txn_has_incomplete_source_finalization(latest_txn):
+            return False
+        if _txn_has_recovery_responsibility(latest_txn):
+            return False
+
     final_disposition = manifest_archive.get("final_disposition")
     if (
         manifest_archive.get("state")
@@ -4553,7 +4737,12 @@ def _manifest_archive_allows_missing_input(manifest, manifest_archive, output_ba
         )
     ):
         return True
-    return _txn_allows_missing_manifest_input(manifest, manifest_archive, output_base)
+    return _txn_allows_missing_manifest_input(
+        manifest,
+        manifest_archive,
+        output_base,
+        missing_path=missing_path,
+    )
 
 
 def _validate_manifest_volume_inputs(manifest, manifest_archive, output_base):
@@ -4583,7 +4772,10 @@ def _validate_manifest_volume_inputs(manifest, manifest_archive, output_base):
             continue
         if not safe_exists(volume_path, VERBOSE):
             if _manifest_archive_allows_missing_input(
-                manifest, manifest_archive, output_base
+                manifest,
+                manifest_archive,
+                output_base,
+                missing_path=volume_path,
             ):
                 continue
             return (
@@ -4614,7 +4806,10 @@ def _validate_manifest_archive_identity(manifest, manifest_archive, output_base)
 
     if not safe_exists(archive_path, VERBOSE):
         if _manifest_archive_allows_missing_input(
-            manifest, manifest_archive, output_base
+            manifest,
+            manifest_archive,
+            output_base,
+            missing_path=archive_path,
         ):
             return None
         return (
@@ -4884,9 +5079,328 @@ def _validate_loaded_dataset_manifest(manifest, output_base):
     return None
 
 
+def _load_classifiable_txn(txn_json_path, *, output_base):
+    safe_txn_json = normalize_local_fs_path(txn_json_path, VERBOSE)
+    with open(safe_txn_json, "r", encoding="utf-8") as f:
+        txn = json.load(f)
+
+    for key in ("txn_id", "archive_path", "output_dir", "state", "paths"):
+        if key not in txn:
+            raise ValueError(f"txn missing field: {key}")
+
+    paths = txn.get("paths") or {}
+    txn_id = txn["txn_id"]
+    output_dir = os.path.abspath(txn["output_dir"])
+    expected_journal_dir = os.path.join(
+        _work_root(output_dir, output_base), "journal", txn_id
+    )
+    expected_txn_json = os.path.join(expected_journal_dir, "txn.json")
+    expected_wal = os.path.join(expected_journal_dir, "txn.wal")
+
+    if (
+        not isinstance(txn["archive_path"], str)
+        or not txn["archive_path"].strip()
+        or not os.path.isabs(txn["archive_path"])
+    ):
+        raise ValueError("txn archive_path invalid")
+    if (
+        not isinstance(txn["output_dir"], str)
+        or not txn["output_dir"].strip()
+        or not os.path.isabs(txn["output_dir"])
+    ):
+        raise ValueError("txn output_dir invalid")
+    output_base_abs = os.path.abspath(output_base)
+    try:
+        if os.path.commonpath([output_base_abs, output_dir]) != output_base_abs:
+            raise ValueError("txn output_dir outside output_base")
+    except ValueError as e:
+        if str(e) != "txn output_dir outside output_base":
+            raise ValueError("txn output_dir outside output_base") from e
+        raise
+    if os.path.abspath(safe_txn_json) != os.path.abspath(expected_txn_json):
+        raise ValueError("txn_json physical path mismatch")
+    if os.path.abspath(paths.get("txn_json", "")) != os.path.abspath(expected_txn_json):
+        raise ValueError("txn_json path mismatch")
+    if os.path.abspath(paths.get("wal", "")) != os.path.abspath(expected_wal):
+        raise ValueError("wal path mismatch")
+
+    txn["archive_path"] = os.path.abspath(txn["archive_path"])
+    txn["output_dir"] = output_dir
+    return txn
+
+
+def _iter_classifiable_txns_for_archive(archive_path, output_dir, output_base):
+    journal_root = os.path.join(_work_root(output_dir, output_base), "journal")
+    if not safe_exists(journal_root, VERBOSE):
+        return []
+    txns = []
+    for txn_id in sorted(os.listdir(journal_root)):
+        txn_json = os.path.join(journal_root, txn_id, "txn.json")
+        if not safe_exists(txn_json, VERBOSE):
+            continue
+        txn = _load_classifiable_txn(txn_json, output_base=output_base)
+        if txn["archive_path"] == os.path.abspath(archive_path):
+            txns.append(txn)
+    return txns
+
+
+def _all_classifiable_txns(output_base):
+    outputs_root = os.path.join(_work_base(output_base), "outputs")
+    txns = []
+    if not safe_exists(outputs_root, VERBOSE):
+        return txns
+    for token in sorted(os.listdir(outputs_root)):
+        journal_root = os.path.join(outputs_root, token, "journal")
+        if not safe_exists(journal_root, VERBOSE):
+            continue
+        for txn_id in sorted(os.listdir(journal_root)):
+            txn_json = os.path.join(journal_root, txn_id, "txn.json")
+            if not safe_exists(txn_json, VERBOSE):
+                continue
+            txns.append(_load_classifiable_txn(txn_json, output_base=output_base))
+    return txns
+
+
+def _selected_txn_for_manifest_archive(manifest_archive, output_base):
+    archive_path = os.path.abspath(manifest_archive["archive_path"])
+    output_dir = os.path.abspath(manifest_archive["output_dir"])
+    same_archive_txns = [
+        txn for txn in _all_classifiable_txns(output_base) if txn["archive_path"] == archive_path
+    ]
+    for txn in same_archive_txns:
+        if txn["output_dir"] != output_dir:
+            raise ValueError(
+                f"same archive journal has mismatched output_dir: {txn['output_dir']} != {output_dir}"
+            )
+    preferred_txn_id = manifest_archive.get("last_txn_id")
+    txns = same_archive_txns
+    if preferred_txn_id:
+        for txn in txns:
+            if txn["txn_id"] == preferred_txn_id:
+                return txn
+    if not txns:
+        return None
+    txns.sort(
+        key=lambda txn: (
+            os.path.getmtime(txn["paths"]["txn_json"]),
+            txn["txn_id"],
+        )
+    )
+    return txns[-1]
+
+
+def _txn_has_recovery_responsibility(txn):
+    state = txn.get("state")
+    if _txn_has_incomplete_source_finalization(txn):
+        return True
+    if state in (
+        TXN_STATE_INIT,
+        TXN_STATE_EXTRACTED,
+        TXN_STATE_INCOMING_COMMITTED,
+        TXN_STATE_PLACING,
+        TXN_STATE_PLACED,
+        TXN_STATE_DURABLE,
+    ):
+        return True
+    if state == TXN_STATE_SOURCE_FINALIZED:
+        return False
+    if state == TXN_STATE_FAILED:
+        return _recoverable_txn_state_from_failed(txn) is not None
+    if state == TXN_STATE_ABORTED:
+        return _recoverable_txn_state_from_aborted(txn) is not None
+    return False
+
+
+def _txn_has_snapshot_resume_metadata(txn):
+    placement = txn.get("placement") or {}
+    return (
+        "move_plan_snapshot" in placement
+        or "move_done_ids_snapshot" in placement
+    )
+
+
+def _wal_dependent_resume_classification(txn):
+    if _txn_source_finalization_plan(txn) is not None:
+        return None
+    if _txn_source_finalization_completed(txn):
+        return None
+
+    state = txn.get("state")
+    wal_dependent = _txn_requires_wal_resume(txn)
+    if not wal_dependent and state == TXN_STATE_FAILED:
+        wal_dependent = (txn.get("error") or {}).get("type") == "DURABILITY_FAILED"
+    if not wal_dependent and state == TXN_STATE_ABORTED:
+        wal_dependent = _txn_has_aborted_placing_residue(txn)
+        if not wal_dependent:
+            wal_path = (txn.get("paths") or {}).get("wal")
+            wal_dependent = bool(
+                (wal_path and safe_exists(wal_path, VERBOSE))
+                or _txn_has_snapshot_resume_state(txn)
+            )
+
+    if not wal_dependent:
+        return None
+
+    wal_path = (txn.get("paths") or {}).get("wal")
+    if wal_path and safe_exists(wal_path, VERBOSE):
+        if _txn_has_replayable_wal(txn):
+            return "resume_required"
+        return "ambiguous"
+    return "resume_required" if _txn_has_snapshot_resume_state(txn) else "ambiguous"
+
+
+def _txn_is_closed_terminal_outcome(txn):
+    state = txn.get("state")
+    if state == TXN_STATE_DONE:
+        return True
+    if state == TXN_STATE_SOURCE_FINALIZED:
+        plan = _txn_source_finalization_plan(txn)
+        if plan is None:
+            return True
+        return _txn_source_finalization_completed(txn)
+    if state == TXN_STATE_FAILED:
+        return _recoverable_txn_state_from_failed(txn) is None and not _txn_has_incomplete_source_finalization(txn)
+    if state == TXN_STATE_CLEANED:
+        return not _txn_has_incomplete_source_finalization(txn)
+    return False
+
+
+def _txn_terminal_manifest_state(txn):
+    state = txn.get("state")
+    if state == TXN_STATE_FAILED:
+        return "failed"
+    if state == TXN_STATE_CLEANED:
+        return "succeeded"
+
+    plan = _txn_source_finalization_plan(txn)
+    if plan is not None:
+        return plan["manifest_state"]
+
+    return "succeeded"
+
+
+def _reconciled_archive_classification(manifest_archive, txn):
+    manifest_state = manifest_archive.get("state")
+    if txn is None:
+        if manifest_state in ("pending", "extracting", "recoverable", "retryable"):
+            return "resume_required"
+        if manifest_state in ("succeeded", "failed"):
+            return manifest_state
+        raise ValueError(f"invalid manifest archive state without txn: {manifest_state}")
+
+    wal_classification = _wal_dependent_resume_classification(txn)
+    if wal_classification is not None:
+        return wal_classification
+
+    if _txn_has_recovery_responsibility(txn):
+        return "resume_required"
+
+    if _txn_is_closed_terminal_outcome(txn):
+        txn_terminal = _txn_terminal_manifest_state(txn)
+        if manifest_state in ("pending", "extracting", "recoverable", "retryable"):
+            return txn_terminal
+        if manifest_state in ("succeeded", "failed"):
+            if manifest_state != txn_terminal:
+                raise ValueError(
+                    f"manifest terminal state {manifest_state} conflicts with txn terminal state {txn_terminal}"
+                )
+            return txn_terminal
+        raise ValueError(f"invalid manifest archive state with terminal txn: {manifest_state}")
+
+    raise ValueError(f"unreconcilable manifest/txn pair: {manifest_state} / {txn.get('state')}")
+
+
+def _orphan_txn_records(output_base, manifest):
+    archive_keys = {
+        (os.path.abspath(entry["archive_path"]), os.path.abspath(entry["output_dir"]))
+        for entry in _iter_dataset_manifest_archives(manifest)
+    }
+    records = []
+    outputs_root = os.path.join(_work_base(output_base), "outputs")
+    if not safe_exists(outputs_root, VERBOSE):
+        return records
+    for token in sorted(os.listdir(outputs_root)):
+        journal_root = os.path.join(outputs_root, token, "journal")
+        if not safe_exists(journal_root, VERBOSE):
+            continue
+        for txn_id in sorted(os.listdir(journal_root)):
+            txn_json = os.path.join(journal_root, txn_id, "txn.json")
+            if not safe_exists(txn_json, VERBOSE):
+                continue
+            txn = _load_classifiable_txn(txn_json, output_base=output_base)
+            key = (txn["archive_path"], txn["output_dir"])
+            if key not in archive_keys:
+                records.append(txn)
+    return records
+
+
+def _classify_existing_work_base(manifest, output_base):
+    saw_resume_required = False
+    for manifest_archive in _iter_dataset_manifest_archives(manifest):
+        txn = _selected_txn_for_manifest_archive(manifest_archive, output_base)
+        archive_classification = _reconciled_archive_classification(manifest_archive, txn)
+        if archive_classification == "resume_required":
+            saw_resume_required = True
+            continue
+        if archive_classification not in ("succeeded", "failed"):
+            return "ambiguous"
+
+    manifest_archive_paths = {
+        os.path.abspath(entry["archive_path"]) for entry in _iter_dataset_manifest_archives(manifest)
+    }
+    for txn in _orphan_txn_records(output_base, manifest):
+        if txn.get("archive_path") in manifest_archive_paths:
+            return "ambiguous"
+        if _txn_has_recovery_responsibility(txn):
+            return "ambiguous"
+        if not _txn_is_closed_terminal_outcome(txn):
+            return "ambiguous"
+
+    if saw_resume_required:
+        return "resume_required"
+    return "terminal_residue"
+
+
+def _retired_work_base_path(work_base, manifest):
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    run_token = (manifest or {}).get("run_id") or hashlib.sha256(
+        os.path.abspath(work_base).encode("utf-8")
+    ).hexdigest()[:8]
+    base = os.path.join(
+        os.path.dirname(work_base),
+        f".advdecompress_work.retired.{timestamp}.{run_token}",
+    )
+    if not safe_exists(base, VERBOSE):
+        return base
+    for index in range(1, 10000):
+        candidate = f"{base}.{index}"
+        if not safe_exists(candidate, VERBOSE):
+            return candidate
+    raise RuntimeError(f"Could not allocate retired workdir path for: {work_base}")
+
+
+def _retire_terminal_work_base(work_base, manifest):
+    if safe_rmtree(work_base, VERBOSE):
+        return True
+    retired_path = _retired_work_base_path(work_base, manifest)
+    try:
+        _atomic_rename(work_base, retired_path, debug=VERBOSE)
+        print(f"Warning: Retired terminal transactional workdir to: {retired_path}")
+        return True
+    except Exception as e:
+        _print_strict_resume_delete_workdir_error(
+            work_base,
+            f"Terminal transactional workdir could not be deleted or retired to {retired_path}: {e}",
+        )
+        return False
+
+
 def _validate_strict_resume_startup(args):
     output_base = _output_base_from_args(args)
     work_base = _work_base(output_base)
+    if not safe_exists(work_base, VERBOSE):
+        return True
+
     try:
         manifest = _load_dataset_manifest(output_base)
     except ValueError as e:
@@ -4894,17 +5408,33 @@ def _validate_strict_resume_startup(args):
         return False
 
     if manifest is None:
-        if safe_exists(work_base, VERBOSE):
-            _print_strict_resume_delete_workdir_error(
-                work_base,
-                "Existing transactional workdir is incompatible with strict dataset resume because dataset_manifest.json is missing.",
-            )
-            return False
-        return True
+        _print_strict_resume_delete_workdir_error(
+            work_base,
+            "Existing transactional workdir is ambiguous because dataset_manifest.json is missing.",
+        )
+        return False
 
     manifest_reason = _validate_loaded_dataset_manifest(manifest, output_base)
     if manifest_reason is not None:
         _print_strict_resume_delete_workdir_error(work_base, manifest_reason)
+        return False
+
+    try:
+        classification = _classify_existing_work_base(manifest, output_base)
+    except Exception as e:
+        _print_strict_resume_delete_workdir_error(
+            work_base,
+            f"Existing transactional workdir is ambiguous during startup classification: {e}",
+        )
+        return False
+
+    if classification == "terminal_residue":
+        return _retire_terminal_work_base(work_base, manifest)
+    if classification == "ambiguous":
+        _print_strict_resume_delete_workdir_error(
+            work_base,
+            "Existing transactional workdir is ambiguous and requires manual intervention.",
+        )
         return False
 
     stored_fingerprint = manifest.get("command_fingerprint") or {}
@@ -4924,26 +5454,29 @@ def _validate_strict_resume_startup(args):
     return True
 
 
+def _source_mutation_requires_durability(args):
+    return not bool(getattr(args, "legacy", False)) and (
+        getattr(args, "success_policy", None) in ("delete", "move")
+        or getattr(args, "fail_policy", None) == "move"
+        or getattr(args, "traditional_zip_policy", None) == "move"
+    )
+
+
 def _validate_delete_durability_args(args):
     delete_mode = _resolve_effective_delete_mode(args)
 
-    if delete_mode == "not_delete":
-        return True
+    if _source_mutation_requires_durability(args):
+        if getattr(args, "no_durability", False):
+            print(
+                "Error: Transactional source-mutating finalization requires durability; --no-durability is invalid."
+            )
+            return False
 
-    if delete_mode == "legacy_delete":
-        return True
-
-    if getattr(args, "no_durability", False):
-        print(
-            "Error: Transactional -sp delete requires payload durability; --no-durability is invalid with -sp delete."
-        )
-        return False
-
-    if getattr(args, "fsync_files", "auto") == "none":
-        print(
-            "Error: Transactional -sp delete requires payload durability; --fsync-files none is invalid with -sp delete."
-        )
-        return False
+        if getattr(args, "fsync_files", "auto") == "none":
+            print(
+                "Error: Transactional source-mutating finalization requires durability; --fsync-files none is invalid."
+            )
+            return False
 
     if delete_mode == "txn_delete_blocked_windows":
         print(
@@ -5273,10 +5806,24 @@ def _build_manifest_discovered_archives(processor, archives, *, args):
     return discovered_archives
 
 
-def _work_root(output_dir, output_base):
+def _output_token(output_dir):
     output_dir_abs = os.path.abspath(output_dir)
-    token = hashlib.sha1(output_dir_abs.encode("utf-8")).hexdigest()[:16]
-    return os.path.join(_work_base(output_base), "outputs", token)
+    return hashlib.sha1(output_dir_abs.encode("utf-8")).hexdigest()[:16]
+
+
+def _shared_locks_root(output_base):
+    return os.path.join(_work_base(output_base), "locks")
+
+
+def _output_lock_path(output_dir, output_base):
+    return os.path.join(
+        _shared_locks_root(output_base),
+        _output_token(output_dir) + ".lock",
+    )
+
+
+def _work_root(output_dir, output_base):
+    return os.path.join(_work_base(output_base), "outputs", _output_token(output_dir))
 
 
 def _txn_paths(output_dir, output_base, txn_id):
@@ -5289,7 +5836,6 @@ def _txn_paths(output_dir, output_base, txn_id):
         "txn_json": os.path.join(work_root, "journal", txn_id, "txn.json"),
         "wal": os.path.join(work_root, "journal", txn_id, "txn.wal"),
         "trash_dir": os.path.join(work_root, "trash", txn_id),
-        "lock_file": os.path.join(work_root, "locks", "output_dir.lock"),
     }
 
 
@@ -5323,7 +5869,7 @@ def _validate_environment_for_output_dir(
     safe_makedirs(os.path.join(work_root, "incoming"), debug=VERBOSE)
     safe_makedirs(os.path.join(work_root, "journal"), debug=VERBOSE)
     safe_makedirs(os.path.join(work_root, "trash"), debug=VERBOSE)
-    safe_makedirs(os.path.join(work_root, "locks"), debug=VERBOSE)
+    safe_makedirs(_shared_locks_root(output_base), debug=VERBOSE)
 
 
 def _atomic_rename(src, dst, *, degrade_cross_volume=False, debug=False):
@@ -5358,6 +5904,21 @@ class WalWriter:
         safe_path = normalize_local_fs_path(path, debug)
         self._f = open(safe_path, "a", encoding="utf-8")
         self._since_fsync = 0
+        self._dir_entry_fsynced = False
+
+    def _ensure_dir_entry_durable(self):
+        if self._dir_entry_fsynced:
+            return
+        dir_result = _fsync_dir(os.path.dirname(self.path), debug=self.debug)
+        if not dir_result:
+            raise RuntimeError(
+                _fsync_dir_error_message(
+                    "journal_dir_fsync_failed:wal",
+                    os.path.dirname(self.path),
+                    dir_result,
+                )
+            )
+        self._dir_entry_fsynced = True
 
     def append(self, records, *, force_fsync=False):
         for r in records:
@@ -5368,6 +5929,7 @@ class WalWriter:
             self.fsync_every > 0 and self._since_fsync >= self.fsync_every
         ):
             os.fsync(self._f.fileno())
+            self._ensure_dir_entry_durable()
             self._since_fsync = 0
 
     def close(self, *, force_fsync=True):
@@ -5375,6 +5937,7 @@ class WalWriter:
             self._f.flush()
             if force_fsync:
                 os.fsync(self._f.fileno())
+                self._ensure_dir_entry_durable()
         finally:
             try:
                 self._f.close()
@@ -5411,8 +5974,42 @@ def _replay_wal(wal_path):
     return plans_by_id, done_set
 
 
+def _fsync_journal_checkpoint(txn, *, include_parent=False):
+    journal_dir = txn["paths"]["journal_dir"]
+    if include_parent:
+        journal_parent = os.path.dirname(journal_dir)
+        parent_result = _fsync_dir(journal_parent, debug=VERBOSE)
+        if not parent_result:
+            raise RuntimeError(
+                _fsync_dir_error_message(
+                    "journal_dir_fsync_failed:parent",
+                    journal_parent,
+                    parent_result,
+                )
+            )
+    dir_result = _fsync_dir(journal_dir, debug=VERBOSE)
+    if not dir_result:
+        raise RuntimeError(
+            _fsync_dir_error_message(
+                "journal_dir_fsync_failed:dir",
+                journal_dir,
+                dir_result,
+            )
+        )
+
+
+def _snapshot_move_progress(txn, plans_by_id, done_ids):
+    placement = txn.setdefault("placement", {})
+    placement["move_plan_snapshot"] = [
+        {"id": int(move_id), "src": plan["src"], "dst": plan["dst"]}
+        for move_id, plan in sorted(plans_by_id.items())
+    ]
+    placement["move_done_ids_snapshot"] = sorted(int(move_id) for move_id in done_ids)
+
+
 def _txn_snapshot(txn):
     atomic_write_json(txn["paths"]["txn_json"], txn, debug=VERBOSE)
+    _fsync_journal_checkpoint(txn, include_parent=False)
 
 
 def _txn_fail(txn, error_type, message):
@@ -5477,6 +6074,7 @@ def _txn_create(
         "error": None,
     }
 
+    _fsync_journal_checkpoint(txn, include_parent=True)
     _txn_snapshot(txn)
     return txn
 
@@ -5710,6 +6308,23 @@ def _track_payload_destinations_from_wal(txn):
             _track_payload_destination(txn, dst)
 
 
+def _track_payload_destinations_from_snapshot(txn):
+    placement = txn.get("placement") or {}
+    plans_by_id = {}
+    for plan in placement.get("move_plan_snapshot") or []:
+        try:
+            move_id = int(plan.get("id"))
+        except Exception:
+            continue
+        plans_by_id[move_id] = plan
+
+    for move_id in placement.get("move_done_ids_snapshot") or []:
+        plan = plans_by_id.get(int(move_id))
+        if plan is None:
+            continue
+        _track_payload_destination(txn, plan.get("dst"))
+
+
 def _placement_known_output_dirs(txn):
     placement = txn.get("placement") or {}
     dirs = [os.path.abspath(txn["output_dir"])]
@@ -5736,6 +6351,7 @@ def _path_depth(path):
 
 def _expected_payload_durability_paths(txn):
     _track_payload_destinations_from_wal(txn)
+    _track_payload_destinations_from_snapshot(txn)
 
     for dir_path in _placement_known_output_dirs(txn):
         _track_payload_dir_hierarchy(txn, dir_path)
@@ -6098,7 +6714,11 @@ def _plan_file_content_with_folder_separate_moves(txn, *, conflict_mode):
 
 
 def _execute_plans(txn, plans, *, wal_writer, degrade_cross_volume=False):
+    plans_by_id = {int(plan["id"]): plan for plan in plans}
+    done_ids = set()
+    _snapshot_move_progress(txn, plans_by_id, done_ids)
     if not plans:
+        _txn_snapshot(txn)
         return
 
     wal_writer.append(plans, force_fsync=True)
@@ -6114,8 +6734,12 @@ def _execute_plans(txn, plans, *, wal_writer, degrade_cross_volume=False):
         _track_payload_destination(txn, p["dst"])
         wal_writer.append([{"t": "MOVE_DONE", "id": int(p["id"])}], force_fsync=False)
         txn["moves"]["done"] += 1
+        done_ids.add(int(p["id"]))
+        _snapshot_move_progress(txn, plans_by_id, done_ids)
         if snapshot_every > 0 and txn["moves"]["done"] % snapshot_every == 0:
             _txn_snapshot(txn)
+
+    _txn_snapshot(txn)
 
 
 def _execute_policy_with_wal(
@@ -6275,6 +6899,31 @@ def _resume_placing_from_wal(txn, *, wal_fsync_every, degrade_cross_volume=False
     return True
 
 
+def _resume_placing_from_snapshot(txn, *, degrade_cross_volume=False):
+    placement = txn.get("placement") or {}
+    plans = placement.get("move_plan_snapshot") or []
+    done_ids = {int(move_id) for move_id in (placement.get("move_done_ids_snapshot") or [])}
+    for plan in plans:
+        move_id = int(plan["id"])
+        src = plan["src"]
+        dst = plan["dst"]
+        if move_id in done_ids:
+            continue
+        src_exists = safe_exists(src, VERBOSE)
+        dst_exists = safe_exists(dst, VERBOSE)
+        if dst_exists and not src_exists:
+            _track_payload_destination(txn, dst)
+            continue
+        if src_exists and not dst_exists:
+            _atomic_rename(src, dst, degrade_cross_volume=degrade_cross_volume, debug=VERBOSE)
+            _track_payload_destination(txn, dst)
+            continue
+        if src_exists and dst_exists:
+            raise RuntimeError(f"Both src and dst exist for snapshot id={move_id}: {src} {dst}")
+        raise RuntimeError(f"Missing both src and dst for snapshot id={move_id}: {src} {dst}")
+    return True
+
+
 def _drain_incoming_dir(txn):
     incoming_dir = txn["paths"]["incoming_dir"]
     if not safe_exists(incoming_dir, VERBOSE):
@@ -6326,14 +6975,14 @@ def _durability_barrier(
     delete_mode="not_delete",
 ):
     if fsync_files == "none":
-        if success_policy == "delete":
+        if success_policy in ("delete", "move"):
             raise RuntimeError(
-                "success_policy=delete requires payload durability; --fsync-files none is invalid"
+                f"success_policy={success_policy} requires payload durability; --fsync-files none is invalid"
             )
         return
     wal_fsynced = _fsync_file(txn["paths"]["wal"], debug=VERBOSE)
     txn_json_fsynced = _fsync_file(txn["paths"]["txn_json"], debug=VERBOSE)
-    if success_policy != "delete":
+    if success_policy not in ("delete", "move"):
         return
 
     if not wal_fsynced:
@@ -6354,24 +7003,61 @@ def _durability_barrier(
 
 
 def _is_delete_durability_failure(args, error):
-    if getattr(args, "success_policy", None) != "delete":
+    if getattr(args, "success_policy", None) not in ("delete", "move"):
         return False
     message = str(error)
     return (
         message.startswith("payload_fsync_failed:")
         or message.startswith("journal_fsync_failed:")
         or message.startswith("payload_missing:")
+        or message.startswith("source_move_fsync_failed:")
     )
 
 
 def _record_finalized_source_destination(txn, src, dst):
     placement = txn.setdefault("placement", {})
     placements = placement.setdefault("finalized_source_moves", [])
-    record = {"src": os.path.abspath(src), "dst": os.path.abspath(dst)}
-    if record not in placements:
+    src_abs = os.path.abspath(src)
+    dst_abs = os.path.abspath(dst)
+    record = None
+    for existing in placements:
+        if os.path.abspath(existing.get("src") or "") != src_abs:
+            continue
+        existing["dst"] = dst_abs
+        existing["durable"] = bool(existing.get("durable", False))
+        record = existing
+        break
+    if record is None:
+        record = {"src": src_abs, "dst": dst_abs, "durable": False}
         placements.append(record)
     if not placement.get("finalized_source_primary_dst"):
         placement["finalized_source_primary_dst"] = record["dst"]
+
+
+def _mark_finalized_source_destination_durable(txn, src, dst):
+    src_abs = os.path.abspath(src)
+    dst_abs = os.path.abspath(dst)
+    placements = txn.setdefault("placement", {}).setdefault("finalized_source_moves", [])
+    matched = False
+    for record in placements:
+        if os.path.abspath(record.get("src") or "") != src_abs:
+            continue
+        record["dst"] = dst_abs
+        record["durable"] = True
+        matched = True
+        break
+
+    if not matched:
+        _record_finalized_source_destination(txn, src_abs, dst_abs)
+        placements[-1]["durable"] = True
+
+    try:
+        _txn_snapshot(txn)
+    except Exception as e:
+        if str(e).startswith("journal_dir_fsync_failed:"):
+            raise RuntimeError(f"source_move_fsync_failed:journal:{e}") from e
+        raise
+    return dst_abs
 
 
 def _planned_finalized_source_move(txn, src):
@@ -6385,8 +7071,41 @@ def _planned_finalized_source_move(txn, src):
 
 def _plan_finalized_source_destination(txn, src, dst):
     _record_finalized_source_destination(txn, src, dst)
-    _txn_snapshot(txn)
+    try:
+        _txn_snapshot(txn)
+    except Exception as e:
+        if str(e).startswith("journal_dir_fsync_failed:"):
+            raise RuntimeError(f"source_move_fsync_failed:journal:{e}") from e
+        raise
     return os.path.abspath(dst)
+
+
+def _durably_finalize_planned_source_move(txn, src, dst, *, degrade_cross_volume=False):
+    planned_dst = _plan_finalized_source_destination(txn, src, dst)
+    src_exists = safe_exists(src, VERBOSE)
+    dst_exists = safe_exists(planned_dst, VERBOSE)
+
+    if src_exists:
+        _atomic_rename(
+            src,
+            planned_dst,
+            degrade_cross_volume=degrade_cross_volume,
+            debug=VERBOSE,
+        )
+    elif not dst_exists:
+        raise RuntimeError(
+            f"Missing both source and finalized destination: {src} {planned_dst}"
+        )
+
+    if not _fsync_file(planned_dst, debug=VERBOSE):
+        raise RuntimeError(f"source_move_fsync_failed:file:{planned_dst}")
+    parent_dir = os.path.dirname(planned_dst)
+    dir_result = _fsync_dir(parent_dir, debug=VERBOSE)
+    if not dir_result:
+        raise RuntimeError(
+            _fsync_dir_error_message("source_move_fsync_failed:dir", parent_dir, dir_result)
+        )
+    return _mark_finalized_source_destination_durable(txn, src, planned_dst)
 
 
 def _set_source_finalization_plan(
@@ -6400,6 +7119,13 @@ def _set_source_finalization_plan(
     placement["source_finalization_manifest_state"] = manifest_state
     placement["source_finalization_disposition"] = final_disposition
     placement["source_finalization_txn_state"] = txn_terminal_state
+
+
+def _record_delete_trash_cleanup_failure(txn):
+    placement = txn.setdefault("placement", {})
+    if placement.get("delete_trash_cleanup_failed"):
+        return
+    placement["delete_trash_cleanup_failed"] = True
 
 
 def _txn_source_finalization_plan(txn):
@@ -6424,6 +7150,27 @@ def _txn_source_finalization_completed(txn):
     if plan["final_disposition"] in ("success:asis", "failure:asis"):
         return True
 
+    if plan["final_disposition"] in (
+        "success:move",
+        "failure:move",
+        "skipped:traditional_zip_moved",
+    ):
+        state = txn.get("state")
+        error_type = ((txn.get("error") or {}).get("type") or "")
+        if state == TXN_STATE_ABORTED and error_type in (
+            "DURABILITY_FAILED",
+            "FAIL_FINALIZE_FAILED",
+        ):
+            return False
+        if state not in (
+            TXN_STATE_SOURCE_FINALIZED,
+            TXN_STATE_DONE,
+            TXN_STATE_FAILED,
+            TXN_STATE_ABORTED,
+            TXN_STATE_CLEANED,
+        ):
+            return False
+
     volumes = [os.path.abspath(v) for v in (txn.get("volumes") or [])]
     if not volumes:
         return False
@@ -6436,26 +7183,42 @@ def _txn_source_finalization_completed(txn):
     )
     if source_finalization_kind == "delete":
         trash_dir = (txn.get("paths") or {}).get("trash_dir")
-        return not (trash_dir and safe_exists(trash_dir, VERBOSE))
+        if trash_dir and safe_exists(trash_dir, VERBOSE):
+            return bool((txn.get("placement") or {}).get("delete_trash_cleanup_failed"))
+        return True
 
     finalized_moves = {
-        os.path.abspath(record.get("src")): os.path.abspath(record.get("dst"))
+        os.path.abspath(record.get("src")): {
+            "dst": os.path.abspath(record.get("dst")),
+            "durable": bool(record.get("durable", False)),
+        }
         for record in ((txn.get("placement") or {}).get("finalized_source_moves") or [])
         if record.get("src") and record.get("dst")
     }
     if set(volumes) - set(finalized_moves):
         return False
 
-    for dst in finalized_moves.values():
-        if not safe_exists(dst, VERBOSE):
+    if txn.get("state") == TXN_STATE_ABORTED:
+        for record in finalized_moves.values():
+            if not record["durable"]:
+                return False
+
+    for record in finalized_moves.values():
+        if not safe_exists(record["dst"], VERBOSE):
             return False
 
     return True
 
 
 def _mark_txn_success_terminal(txn, *, final_disposition):
+    previous_state = txn.get("state")
     txn["state"] = TXN_STATE_DONE
-    _txn_snapshot(txn)
+    try:
+        _txn_snapshot(txn)
+    except Exception:
+        txn["state"] = previous_state
+        raise
+    _cleanup_workdir(txn)
     _update_dataset_manifest_archive(
         txn["output_base"],
         txn["archive_path"],
@@ -6474,10 +7237,18 @@ def _mark_txn_failure_terminal(
     error=None,
     tx_state=TXN_STATE_FAILED,
 ):
+    previous_state = txn.get("state")
+    previous_error = txn.get("error")
     if error is not None:
         txn["error"] = error
     txn["state"] = tx_state
-    _txn_snapshot(txn)
+    try:
+        _txn_snapshot(txn)
+    except Exception:
+        txn["state"] = previous_state
+        txn["error"] = previous_error
+        raise
+    _cleanup_workdir(txn)
     _update_dataset_manifest_archive(
         txn["output_base"],
         txn["archive_path"],
@@ -6539,10 +7310,14 @@ def _finalize_traditional_zip_move(txn, *, args):
             dst = os.path.join(target_dir, os.path.basename(volume))
             if safe_exists(dst, VERBOSE):
                 dst = _ensure_unique_path(dst, txn["txn_id"][:8])
-            dst = _plan_finalized_source_destination(txn, volume, dst)
         safe_makedirs(os.path.dirname(dst), debug=VERBOSE)
-        if safe_exists(volume, VERBOSE):
-            _atomic_rename(volume, dst, degrade_cross_volume=True, debug=VERBOSE)
+        if safe_exists(volume, VERBOSE) or safe_exists(dst, VERBOSE):
+            _durably_finalize_planned_source_move(
+                txn,
+                volume,
+                dst,
+                degrade_cross_volume=True,
+            )
 
 
 def _resume_source_finalization_if_needed(txn, *, args):
@@ -6554,10 +7329,18 @@ def _resume_source_finalization_if_needed(txn, *, args):
     if completed is not None:
         return True
 
+    def snapshot_source_finalized_state():
+        previous_state = txn.get("state")
+        txn["state"] = TXN_STATE_SOURCE_FINALIZED
+        try:
+            _txn_snapshot(txn)
+        except Exception:
+            txn["state"] = previous_state
+            raise
+
     disposition = plan["final_disposition"]
     if disposition == "success:asis":
-        txn["state"] = TXN_STATE_SOURCE_FINALIZED
-        _txn_snapshot(txn)
+        snapshot_source_finalized_state()
         return _complete_source_finalization_plan(txn) is not None
     if disposition in _SUCCESSFUL_SOURCE_FINALIZATION_DISPOSITIONS:
         _finalize_sources_success(txn, args=args)
@@ -6568,8 +7351,7 @@ def _resume_source_finalization_if_needed(txn, *, args):
     else:
         return False
 
-    txn["state"] = TXN_STATE_SOURCE_FINALIZED
-    _txn_snapshot(txn)
+    snapshot_source_finalized_state()
     completed = _complete_source_finalization_plan(txn)
     return completed is not None
 
@@ -6610,7 +7392,11 @@ def _finalize_sources_success(txn, *, args):
                     debug=VERBOSE,
                 )
 
-        safe_rmtree(trash_dir, VERBOSE)
+        if not safe_rmtree(trash_dir, VERBOSE):
+            _record_delete_trash_cleanup_failure(txn)
+            print(
+                f"  Warning: Could not remove transactional trash dir {trash_dir}; source finalization is complete and future runs will treat the residue as terminal."
+            )
         return
 
     if success_policy == "move":
@@ -6632,14 +7418,13 @@ def _finalize_sources_success(txn, *, args):
                 dst = os.path.join(dest_dir, os.path.basename(v))
                 if safe_exists(dst, VERBOSE):
                     dst = _ensure_unique_path(dst, txn["txn_id"][:8])
-                dst = _plan_finalized_source_destination(txn, v, dst)
             safe_makedirs(os.path.dirname(dst), debug=VERBOSE)
-            if safe_exists(v, VERBOSE):
-                _atomic_rename(
+            if safe_exists(v, VERBOSE) or safe_exists(dst, VERBOSE):
+                _durably_finalize_planned_source_move(
+                    txn,
                     v,
                     dst,
                     degrade_cross_volume=getattr(args, "degrade_cross_volume", False),
-                    debug=VERBOSE,
                 )
         return
 
@@ -6667,56 +7452,86 @@ def _finalize_sources_failure(volumes, *, args, txn=None):
                 dst = _ensure_unique_path(
                     dst, (txn["txn_id"][:8] if txn else uuid.uuid4().hex[:8])
                 )
-            if txn is not None:
-                dst = _plan_finalized_source_destination(txn, v, dst)
         safe_makedirs(os.path.dirname(dst), debug=VERBOSE)
         if safe_exists(v, VERBOSE):
-            _atomic_rename(
+            if txn is None:
+                _atomic_rename(
+                    v,
+                    dst,
+                    degrade_cross_volume=getattr(args, "degrade_cross_volume", False),
+                    debug=VERBOSE,
+                )
+                if not _fsync_file(dst, debug=VERBOSE):
+                    raise RuntimeError(f"source_move_fsync_failed:file:{dst}")
+                parent_dir = os.path.dirname(dst)
+                dir_result = _fsync_dir(parent_dir, debug=VERBOSE)
+                if not dir_result:
+                    raise RuntimeError(
+                        _fsync_dir_error_message(
+                            "source_move_fsync_failed:dir",
+                            parent_dir,
+                            dir_result,
+                        )
+                    )
+            else:
+                _durably_finalize_planned_source_move(
+                    txn,
+                    v,
+                    dst,
+                    degrade_cross_volume=getattr(args, "degrade_cross_volume", False),
+                )
+        elif txn is not None and safe_exists(dst, VERBOSE):
+            _durably_finalize_planned_source_move(
+                txn,
                 v,
                 dst,
                 degrade_cross_volume=getattr(args, "degrade_cross_volume", False),
-                debug=VERBOSE,
             )
 
 
 def _cleanup_workdir(txn):
-    # remove staging/<txn_id> and incoming/<txn_id>, keep journal for GC
     work_root = txn["paths"]["work_root"]
     txn_id = txn["txn_id"]
-    safe_rmtree(os.path.join(work_root, "staging", txn_id), VERBOSE)
-    safe_rmtree(os.path.join(work_root, "incoming", txn_id), VERBOSE)
+    subtree_paths = [
+        os.path.join(work_root, "staging", txn_id),
+        os.path.join(work_root, "incoming", txn_id),
+        os.path.join(work_root, "trash", txn_id),
+    ]
+    for subtree_path in subtree_paths:
+        if not safe_exists(subtree_path, VERBOSE):
+            continue
+        if not safe_rmtree(subtree_path, VERBOSE):
+            print(f"  Warning: Could not clean transactional subtree {subtree_path}")
 
 
-def _gc_manifest_archive_state_for_txn(manifest, txn):
+def _gc_should_delete_journal(txn, manifest, output_base):
     if manifest is None:
-        return None
+        return (not _txn_has_recovery_responsibility(txn)) and _txn_is_closed_terminal_outcome(txn)
+
     archive_path = txn.get("archive_path")
     if not archive_path:
-        return None
-    entry = _get_dataset_manifest_archive_entry(manifest, archive_path)
-    if entry is None:
-        return None
-    return entry.get("state")
+        return False
 
+    manifest_archive = _get_dataset_manifest_archive_entry(manifest, archive_path)
+    if manifest_archive is None:
+        return False
 
-def _gc_should_delete_journal(txn, manifest):
-    state = txn.get("state")
-    manifest_archive_state = _gc_manifest_archive_state_for_txn(manifest, txn)
+    try:
+        selected_txn = _selected_txn_for_manifest_archive(manifest_archive, output_base)
+        effective_state = _reconciled_archive_classification(manifest_archive, selected_txn)
+    except Exception:
+        return False
 
-    if state == TXN_STATE_DONE:
-        if manifest is None:
-            return True
-        return manifest_archive_state in ("succeeded", "failed")
+    if effective_state not in ("succeeded", "failed"):
+        return False
 
-    if state == TXN_STATE_FAILED:
-        return manifest_archive_state == "failed"
+    if selected_txn is None:
+        return False
 
-    if state == TXN_STATE_ABORTED:
-        if manifest is None:
-            return False
-        return manifest_archive_state in ("succeeded", "failed")
+    if selected_txn.get("txn_id") != txn.get("txn_id"):
+        return True
 
-    return False
+    return not _txn_has_recovery_responsibility(txn)
 
 
 def _garbage_collect(output_dir, *, output_base, keep_journal_days=7):
@@ -6743,7 +7558,7 @@ def _garbage_collect(output_dir, *, output_base, keep_journal_days=7):
             safe_txn_json = normalize_local_fs_path(txn_json, VERBOSE)
             with open(safe_txn_json, "r", encoding="utf-8") as f:
                 txn = json.load(f)
-            if _gc_should_delete_journal(txn, manifest):
+            if _gc_should_delete_journal(txn, manifest, output_base):
                 safe_rmtree(txn_dir, VERBOSE)
         except Exception:
             continue
@@ -6809,7 +7624,10 @@ def _recover_output_dir(
             elif _recoverable_txn_state_from_failed(txn) is None:
                 continue
         if state == TXN_STATE_ABORTED:
-            if _classify_aborted_txn_state(txn) != "recoverable":
+            if (
+                not _txn_has_incomplete_source_finalization(txn)
+                and _classify_aborted_txn_state(txn) != "recoverable"
+            ):
                 continue
 
         try:
@@ -6841,50 +7659,16 @@ def _recover_output_dir(
 
 
 def _load_latest_txn_for_archive(manifest_archive, output_base):
-    preferred_txn_id = None
-    if manifest_archive is not None:
-        preferred_txn_id = manifest_archive.get("last_txn_id")
-    journal_root = os.path.join(
-        _work_root(manifest_archive["output_dir"], output_base), "journal"
-    )
-    if not safe_exists(journal_root, VERBOSE):
+    if manifest_archive is None:
         return None
-
-    candidate_ids = []
-    if preferred_txn_id:
-        candidate_ids.append(preferred_txn_id)
-    try:
-        for txn_id in sorted(os.listdir(journal_root)):
-            if txn_id != preferred_txn_id:
-                candidate_ids.append(txn_id)
-    except Exception:
-        return None
-
-    archive_path = os.path.abspath(manifest_archive["archive_path"])
-    latest_txn = None
-    latest_mtime = None
-
-    for txn_id in candidate_ids:
-        txn_json = os.path.join(journal_root, txn_id, "txn.json")
-        if not safe_exists(txn_json, VERBOSE):
-            continue
-        try:
-            safe_txn_json = normalize_local_fs_path(txn_json, VERBOSE)
-            with open(safe_txn_json, "r", encoding="utf-8") as f:
-                txn = json.load(f)
-            if os.path.abspath(txn.get("archive_path", "")) != archive_path:
-                continue
-            txn_mtime = os.path.getmtime(txn_json)
-        except Exception:
-            continue
-        if latest_txn is None or txn_mtime >= latest_mtime:
-            latest_txn = txn
-            latest_mtime = txn_mtime
-
-    return latest_txn
+    return _selected_txn_for_manifest_archive(manifest_archive, output_base)
 
 
 def _load_latest_txn_by_archive_path(archive_path, output_dir, output_base):
+    manifest = _load_dataset_manifest(output_base)
+    manifest_archive = _get_dataset_manifest_archive_entry(manifest, archive_path)
+    if manifest_archive is not None:
+        return _load_latest_txn_for_archive(manifest_archive, output_base)
     return _load_latest_txn_for_archive(
         {
             "archive_path": archive_path,
@@ -6901,9 +7685,28 @@ def _txn_path_has_recoverable_contents(path):
     return (files + dirs) > 0
 
 
-def _txn_has_resumable_wal(txn):
+def _txn_recoverable_placing_state(txn):
+    state = txn.get("state")
+    if state == TXN_STATE_PLACING:
+        return TXN_STATE_PLACING
+    if state == TXN_STATE_FAILED:
+        return _recoverable_txn_state_from_failed(txn)
+    if state == TXN_STATE_ABORTED:
+        return _recoverable_txn_state_from_aborted(txn)
+    return None
+
+
+def _txn_requires_wal_resume(txn):
+    return _txn_recoverable_placing_state(txn) == TXN_STATE_PLACING
+
+
+def _txn_has_replayable_wal(txn):
     wal_path = (txn.get("paths") or {}).get("wal")
-    if not wal_path or not safe_exists(wal_path, VERBOSE):
+    if (
+        not wal_path
+        or not safe_exists(wal_path, VERBOSE)
+        or not safe_isfile(wal_path, VERBOSE)
+    ):
         return False
 
     try:
@@ -6911,30 +7714,77 @@ def _txn_has_resumable_wal(txn):
     except Exception:
         return False
 
-    if not plans_by_id:
-        return False
-
     for move_id, plan in plans_by_id.items():
-        if move_id in done_set:
-            continue
-        src_exists = safe_exists(plan.get("src"), VERBOSE)
-        dst_exists = safe_exists(plan.get("dst"), VERBOSE)
-        if src_exists == dst_exists:
+        if not isinstance(move_id, int):
+            return False
+        if not isinstance(plan, dict):
+            return False
+        if not isinstance(plan.get("src"), str) or not isinstance(plan.get("dst"), str):
+            return False
+
+    for move_id in done_set:
+        if not isinstance(move_id, int):
+            return False
+
+    return bool(plans_by_id)
+
+
+def _txn_has_snapshot_resume_state(txn):
+    placement = txn.get("placement") or {}
+    plans = placement.get("move_plan_snapshot")
+    done_ids = placement.get("move_done_ids_snapshot")
+    if not isinstance(plans, list) or not isinstance(done_ids, list):
+        return False
+    for plan in plans:
+        if not isinstance(plan, dict):
+            return False
+        if not isinstance(plan.get("id"), int):
+            return False
+        if not isinstance(plan.get("src"), str) or not isinstance(plan.get("dst"), str):
+            return False
+    for move_id in done_ids:
+        if not isinstance(move_id, int):
+            return False
+
+    plan_ids = {plan["id"] for plan in plans}
+    for move_id in done_ids:
+        if move_id not in plan_ids:
             return False
 
     return True
 
 
+def _txn_has_aborted_placing_residue(txn, *, has_staging=None, has_incoming=None):
+    if txn.get("state") != TXN_STATE_ABORTED:
+        return False
+    if _txn_source_finalization_plan(txn) is not None:
+        return False
+    if not txn.get("policy_frozen") or not txn.get("resolved_policy"):
+        return False
+
+    paths = txn.get("paths") or {}
+    if has_staging is None:
+        has_staging = _txn_path_has_recoverable_contents(paths.get("staging_extracted"))
+    if has_incoming is None:
+        has_incoming = _txn_path_has_recoverable_contents(paths.get("incoming_dir"))
+    return bool(has_staging or has_incoming)
+
 def _recoverable_txn_state_from_aborted(txn):
+    if _txn_source_finalization_completed(txn):
+        return None
+
     paths = txn.get("paths") or {}
     has_staging = _txn_path_has_recoverable_contents(paths.get("staging_extracted"))
     has_incoming = _txn_path_has_recoverable_contents(paths.get("incoming_dir"))
-    has_wal = _txn_has_resumable_wal(txn)
-
-    if has_staging and (has_incoming or has_wal):
-        return None
-    if has_wal:
+    if _txn_has_replayable_wal(txn) or _txn_has_snapshot_resume_state(txn):
         return TXN_STATE_PLACING
+    if _txn_has_aborted_placing_residue(
+        txn, has_staging=has_staging, has_incoming=has_incoming
+    ):
+        return None
+
+    if has_staging and has_incoming:
+        return None
     if has_incoming:
         return TXN_STATE_INCOMING_COMMITTED
     if has_staging:
@@ -6952,16 +7802,13 @@ def _recoverable_txn_state_from_failed(txn):
     error = txn.get("error") or {}
     if error.get("type") != "DURABILITY_FAILED":
         return None
-    if _txn_has_resumable_wal(txn):
+    if _txn_has_replayable_wal(txn) or _txn_has_snapshot_resume_state(txn):
         return TXN_STATE_PLACING
     return None
 
 
 def _classify_manifest_archive_state(manifest_archive, output_base):
     state = manifest_archive.get("state")
-    if state in ("succeeded", "failed"):
-        return state
-
     txn = _load_latest_txn_for_archive(manifest_archive, output_base)
     if txn is None:
         if state in ("extracting", "recoverable"):
@@ -6969,32 +7816,16 @@ def _classify_manifest_archive_state(manifest_archive, output_base):
         return state
 
     txn_state = txn.get("state")
-    if txn_state == TXN_STATE_DONE:
-        return "succeeded"
-    if _txn_source_finalization_plan(txn) is not None:
+    if _txn_has_recovery_responsibility(txn):
+        if txn_state == TXN_STATE_ABORTED and not _txn_has_incomplete_source_finalization(txn):
+            return _classify_aborted_txn_state(txn)
+        if txn_state == TXN_STATE_INIT and _txn_source_finalization_plan(txn) is None:
+            return "retryable"
         return "recoverable"
-    if _txn_has_incomplete_source_finalization(txn):
-        return "recoverable"
-    if txn_state == TXN_STATE_FAILED:
-        if _recoverable_txn_state_from_failed(txn) is not None:
-            return "recoverable"
-        return "failed"
+    if _txn_is_closed_terminal_outcome(txn):
+        return _txn_terminal_manifest_state(txn)
     if txn_state == TXN_STATE_ABORTED:
         return _classify_aborted_txn_state(txn)
-    if txn_state == TXN_STATE_INIT:
-        if state in ("extracting", "recoverable"):
-            return "retryable"
-        return state
-    if txn_state in (
-        TXN_STATE_EXTRACTED,
-        TXN_STATE_INCOMING_COMMITTED,
-        TXN_STATE_PLACING,
-        TXN_STATE_PLACED,
-        TXN_STATE_DURABLE,
-        TXN_STATE_SOURCE_FINALIZED,
-        TXN_STATE_CLEANED,
-    ):
-        return "recoverable"
     if state in ("extracting", "recoverable"):
         return "retryable"
     return state
@@ -7195,8 +8026,7 @@ def _recover_all_outputs(
     if recoverable_archives is None:
         output_dirs = _discover_output_dirs_for_recovery(output_base)
         for output_dir in output_dirs:
-            work_root = _work_root(output_dir, output_base)
-            lock_path = os.path.join(work_root, "locks", "output_dir.lock")
+            lock_path = _output_lock_path(output_dir, output_base)
             lock = FileLock(
                 lock_path,
                 timeout_ms=args.output_lock_timeout_ms,
@@ -7219,8 +8049,7 @@ def _recover_all_outputs(
 
     for recoverable_archive in recoverable_archives:
         output_dir = recoverable_archive["output_dir"]
-        work_root = _work_root(output_dir, output_base)
-        lock_path = os.path.join(work_root, "locks", "output_dir.lock")
+        lock_path = _output_lock_path(output_dir, output_base)
         lock = FileLock(
             lock_path,
             timeout_ms=args.output_lock_timeout_ms,
@@ -7500,7 +8329,7 @@ def _extract_phase(processor, archive_path, *, args, output_base):
 def _place_and_finalize_txn(txn, *, args, recovery=False):
     if txn.get("state") == TXN_STATE_DONE:
         return
-    if txn.get("state") == TXN_STATE_CLEANED:
+    if txn.get("state") == TXN_STATE_CLEANED and not _txn_has_incomplete_source_finalization(txn):
         _mark_txn_success_terminal(
             txn,
             final_disposition=_manifest_success_disposition(args),
@@ -7564,16 +8393,22 @@ def _place_and_finalize_txn(txn, *, args, recovery=False):
             txn["state"] = TXN_STATE_PLACING
             _txn_snapshot(txn)
 
-        if txn.get("state") == TXN_STATE_PLACING:
+        if _txn_requires_wal_resume(txn):
             resumed = False
-            try:
-                resumed = _resume_placing_from_wal(
+            if _txn_has_replayable_wal(txn):
+                try:
+                    resumed = _resume_placing_from_wal(
+                        txn,
+                        wal_fsync_every=args.wal_fsync_every,
+                        degrade_cross_volume=args.degrade_cross_volume,
+                    )
+                except json.JSONDecodeError:
+                    raise RuntimeError("wal_corrupted")
+            elif _txn_has_snapshot_resume_state(txn):
+                resumed = _resume_placing_from_snapshot(
                     txn,
-                    wal_fsync_every=args.wal_fsync_every,
                     degrade_cross_volume=args.degrade_cross_volume,
                 )
-            except json.JSONDecodeError:
-                raise RuntimeError("wal_corrupted")
 
             if not resumed:
                 _execute_policy_with_wal(
@@ -7644,23 +8479,38 @@ def _place_and_finalize_txn(txn, *, args, recovery=False):
                 finalized_at=None,
             )
             raise
-        _txn_fail(txn, "PLACE_FAILED" if not recovery else "RECOVER_FAILED", e)
-        _update_dataset_manifest_archive(
-            txn["output_base"],
-            txn["archive_path"],
-            state="failed",
-            last_txn_id=txn["txn_id"],
+        if str(e).startswith("source_move_fsync_failed:"):
+            _txn_abort(txn, "DURABILITY_FAILED", e)
+            _update_dataset_manifest_archive(
+                txn["output_base"],
+                txn["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn.get("error"),
+                finalized_at=None,
+            )
+            raise
+        if _txn_is_closed_terminal_outcome(txn):
+            raise
+        if (txn.get("error") or {}).get("type") == "FAIL_FINALIZE_FAILED" and _txn_has_incomplete_source_finalization(txn):
+            raise
+        _mark_txn_failure_terminal(
+            txn,
             final_disposition=_manifest_failure_disposition(args),
-            error=txn.get("error"),
-            finalized_at=_now_iso(),
+            error={
+                "type": "PLACE_FAILED" if not recovery else "RECOVER_FAILED",
+                "message": str(e),
+                "at": _now_iso(),
+            },
+            tx_state=TXN_STATE_FAILED,
         )
         raise
 
 
 def _finalize_one_txn(txn, *, processor, args, output_base):
     output_dir = txn["output_dir"]
-    work_root = _work_root(output_dir, output_base)
-    lock_path = os.path.join(work_root, "locks", "output_dir.lock")
+    lock_path = _output_lock_path(output_dir, output_base)
     lock = FileLock(
         lock_path,
         timeout_ms=args.output_lock_timeout_ms,
@@ -7761,11 +8611,37 @@ def _handle_transactional_result(
         processor.failed_archives.append(archive_path)
 
 
+def _all_txns_for_work_root(work_root, output_base):
+    journal_root = os.path.join(work_root, "journal")
+    txns = []
+    if not safe_exists(journal_root, VERBOSE):
+        return txns
+    for txn_id in sorted(os.listdir(journal_root)):
+        txn_json = os.path.join(journal_root, txn_id, "txn.json")
+        if not safe_exists(txn_json, VERBOSE):
+            continue
+        txns.append(_load_classifiable_txn(txn_json, output_base=output_base))
+    return txns
+
+
+def _work_root_cleanup_eligible(work_root, output_base):
+    try:
+        txns = _all_txns_for_work_root(work_root, output_base)
+    except Exception:
+        return False
+    for txn in txns:
+        if _txn_has_recovery_responsibility(txn):
+            return False
+        if not _txn_is_closed_terminal_outcome(txn):
+            return False
+    return True
+
+
 def _cleanup_one_transactional_output_dir(
     output_dir, *, output_base, args, should_clean, manifest_terminal=False
 ):
     work_root = _work_root(output_dir, output_base)
-    lock_path = os.path.join(work_root, "locks", "output_dir.lock")
+    lock_path = _output_lock_path(output_dir, output_base)
     lock = FileLock(
         lock_path,
         timeout_ms=args.output_lock_timeout_ms,
@@ -7787,14 +8663,12 @@ def _cleanup_one_transactional_output_dir(
                 return False
 
             if should_clean and manifest_terminal:
-                try:
-                    if not safe_rmtree(work_root, VERBOSE):
-                        print(f"  Warning: Could not clean journal dir {work_root}")
-                        return False
-                except KeyboardInterrupt:
-                    raise
-                except Exception as e:
-                    print(f"  Warning: Could not clean journal dir {work_root}: {e}")
+                if not _work_root_cleanup_eligible(work_root, output_base):
+                    return False
+                if not safe_rmtree(work_root, VERBOSE):
+                    print(
+                        f"  Warning: Could not clean transactional work root {work_root}; result is already terminal."
+                    )
                     return False
             return True
     except KeyboardInterrupt:
@@ -7840,6 +8714,8 @@ def _run_transactional(processor, archives, *, args):
     _warn_windows_unsafe_delete_startup(args)
 
     manifest = _load_dataset_manifest(output_base)
+    if manifest is None and not archives:
+        return None
     if manifest is None:
         manifest = _create_dataset_manifest(
             input_root=args.path,
@@ -7914,12 +8790,20 @@ def _run_transactional(processor, archives, *, args):
 
     if should_clean and manifest_terminal and all_cleanup_succeeded:
         work_base = _work_base(output_base)
-        try:
-            safe_rmtree(work_base, VERBOSE)
-        except KeyboardInterrupt:
-            raise
-        except Exception:
-            pass
+        outputs_root = os.path.join(work_base, "outputs")
+        all_work_roots_eligible = True
+        if safe_exists(outputs_root, VERBOSE):
+            for token in sorted(os.listdir(outputs_root)):
+                work_root = os.path.join(outputs_root, token)
+                if not safe_isdir(work_root, VERBOSE):
+                    continue
+                if not _work_root_cleanup_eligible(work_root, output_base):
+                    all_work_roots_eligible = False
+                    break
+        if all_work_roots_eligible and not safe_rmtree(work_base, VERBOSE):
+            print(
+                f"Warning: Could not remove terminal transactional workdir {work_base}; future runs will treat it as terminal residue rather than active state."
+            )
 
 
 # ==================== End Transactional Mode ====================
