@@ -1234,24 +1234,34 @@ class ArchiveProcessor:
         archive_path = os.path.abspath(archive_path)
         print(f"Processing: {archive_path}")
 
-        # 处理传统ZIP策略
-        traditional_zip_result = self.handle_traditional_zip_policy(archive_path)
-        if not traditional_zip_result["should_continue"]:
-            if VERBOSE:
-                print(
-                    f"  DEBUG: 传统ZIP策略处理完成: {traditional_zip_result['reason']}"
-                )
-
-            # 根据策略结果决定是否算作成功或跳过
-            if traditional_zip_result["reason"].startswith("传统ZIP已移动"):
+        inspected = _inspect_traditional_zip_policy(self.args, archive_path)
+        if inspected["policy"] == "move" and inspected["applies"]:
+            if self.args.dry_run and inspected["reason"] == "traditional_zip_move":
+                print(f"  [DRY RUN] Would move traditional ZIP to: {inspected['traditional_zip_to']}")
+                return True
+            move_result = _execute_non_transactional_traditional_zip_move(
+                self,
+                archive_path,
+                inspected,
+            )
+            if move_result["status"] == "succeeded":
                 self.successful_archives.append(archive_path)
                 return True
-            else:
+            if move_result["status"] == "skipped":
                 self.skipped_archives.append(archive_path)
                 return False
+            self.failed_archives.append(archive_path)
+            return False
 
-        # 获取ZIP解码参数（如果有）
-        zip_decode_from_policy = traditional_zip_result.get("zip_decode")
+        if inspected["reason"] == "traditional_zip_asis":
+            self.skipped_archives.append(archive_path)
+            return False
+
+        if inspected["reason"] == "traditional_zip_decode_invalid":
+            self.skipped_archives.append(archive_path)
+            return False
+
+        zip_decode_from_policy = inspected["zip_decode"]
 
         if self.args.dry_run:
             print(f"  [DRY RUN] Would process: {archive_path}")
@@ -1667,272 +1677,6 @@ class ArchiveProcessor:
             # Extract directly, handling conflicts like direct policy
             self.apply_direct_policy(tmp_dir, output_dir, archive_name, unique_suffix)
             print(f"  Extracted directly ({total_items} items < {threshold})")
-
-    def handle_traditional_zip_policy(self, archive_path):
-        """
-        处理传统ZIP策略（添加错误检查）
-
-        Args:
-            archive_path: 归档文件路径
-
-        Returns:
-            dict: {
-                'should_continue': bool,  # 是否继续后续处理
-                'zip_decode': int or None,  # ZIP解码参数
-                'reason': str  # 处理原因
-            }
-        """
-        result = {
-            "should_continue": True,
-            "zip_decode": None,
-            "reason": "",
-            "manifest_state": None,
-            "manifest_final_disposition": None,
-            "manifest_error": None,
-        }
-
-        # 【优先级3】添加参数检查
-        if not hasattr(self.args, "traditional_zip_policy"):
-            if VERBOSE:
-                print(f"  DEBUG: 未找到traditional_zip_policy，使用默认值decode-auto")
-            self.args.traditional_zip_policy = "decode-auto"
-
-        # 检查是否是ZIP文件
-        if not is_zip_format(archive_path):
-            return result
-
-        # 检查是否是传统ZIP
-        if not is_traditional_zip(archive_path):
-            if VERBOSE:
-                print(f"  DEBUG: 非传统ZIP，无需应用传统ZIP策略")
-            return result
-
-        if VERBOSE:
-            print(
-                f"  DEBUG: 检测到传统ZIP，应用策略: {self.args.traditional_zip_policy}"
-            )
-
-        policy = self.args.traditional_zip_policy.lower()
-
-        # 处理move策略
-        if policy == "move":
-            if (
-                not hasattr(self.args, "traditional_zip_to")
-                or not self.args.traditional_zip_to
-            ):
-                print(
-                    f"  Error: --traditional-zip-to is required with --traditional-zip-policy move"
-                )
-                result["should_continue"] = False
-                result["reason"] = "缺少--traditional-zip-to参数"
-                return result
-
-            try:
-                # 使用新的get_all_volumes方法查找所有相关卷
-                all_volumes = self.get_all_volumes(archive_path)
-                output_base = (
-                    os.path.abspath(self.args.output)
-                    if getattr(self.args, "output", None)
-                    else os.path.abspath(
-                        self.args.path
-                        if safe_isdir(self.args.path, VERBOSE)
-                        else os.path.dirname(self.args.path)
-                    )
-                )
-                output_dir = _compute_output_dir(self.args, archive_path)
-                txn = _txn_create(
-                    archive_path=archive_path,
-                    volumes=all_volumes,
-                    output_dir=output_dir,
-                    output_base=output_base,
-                    policy=getattr(self.args, "decompress_policy", "direct"),
-                    wal_fsync_every=getattr(self.args, "wal_fsync_every", 1),
-                    snapshot_every=getattr(self.args, "snapshot_every", 1),
-                    durability_enabled=not getattr(self.args, "no_durability", False),
-                )
-                txn["error"] = {
-                    "type": "TRADITIONAL_ZIP_MOVED",
-                    "message": "traditional_zip_moved",
-                    "at": _now_iso(),
-                }
-                _set_source_finalization_plan(
-                    txn,
-                    manifest_state="succeeded",
-                    final_disposition="skipped:traditional_zip_moved",
-                    txn_terminal_state=TXN_STATE_DONE,
-                )
-                _txn_snapshot(txn)
-
-                if VERBOSE:
-                    print(f"  DEBUG: 移动传统ZIP文件到: {self.args.traditional_zip_to}")
-
-                try:
-                    _finalize_traditional_zip_move(txn, args=self.args)
-                    previous_state = txn.get("state")
-                    txn["state"] = TXN_STATE_SOURCE_FINALIZED
-                    try:
-                        _txn_snapshot(txn)
-                    except Exception:
-                        txn["state"] = previous_state
-                        raise
-                    _complete_source_finalization_plan(txn)
-
-                    traditional_zip_to_abs = os.path.abspath(self.args.traditional_zip_to)
-                    print(f"  Traditional ZIP moved to: {traditional_zip_to_abs}")
-                    result["should_continue"] = False
-                    result["reason"] = "传统ZIP已移动"
-                    result["manifest_state"] = "succeeded"
-                    result["manifest_final_disposition"] = "skipped:traditional_zip_moved"
-                    return result
-
-                except Exception as e:
-                    print(f"  Error moving traditional ZIP: {e}")
-                    if not _txn_is_closed_terminal_outcome(txn):
-                        _txn_abort(txn, "FAIL_FINALIZE_FAILED", e)
-                    result["should_continue"] = False
-                    result["reason"] = f"移动传统ZIP失败: {e}"
-                    if _txn_is_closed_terminal_outcome(txn):
-                        result["manifest_state"] = "succeeded"
-                        result["manifest_final_disposition"] = (
-                            "skipped:traditional_zip_moved"
-                        )
-                        result["manifest_error"] = None
-                    else:
-                        result["manifest_state"] = "retryable"
-                        result["manifest_final_disposition"] = "unknown"
-                        result["manifest_error"] = txn.get("error")
-                    return result
-
-            except Exception as e:
-                print(f"  Error moving traditional ZIP: {e}")
-                result["should_continue"] = False
-                result["reason"] = f"移动传统ZIP失败: {e}"
-                result["manifest_state"] = "retryable"
-                result["manifest_final_disposition"] = "unknown"
-                result["manifest_error"] = {
-                    "type": "FAIL_FINALIZE_FAILED",
-                    "message": str(e),
-                    "at": _now_iso(),
-                }
-                return result
-
-        # 处理decode-${int}策略
-        elif policy.startswith("decode-") and policy != "decode-auto":
-            try:
-                # 提取编码数字
-                encoding_str = policy[7:]  # 去掉'decode-'前缀
-                zip_decode = int(encoding_str)
-
-                if VERBOSE:
-                    print(f"  DEBUG: 使用手动指定编码: {zip_decode}")
-
-                result["zip_decode"] = zip_decode
-                result["reason"] = f"使用手动编码{zip_decode}"
-                return result
-
-            except ValueError:
-                print(
-                    f"  Error: Invalid encoding in --traditional-zip-policy: {policy}"
-                )
-                result["should_continue"] = False
-                result["reason"] = "无效的编码参数"
-                return result
-
-        # 处理decode-auto策略
-        elif policy == "decode-auto":
-            try:
-                try:
-                    import zipfile
-
-                    decode_model = getattr(
-                        self.args, "traditional_zip_decode_model", "chardet"
-                    )
-                    if decode_model == "charset_normalizer":
-                        from charset_normalizer import detect
-                    else:
-                        import chardet
-                except ImportError as e:
-                    if VERBOSE:
-                        print(f"  DEBUG: decode-auto所需库不可用，将使用默认解压: {e}")
-                    result["reason"] = "decode-auto依赖库不可用，使用默认解压"
-                    return result
-
-                # 混合编码检测
-                chardet_confidence_threshold = (
-                    getattr(self.args, "traditional_zip_decode_confidence", 90) / 100.0
-                )
-
-                encoding_result = guess_zip_encoding(
-                    archive_path,
-                    chardet_confidence_threshold=chardet_confidence_threshold,
-                    decode_model=decode_model,
-                )
-
-                if not encoding_result["success"]:
-                    if VERBOSE:
-                        print(f"  DEBUG: 编码检测失败，将使用默认解压")
-                    result["reason"] = "自动编码检测失败，使用默认解压"
-                    return result
-
-                # 显示检测结果信息
-                detected_confidence = encoding_result["confidence"]
-
-                if VERBOSE:
-                    print(f"  DEBUG: 编码检测结果 - 置信度: {detected_confidence:.2%}")
-
-                # 转换编码为7z参数
-                detected_encoding = encoding_result["encoding"]
-                zip_decode_param = get_7z_encoding_param(detected_encoding)
-
-                if not zip_decode_param:
-                    if VERBOSE:
-                        print(
-                            f"  DEBUG: 无法映射编码到7z参数，将使用默认解压: {detected_encoding}"
-                        )
-                    result["reason"] = (
-                        f"无法映射编码{detected_encoding}到7z参数，使用默认解压"
-                    )
-                    return result
-
-                if VERBOSE:
-                    print(
-                        f"  DEBUG: 自动检测编码: {detected_encoding} -> {zip_decode_param}"
-                    )
-
-                # 对于UTF-8编码参数，使用特殊处理
-                if zip_decode_param == "UTF-8":
-                    result["zip_decode"] = None  # 让7z使用默认UTF-8处理
-                else:
-                    try:
-                        result["zip_decode"] = int(zip_decode_param)
-                    except ValueError:
-                        result["zip_decode"] = None
-
-                result["reason"] = (
-                    f"自动检测编码{detected_encoding}(置信度{detected_confidence:.1%})"
-                )
-                return result
-
-            except Exception as e:
-                if VERBOSE:
-                    print(f"  DEBUG: decode-auto处理异常: {e}")
-                result["reason"] = f"自动编码检测异常，使用默认解压: {e}"
-                return result
-
-        # 处理asis策略
-        elif policy == "asis":
-            if VERBOSE:
-                print(f"  DEBUG: asis策略，跳过处理")
-            result["should_continue"] = False
-            result["reason"] = "传统ZIP按asis策略跳过"
-            return result
-
-        # 未知策略
-        else:
-            print(f"  Error: Unknown traditional-zip-policy: {policy}")
-            result["should_continue"] = False
-            result["reason"] = f"未知策略: {policy}"
-            return result
 
     def is_archive_single_or_volume(self, file_path):
         """
@@ -2350,18 +2094,6 @@ class ArchiveProcessor:
         elif filename_lower.endswith(".zip"):
             if self.args.skip_zip:
                 return True, "单个ZIP文件被跳过 (--skip-zip)"
-
-            # 检查传统ZIP策略
-            if (
-                hasattr(self.args, "traditional_zip_policy")
-                and self.args.traditional_zip_policy
-            ):
-                if is_traditional_zip(file_path):
-                    if self.args.traditional_zip_policy.lower() == "asis":
-                        return (
-                            True,
-                            "传统编码ZIP文件被跳过 (--traditional-zip-policy asis)",
-                        )
 
         # EXE SFX单文件
         elif filename_lower.endswith(".exe"):
@@ -4420,14 +4152,8 @@ def _dataset_manifest_archive_id(archive_path):
 
 _SUCCESSFUL_SOURCE_FINALIZATION_DISPOSITIONS = {
     "success:delete": "delete",
-    "success:delete-unsafe-windows": "delete",
     "success:move": "move",
 }
-
-_WINDOWS_UNSAFE_DELETE_WARNING_TEXT = (
-    "best-effort payload directory durability on Windows; "
-    "source archives are deleted after transactional placement anyway."
-)
 
 
 def _resolve_effective_delete_mode(args):
@@ -4437,11 +4163,6 @@ def _resolve_effective_delete_mode(args):
     if bool(getattr(args, "legacy", False)):
         return "legacy_delete"
 
-    if os.name == "nt":
-        if bool(getattr(args, "unsafe_windows_delete", False)):
-            return "txn_delete_unsafe_windows"
-        return "txn_delete_blocked_windows"
-
     return "txn_delete"
 
 
@@ -4450,34 +4171,7 @@ def _success_disposition_for_delete_mode(delete_mode, success_policy):
     if normalized_success_policy != "delete":
         return f"success:{normalized_success_policy}"
 
-    if delete_mode == "txn_delete_unsafe_windows":
-        return "success:delete-unsafe-windows"
-
     return "success:delete"
-
-
-def _warn_windows_unsafe_delete_startup(args):
-    if _resolve_effective_delete_mode(args) != "txn_delete_unsafe_windows":
-        return
-    if bool(getattr(args, "_unsafe_windows_delete_startup_warned", False)):
-        return
-
-    print(
-        "Warning: Windows transactional -sp delete uses "
-        + _WINDOWS_UNSAFE_DELETE_WARNING_TEXT
-    )
-    setattr(args, "_unsafe_windows_delete_startup_warned", True)
-
-
-def _warn_windows_unsafe_delete_before_source_finalization(txn, *, args):
-    if _resolve_effective_delete_mode(args) != "txn_delete_unsafe_windows":
-        return
-
-    print(
-        "  Warning: Finalizing transactional source deletion for "
-        f"{os.path.abspath(txn['archive_path'])} with "
-        + _WINDOWS_UNSAFE_DELETE_WARNING_TEXT
-    )
 
 
 def _normalize_command_fingerprint_fields(args):
@@ -4523,7 +4217,6 @@ def _normalize_command_fingerprint_fields(args):
         "detect_elf_sfx": bool(getattr(args, "detect_elf_sfx", False)),
         "decompress_policy": getattr(args, "decompress_policy", None),
         "success_policy": getattr(args, "success_policy", None),
-        "unsafe_windows_delete": resolved_delete_mode == "txn_delete_unsafe_windows",
         "success_to": (
             os.path.abspath(args.success_to)
             if getattr(args, "success_to", None)
@@ -4589,13 +4282,7 @@ def _manifest_fail_policy_from_manifest(manifest):
 def _manifest_success_disposition_from_manifest(manifest):
     fields = _manifest_command_fingerprint_fields(manifest)
     success_policy = fields.get("success_policy") or "asis"
-    delete_mode = "not_delete"
-    if success_policy == "delete":
-        delete_mode = (
-            "txn_delete_unsafe_windows"
-            if bool(fields.get("unsafe_windows_delete", False))
-            else "txn_delete"
-        )
+    delete_mode = "txn_delete" if success_policy == "delete" else "not_delete"
     return _success_disposition_for_delete_mode(delete_mode, success_policy)
 
 
@@ -5463,8 +5150,6 @@ def _source_mutation_requires_durability(args):
 
 
 def _validate_delete_durability_args(args):
-    delete_mode = _resolve_effective_delete_mode(args)
-
     if _source_mutation_requires_durability(args):
         if getattr(args, "no_durability", False):
             print(
@@ -5477,12 +5162,6 @@ def _validate_delete_durability_args(args):
                 "Error: Transactional source-mutating finalization requires durability; --fsync-files none is invalid."
             )
             return False
-
-    if delete_mode == "txn_delete_blocked_windows":
-        print(
-            "Error: Windows transactional -sp delete requires --unsafe-windows-delete to allow best-effort payload directory durability before source deletion."
-        )
-        return False
 
     return True
 
@@ -6972,7 +6651,6 @@ def _durability_barrier(
     *,
     fsync_files="auto",
     success_policy="asis",
-    delete_mode="not_delete",
 ):
     if fsync_files == "none":
         if success_policy in ("delete", "move"):
@@ -6995,10 +6673,9 @@ def _durability_barrier(
         if not _fsync_file(path, debug=VERBOSE):
             raise RuntimeError(f"payload_fsync_failed:file:{path}")
 
-    allow_best_effort_payload_dir_fsync = delete_mode == "txn_delete_unsafe_windows"
     for path in touched_dirs:
         dir_fsynced = _fsync_dir(path, debug=VERBOSE)
-        if not dir_fsynced and not allow_best_effort_payload_dir_fsync:
+        if not dir_fsynced:
             raise RuntimeError(f"payload_fsync_failed:dir:{path}")
 
 
@@ -7010,7 +6687,6 @@ def _is_delete_durability_failure(args, error):
         message.startswith("payload_fsync_failed:")
         or message.startswith("journal_fsync_failed:")
         or message.startswith("payload_missing:")
-        or message.startswith("source_move_fsync_failed:")
     )
 
 
@@ -7291,6 +6967,231 @@ def _relative_input_parent(args, source_path):
     return "" if rel_parent == "." else rel_parent
 
 
+def _inspect_traditional_zip_policy(args, archive_path):
+    archive_path = os.path.abspath(archive_path)
+    policy = str(getattr(args, "traditional_zip_policy", "decode-auto") or "decode-auto")
+    policy = policy.lower()
+
+    record = {
+        "applies": False,
+        "policy": policy,
+        "zip_decode": None,
+        "reason": "not_zip",
+        "traditional_zip_to": None,
+        "error": None,
+    }
+
+    if not is_zip_format(archive_path):
+        return record
+
+    record["reason"] = "not_traditional_zip"
+    if not is_traditional_zip(archive_path):
+        return record
+
+    record["applies"] = True
+
+    if policy == "asis":
+        record["reason"] = "traditional_zip_asis"
+        return record
+
+    if policy == "move":
+        traditional_zip_to = getattr(args, "traditional_zip_to", None)
+        if not traditional_zip_to:
+            record["reason"] = "traditional_zip_move_missing_destination"
+            record["error"] = {
+                "type": "TRADITIONAL_ZIP_MOVE_CONFIG_INVALID",
+                "message": "traditional_zip_to required for traditional ZIP move",
+                "at": _now_iso(),
+            }
+            return record
+
+        record["reason"] = "traditional_zip_move"
+        record["traditional_zip_to"] = os.path.abspath(traditional_zip_to)
+        return record
+
+    if policy == "decode-auto":
+        pass
+    elif policy.startswith("decode-"):
+        try:
+            record["zip_decode"] = int(policy[7:])
+            if record["zip_decode"] < 0:
+                raise ValueError
+            record["reason"] = "traditional_zip_decode_manual"
+        except ValueError:
+            record["reason"] = "traditional_zip_decode_invalid"
+            record["error"] = {
+                "type": "TRADITIONAL_ZIP_DECODE_POLICY_INVALID",
+                "message": f"invalid traditional zip decode policy: {policy}",
+                "at": _now_iso(),
+            }
+        return record
+    else:
+        record["reason"] = "traditional_zip_decode_invalid"
+        record["error"] = {
+            "type": "TRADITIONAL_ZIP_DECODE_POLICY_INVALID",
+            "message": f"invalid traditional zip policy: {policy}",
+            "at": _now_iso(),
+        }
+        return record
+
+    try:
+        decode_model = getattr(args, "traditional_zip_decode_model", "chardet")
+        confidence_threshold = (
+            getattr(args, "traditional_zip_decode_confidence", 90) / 100.0
+        )
+        encoding_result = guess_zip_encoding(
+            archive_path,
+            chardet_confidence_threshold=confidence_threshold,
+            decode_model=decode_model,
+        )
+        if encoding_result.get("success"):
+            zip_decode_param = get_7z_encoding_param(encoding_result.get("encoding"))
+            if zip_decode_param and zip_decode_param != "UTF-8":
+                record["zip_decode"] = int(zip_decode_param)
+    except Exception:
+        record["zip_decode"] = None
+
+    record["reason"] = "traditional_zip_decode_auto"
+    return record
+
+
+def _traditional_zip_move_token(args, volumes):
+    payload = {
+        "path": os.path.abspath(args.path),
+        "traditional_zip_to": os.path.abspath(args.traditional_zip_to),
+        "volumes": [os.path.abspath(volume) for volume in volumes],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(encoded).hexdigest()[:8]
+
+
+def _traditional_zip_move_destinations(args, volumes, *, collision_token):
+    dest_base = os.path.abspath(args.traditional_zip_to)
+    planned = []
+    for volume in volumes:
+        volume_abs = os.path.abspath(volume)
+        rel_parent = _relative_input_parent(args, volume_abs)
+        target_dir = os.path.join(dest_base, rel_parent) if rel_parent else dest_base
+        dst = os.path.join(target_dir, os.path.basename(volume_abs))
+        if safe_exists(dst, VERBOSE):
+            dst = _ensure_unique_path(dst, collision_token)
+        planned.append((volume_abs, os.path.abspath(dst)))
+    return planned
+
+
+def _execute_non_transactional_traditional_zip_move(processor, archive_path, inspected):
+    if inspected["reason"] != "traditional_zip_move":
+        if inspected["reason"] == "traditional_zip_move_missing_destination":
+            print(
+                "  Error: --traditional-zip-to is required with --traditional-zip-policy move"
+            )
+        return {
+            "status": "skipped",
+            "reason": inspected["reason"],
+            "error": inspected["error"],
+        }
+
+    try:
+        volumes = processor.get_all_volumes(archive_path)
+        collision_token = _traditional_zip_move_token(processor.args, volumes)
+        planned = _traditional_zip_move_destinations(
+            processor.args,
+            volumes,
+            collision_token=collision_token,
+        )
+        for src, dst in planned:
+            safe_makedirs(os.path.dirname(dst), debug=VERBOSE)
+            safe_move(src, dst, VERBOSE)
+        print(f"  Traditional ZIP moved to: {inspected['traditional_zip_to']}")
+        return {"status": "succeeded", "reason": "traditional_zip_moved", "error": None}
+    except Exception as e:
+        print(f"  Error moving traditional ZIP: {e}")
+        return {
+            "status": "failed",
+            "reason": "traditional_zip_move_failed",
+            "error": {
+                "type": "TRADITIONAL_ZIP_MOVE_FAILED",
+                "message": str(e),
+                "at": _now_iso(),
+            },
+        }
+
+
+def _execute_transactional_traditional_zip_move(
+    processor, archive_path, inspected, *, output_base
+):
+    try:
+        all_volumes = processor.get_all_volumes(archive_path)
+        collision_token = _traditional_zip_move_token(processor.args, all_volumes)
+        planned = _traditional_zip_move_destinations(
+            processor.args,
+            all_volumes,
+            collision_token=collision_token,
+        )
+        output_dir = _compute_output_dir(processor.args, archive_path)
+        txn = _txn_create(
+            archive_path=archive_path,
+            volumes=all_volumes,
+            output_dir=output_dir,
+            output_base=output_base,
+            policy=getattr(processor.args, "decompress_policy", "direct"),
+            wal_fsync_every=getattr(processor.args, "wal_fsync_every", 1),
+            snapshot_every=getattr(processor.args, "snapshot_every", 1),
+            durability_enabled=not getattr(processor.args, "no_durability", False),
+        )
+    except Exception as e:
+        return {
+            "kind": "failed",
+            "archive_path": archive_path,
+            "reason": "traditional_zip_move_failed",
+            "error": "traditional_zip_move_failed",
+            "manifest_state": "retryable",
+            "manifest_final_disposition": "unknown",
+            "manifest_error": {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": str(e),
+                "at": _now_iso(),
+            },
+        }
+
+    try:
+        for src, dst in planned:
+            _plan_finalized_source_destination(txn, src, dst)
+        txn["error"] = {
+            "type": "TRADITIONAL_ZIP_MOVED",
+            "message": "traditional_zip_moved",
+            "at": _now_iso(),
+        }
+        _set_source_finalization_plan(
+            txn,
+            manifest_state="succeeded",
+            final_disposition="skipped:traditional_zip_moved",
+            txn_terminal_state=TXN_STATE_DONE,
+        )
+        _txn_snapshot(txn)
+        _finalize_traditional_zip_move(txn, args=processor.args)
+        previous_state = txn.get("state")
+        txn["state"] = TXN_STATE_SOURCE_FINALIZED
+        try:
+            _txn_snapshot(txn)
+        except Exception:
+            txn["state"] = previous_state
+            raise
+        return {"kind": "txn", "txn": txn}
+    except Exception as e:
+        if not _txn_is_closed_terminal_outcome(txn):
+            _txn_abort(txn, "FAIL_FINALIZE_FAILED", e)
+        return {
+            "kind": "txn_failed",
+            "archive_path": archive_path,
+            "txn": txn,
+            "manifest_error": txn.get("error"),
+            "failure_finalization_completed": False,
+        }
+
+
 def _finalize_traditional_zip_move(txn, *, args):
     traditional_zip_to = getattr(args, "traditional_zip_to", None)
     if not traditional_zip_to:
@@ -7299,17 +7200,21 @@ def _finalize_traditional_zip_move(txn, *, args):
     dest_base = os.path.abspath(traditional_zip_to)
     safe_makedirs(dest_base, debug=VERBOSE)
 
+    collision_token = _traditional_zip_move_token(args, txn["volumes"])
+    recomputed_destinations = {
+        src: dst
+        for src, dst in _traditional_zip_move_destinations(
+            args,
+            txn["volumes"],
+            collision_token=collision_token,
+        )
+    }
+
     for volume in txn["volumes"]:
+        volume = os.path.abspath(volume)
         dst = _planned_finalized_source_move(txn, volume)
         if dst is None:
-            rel_parent = _relative_input_parent(args, volume)
-            target_dir = (
-                os.path.join(dest_base, rel_parent) if rel_parent else dest_base
-            )
-            safe_makedirs(target_dir, debug=VERBOSE)
-            dst = os.path.join(target_dir, os.path.basename(volume))
-            if safe_exists(dst, VERBOSE):
-                dst = _ensure_unique_path(dst, txn["txn_id"][:8])
+            dst = recomputed_destinations[volume]
         safe_makedirs(os.path.dirname(dst), debug=VERBOSE)
         if safe_exists(volume, VERBOSE) or safe_exists(dst, VERBOSE):
             _durably_finalize_planned_source_move(
@@ -7360,8 +7265,6 @@ def _finalize_sources_success(txn, *, args):
     success_policy = args.success_policy
     if success_policy == "asis":
         return
-
-    _warn_windows_unsafe_delete_before_source_finalization(txn, args=args)
 
     volumes = txn["volumes"]
     output_dir = txn["output_dir"]
@@ -8109,24 +8012,40 @@ def _extract_phase(processor, archive_path, *, args, output_base):
         print(f"  [DRY RUN] Would process: {archive_path}")
         return {"kind": "dry_run", "archive_path": archive_path}
 
-    traditional_zip_result = processor.handle_traditional_zip_policy(archive_path)
-    if not traditional_zip_result.get("should_continue", True):
-        if VERBOSE:
-            print(
-                f"  DEBUG: 传统ZIP策略处理完成: {traditional_zip_result.get('reason')}"
-            )
+    inspected = _inspect_traditional_zip_policy(args, archive_path)
+    if inspected["reason"] == "traditional_zip_asis":
         return {
             "kind": "skipped",
             "archive_path": archive_path,
-            "reason": traditional_zip_result.get("reason"),
-            "manifest_state": traditional_zip_result.get("manifest_state"),
-            "manifest_final_disposition": traditional_zip_result.get(
-                "manifest_final_disposition"
-            ),
-            "manifest_error": traditional_zip_result.get("manifest_error"),
+            "reason": inspected["reason"],
         }
 
-    zip_decode_from_policy = traditional_zip_result.get("zip_decode")
+    if inspected["reason"] == "traditional_zip_decode_invalid":
+        return {
+            "kind": "skipped",
+            "archive_path": archive_path,
+            "reason": inspected["reason"],
+        }
+
+    if inspected["policy"] == "move" and inspected["applies"]:
+        if inspected["reason"] != "traditional_zip_move":
+            return {
+                "kind": "failed",
+                "archive_path": archive_path,
+                "reason": inspected["reason"],
+                "error": inspected["reason"],
+                "manifest_state": "retryable",
+                "manifest_final_disposition": "unknown",
+                "manifest_error": inspected["error"],
+            }
+        return _execute_transactional_traditional_zip_move(
+            processor,
+            archive_path,
+            inspected,
+            output_base=output_base,
+        )
+
+    zip_decode_from_policy = inspected["zip_decode"]
 
     check_interrupt()
 
@@ -8429,7 +8348,6 @@ def _place_and_finalize_txn(txn, *, args, recovery=False):
                 txn,
                 fsync_files=args.fsync_files,
                 success_policy=args.success_policy,
-                delete_mode=_resolve_effective_delete_mode(args),
             )
             txn["state"] = TXN_STATE_DURABLE
             _txn_snapshot(txn)
@@ -8480,11 +8398,21 @@ def _place_and_finalize_txn(txn, *, args, recovery=False):
             )
             raise
         if str(e).startswith("source_move_fsync_failed:"):
-            _txn_abort(txn, "DURABILITY_FAILED", e)
+            source_finalization_plan = _txn_source_finalization_plan(txn) or {}
+            is_delete_source_finalization = (
+                source_finalization_plan.get("final_disposition") == "success:delete"
+            )
+            error_type = (
+                "FAIL_FINALIZE_FAILED"
+                if is_delete_source_finalization
+                else "DURABILITY_FAILED"
+            )
+            manifest_state = "retryable" if is_delete_source_finalization else "recoverable"
+            _txn_abort(txn, error_type, e)
             _update_dataset_manifest_archive(
                 txn["output_base"],
                 txn["archive_path"],
-                state="recoverable",
+                state=manifest_state,
                 last_txn_id=txn["txn_id"],
                 final_disposition="unknown",
                 error=txn.get("error"),
@@ -8590,15 +8518,20 @@ def _handle_transactional_result(
                     "message": str(result.get("error")),
                     "at": _now_iso(),
                 }
-            manifest_state = "failed"
-            manifest_final_disposition = _manifest_failure_disposition(args)
-            manifest_finalized_at = _now_iso()
-            if txn.get("state") == TXN_STATE_ABORTED or not result.get(
-                "failure_finalization_completed", True
-            ):
-                manifest_state = "retryable"
-                manifest_final_disposition = "unknown"
-                manifest_finalized_at = None
+            if kind == "failed" and result.get("manifest_state") is not None:
+                manifest_state = result["manifest_state"]
+                manifest_final_disposition = result["manifest_final_disposition"]
+                manifest_finalized_at = None if manifest_state != "failed" else _now_iso()
+            else:
+                manifest_state = "failed"
+                manifest_final_disposition = _manifest_failure_disposition(args)
+                manifest_finalized_at = _now_iso()
+                if txn.get("state") == TXN_STATE_ABORTED or not result.get(
+                    "failure_finalization_completed", True
+                ):
+                    manifest_state = "retryable"
+                    manifest_final_disposition = "unknown"
+                    manifest_finalized_at = None
             _update_dataset_manifest_archive(
                 output_base,
                 archive_path,
@@ -8710,8 +8643,6 @@ def _run_transactional(processor, archives, *, args):
             current_run_touched_output_dirs=set(),
         )
         return True
-
-    _warn_windows_unsafe_delete_startup(args)
 
     manifest = _load_dataset_manifest(output_base)
     if manifest is None and not archives:
@@ -11521,7 +11452,7 @@ def main():
         "--success-policy",
         choices=["delete", "asis", "move"],
         default="asis",
-        help="Policy for successful extractions (default: asis). Windows transactional -sp delete requires --unsafe-windows-delete. Legacy -sp delete does not require --unsafe-windows-delete.",
+        help="Policy for successful extractions (default: asis).",
     )
 
     parser.add_argument(
@@ -11622,12 +11553,7 @@ def main():
     parser.add_argument(
         "--legacy",
         action="store_true",
-        help="Use legacy non-transactional pipeline (no journal/recovery). Legacy -sp delete does not require --unsafe-windows-delete.",
-    )
-    parser.add_argument(
-        "--unsafe-windows-delete",
-        action="store_true",
-        help="Allow best-effort transactional source deletion on Windows when used with -sp delete. This flag is inert outside Windows transactional delete.",
+        help="Use legacy non-transactional pipeline (no journal/recovery).",
     )
     parser.add_argument(
         "--degrade-cross-volume",
@@ -11673,13 +11599,13 @@ def main():
     parser.add_argument(
         "--no-durability",
         action="store_true",
-        help="Disable durability barrier (fsync) before finalizing sources. Invalid with transactional -sp delete, including Windows runs gated by --unsafe-windows-delete; legacy -sp delete remains exempt from the unsafe gate.",
+        help="Disable durability barrier (fsync) before finalizing sources. Invalid with transactional source-mutating finalization.",
     )
     parser.add_argument(
         "--fsync-files",
         choices=["auto", "none"],
         default="auto",
-        help="Durability fsync strategy (default: auto). auto: fsync WAL + txn.json for non-destructive cases and automatically upgrades to payload durability fsyncs when transactional -sp delete is used. On Windows, --unsafe-windows-delete enables only best-effort payload directory durability before source deletion on Windows.",
+        help="Durability fsync strategy (default: auto). auto: fsync WAL + txn.json for non-destructive cases and automatically upgrades to payload durability fsyncs when transactional source-mutating finalization is used.",
     )
     parser.add_argument(
         "--success-clean-journal",
@@ -11766,63 +11692,8 @@ def main():
             print("Error: --fail-to is required when using -fp move")
             return 1
 
-        # 增强的传统ZIP策略参数验证
         if args.traditional_zip_policy:
-            policy = args.traditional_zip_policy.lower()
-
-            # 验证策略格式
-            valid_policies = ["move", "asis", "decode-auto"]
-            is_valid_policy = False
-
-            if policy in valid_policies:
-                is_valid_policy = True
-            elif policy.startswith("decode-") and policy != "decode-auto":
-                # 验证decode-${int}格式
-                try:
-                    encoding_str = policy[7:]  # 去掉'decode-'前缀
-                    encoding_num = int(encoding_str)
-                    if encoding_num < 0:
-                        print(
-                            f"Error: Invalid encoding number in --traditional-zip-policy: {encoding_num}"
-                        )
-                        print("Encoding number must be non-negative")
-                        return 1
-                    is_valid_policy = True
-                except ValueError:
-                    print(
-                        f"Error: Invalid decode format in --traditional-zip-policy: {args.traditional_zip_policy}"
-                    )
-                    print("Use format: decode-${int}, e.g., decode-932")
-                    return 1
-
-            if not is_valid_policy:
-                print(
-                    f"Error: Invalid --traditional-zip-policy: {args.traditional_zip_policy}"
-                )
-                print("Valid options:")
-                print(
-                    "  move              - Move traditional ZIP files to specified directory"
-                )
-                print("  asis              - Skip traditional ZIP files")
-                print("  decode-auto       - Auto-detect encoding")
-                print(
-                    "  decode-${int}     - Manual encoding (e.g., decode-932, decode-936)"
-                )
-                print("")
-                print("Common encoding examples:")
-                print("  decode-932        - Shift-JIS (Japanese)")
-                print("  decode-936        - GBK/GB2312 (Simplified Chinese)")
-                print("  decode-950        - Big5 (Traditional Chinese)")
-                print("  decode-949        - EUC-KR (Korean)")
-                print("  decode-1252       - Windows-1252 (Western European)")
-                return 1
-
-            # 验证move策略需要目标目录
-            if policy == "move" and not args.traditional_zip_to:
-                print(
-                    "Error: --traditional-zip-to is required when using --traditional-zip-policy move"
-                )
-                return 1
+            args.traditional_zip_policy = args.traditional_zip_policy.lower()
 
             # 验证置信度参数范围
             if (

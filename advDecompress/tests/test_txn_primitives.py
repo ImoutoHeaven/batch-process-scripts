@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 import hashlib
 import io
 import json
@@ -52,6 +53,10 @@ class TestTxnPrimitives(unittest.TestCase):
         return SimpleNamespace(**args)
 
     def _make_processing_args(self, root_dir, **overrides):
+        if "unsafe_windows_delete" in overrides:
+            raise TypeError(
+                "removed Windows delete flag overrides are not supported in test helpers"
+            )
         args = {
             "verbose": False,
             "password": None,
@@ -97,7 +102,6 @@ class TestTxnPrimitives(unittest.TestCase):
             "success_clean_journal": False,
             "fail_clean_journal": False,
             "legacy": False,
-            "unsafe_windows_delete": False,
             "no_lock": False,
             "no_durability": False,
         }
@@ -179,9 +183,6 @@ class TestTxnPrimitives(unittest.TestCase):
         for attr, flag in bool_flags:
             if getattr(args, attr, False):
                 argv.append(flag)
-
-        if getattr(args, "unsafe_windows_delete", False):
-            argv.append("--unsafe-windows-delete")
 
         if getattr(args, "legacy", False):
             argv.append("--legacy")
@@ -528,18 +529,13 @@ class TestTxnPrimitives(unittest.TestCase):
     def _make_transactional_processor_stub(self):
         return types.SimpleNamespace(
             sfx_detector=None,
-            handle_traditional_zip_policy=lambda path: {
-                "should_continue": True,
-                "zip_decode": None,
-                "reason": "",
-            },
             get_all_volumes=lambda path: [os.path.abspath(path)],
             successful_archives=[],
             failed_archives=[],
             skipped_archives=[],
         )
 
-    def _assert_windows_unsafe_delete_barrier_failure(
+    def _assert_windows_transactional_delete_barrier_failure(
         self,
         fixture,
         *,
@@ -558,8 +554,6 @@ class TestTxnPrimitives(unittest.TestCase):
 
         archive_path = os.path.abspath(fixture["archive_path"])
         archive_id = self.m._dataset_manifest_archive_id(archive_path)
-        fixture["args"].unsafe_windows_delete = True
-
         with (
             mock.patch.object(self.m.os, "name", "nt"),
             mock.patch.object(self.m, "FileLock", DummyLock),
@@ -1541,81 +1535,41 @@ class TestTxnPrimitives(unittest.TestCase):
             ):
                 self.assertNotIn(excluded_key, base_fingerprint["fields"])
 
-    def test_make_processing_args_defaults_unsafe_windows_delete_false(self):
+    def test_make_processing_args_omits_removed_windows_delete_flag(self):
         with tempfile.TemporaryDirectory() as td:
             args = self._make_processing_args(td)
 
-        self.assertFalse(args.unsafe_windows_delete)
+        self.assertFalse(hasattr(args, "unsafe_windows_delete"))
 
-    def test_argv_for_main_emits_unsafe_windows_delete_and_legacy_flags(self):
+    def test_argv_for_main_emits_legacy_flag_after_windows_delete_flag_removal(self):
         with tempfile.TemporaryDirectory() as td:
             args = self._make_processing_args(
                 td,
-                unsafe_windows_delete=True,
                 legacy=True,
             )
 
         argv = self._argv_for_main(args)
 
-        self.assertIn("--unsafe-windows-delete", argv)
+        self.assertNotIn("--unsafe-windows-delete", argv)
         self.assertIn("--legacy", argv)
 
-    def test_command_fingerprint_tracks_effective_unsafe_windows_delete(self):
+    def test_command_fingerprint_omits_removed_windows_delete_field(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
             os.makedirs(input_root)
             os.makedirs(output_root)
 
-            safe_args = self._make_processing_args(input_root, output=output_root)
-            legacy_flagged_args = self._make_processing_args(
+            args = self._make_processing_args(
                 input_root,
                 output=output_root,
                 success_policy="delete",
-                legacy=True,
-                unsafe_windows_delete=True,
-            )
-            non_windows_delete_flagged_args = self._make_processing_args(
-                input_root,
-                output=output_root,
-                success_policy="delete",
-                unsafe_windows_delete=True,
-            )
-            windows_unsafe_args = self._make_processing_args(
-                input_root,
-                output=output_root,
-                success_policy="delete",
-                unsafe_windows_delete=True,
             )
 
-            with self.subTest(platform="windows"):
-                with mock.patch.object(self.m.os, "name", "nt"):
-                    safe_fp = self.m._build_command_fingerprint(safe_args)
-                    legacy_flagged_fp = self.m._build_command_fingerprint(
-                        legacy_flagged_args
-                    )
-                    windows_unsafe_fp = self.m._build_command_fingerprint(
-                        windows_unsafe_args
-                    )
+            with mock.patch.object(self.m.os, "name", "nt"):
+                fingerprint = self.m._build_command_fingerprint(args)
 
-                self.assertIn("unsafe_windows_delete", safe_fp["fields"])
-                self.assertFalse(safe_fp["fields"]["unsafe_windows_delete"])
-                self.assertFalse(legacy_flagged_fp["fields"]["unsafe_windows_delete"])
-                self.assertTrue(windows_unsafe_fp["fields"]["unsafe_windows_delete"])
-
-            with self.subTest(platform="non-windows"):
-                with mock.patch.object(self.m.os, "name", "posix"):
-                    non_windows_delete_fp = self.m._build_command_fingerprint(
-                        non_windows_delete_flagged_args
-                    )
-
-                self.assertIn(
-                    "unsafe_windows_delete",
-                    non_windows_delete_fp["fields"],
-                )
-                self.assertFalse(
-                    non_windows_delete_fp["fields"]["unsafe_windows_delete"]
-                )
+        self.assertNotIn("unsafe_windows_delete", fingerprint["fields"])
 
     def test_resume_rejects_manifest_fingerprint_mismatch(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1790,95 +1744,6 @@ class TestTxnPrimitives(unittest.TestCase):
                 self.assertEqual(manifest_before, f.read())
             with open(txn_json_path, "rb") as f:
                 self.assertEqual(txn_before, f.read())
-
-    def test_run_transactional_rejects_fingerprint_mismatch_for_unsafe_windows_delete(
-        self,
-    ):
-        with tempfile.TemporaryDirectory() as td:
-            input_root = os.path.join(td, "input")
-            output_root = os.path.join(td, "output")
-            os.makedirs(input_root)
-            os.makedirs(output_root)
-
-            discovered = self._make_discovered_archives(
-                input_root,
-                output_root,
-                ["alpha.zip"],
-            )
-            safe_args = self._make_processing_args(
-                input_root,
-                output=output_root,
-                success_policy="delete",
-                unsafe_windows_delete=False,
-            )
-            unsafe_args = self._make_processing_args(
-                input_root,
-                output=output_root,
-                success_policy="delete",
-                unsafe_windows_delete=True,
-            )
-
-            with mock.patch.object(self.m.os, "name", "nt"):
-                baseline_fingerprint = self.m._build_command_fingerprint(unsafe_args)
-
-            self.m._create_dataset_manifest(
-                input_root=input_root,
-                output_root=output_root,
-                discovered_archives=discovered,
-                command_fingerprint=baseline_fingerprint,
-            )
-
-            txn = self.m._txn_create(
-                archive_path=discovered[0]["archive_path"],
-                volumes=discovered[0]["volumes"],
-                output_dir=discovered[0]["output_dir"],
-                output_base=output_root,
-                policy="direct",
-                wal_fsync_every=1,
-                snapshot_every=1,
-                durability_enabled=False,
-            )
-            txn["state"] = self.m.TXN_STATE_EXTRACTED
-            self.m._txn_snapshot(txn)
-
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
-            )
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(self.m.os, "name", "nt"),
-                mock.patch.object(
-                    self.m,
-                    "_recover_all_outputs",
-                    side_effect=AssertionError(
-                        "recovery should not start before strict unsafe_windows_delete resume validation"
-                    ),
-                ),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "extract should not start before strict unsafe_windows_delete resume validation"
-                    ),
-                ),
-            ):
-                result = self.m._run_transactional(
-                    processor,
-                    [discovered[0]["archive_path"]],
-                    args=safe_args,
-                )
-
-            self.assertFalse(result)
-            output = stdout.getvalue().lower()
-            self.assertIn("command fingerprint", output)
-            self.assertNotIn("--unsafe-windows-delete", output)
-            self.assertEqual([], processor.successful_archives)
-            self.assertEqual([], processor.failed_archives)
-            self.assertEqual([], processor.skipped_archives)
 
     def test_resume_rejects_legacy_workdir_without_manifest(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4595,11 +4460,6 @@ class TestTxnPrimitives(unittest.TestCase):
             observed = {}
             processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
 
@@ -4675,11 +4535,6 @@ class TestTxnPrimitives(unittest.TestCase):
             archive_id = self.m._dataset_manifest_archive_id(archive_path)
             processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
 
@@ -4737,11 +4592,6 @@ class TestTxnPrimitives(unittest.TestCase):
             archive_id = self.m._dataset_manifest_archive_id(archive_path)
             processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
 
@@ -5389,7 +5239,7 @@ class TestTxnPrimitives(unittest.TestCase):
             fix_archive_ext.assert_not_called()
             processor.find_archives.assert_not_called()
 
-    def test_help_describes_windows_delete_gate_and_legacy_exemption(self):
+    def test_main_help_omits_removed_windows_delete_flag(self):
         stdout = io.StringIO()
 
         with (
@@ -5404,54 +5254,30 @@ class TestTxnPrimitives(unittest.TestCase):
         help_text = help_text.replace(
             "--unsafe- windows-delete", "--unsafe-windows-delete"
         )
-        self.assertIn("--unsafe-windows-delete", help_text)
+        self.assertNotIn("--unsafe-windows-delete", help_text)
+        self.assertNotIn("best-effort payload directory durability", help_text)
+
+    def test_main_help_describes_fsync_files_for_transactional_source_mutation(self):
+        stdout = io.StringIO()
+
+        with (
+            contextlib.redirect_stdout(stdout),
+            mock.patch.object(self.m.sys, "argv", ["advDecompress.py", "--help"]),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            self.m.main()
+
+        self.assertEqual(0, ctx.exception.code)
+        help_text = " ".join(stdout.getvalue().split())
+        self.assertNotIn("when transactional -sp delete is used", help_text)
         self.assertIn(
-            "Windows transactional -sp delete requires --unsafe-windows-delete",
+            "when transactional source-mutating finalization is used",
             help_text,
         )
-        self.assertIn(
-            "Legacy -sp delete does not require --unsafe-windows-delete",
-            help_text,
-        )
-        self.assertIn(
-            "best-effort payload directory durability before source deletion on Windows",
-            help_text,
-        )
 
-    def test_main_rejects_windows_transactional_delete_without_unsafe_flag(self):
-        with tempfile.TemporaryDirectory() as td:
-            input_root = os.path.join(td, "input")
-            output_root = os.path.join(td, "output")
-            os.makedirs(input_root)
-            os.makedirs(output_root)
-
-            args = self._make_processing_args(
-                input_root,
-                output=output_root,
-                success_policy="delete",
-            )
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(self.m.os, "name", "nt"),
-                mock.patch.object(self.m.sys, "argv", self._argv_for_main(args)),
-                mock.patch.object(
-                    self.m,
-                    "safe_subprocess_run",
-                    return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
-                ),
-                mock.patch.object(self.m, "ArchiveProcessor") as archive_processor_ctor,
-                mock.patch.object(self.m, "fix_archive_ext") as fix_archive_ext,
-            ):
-                exit_code = self.m.main()
-
-            self.assertEqual(1, exit_code)
-            self.assertIn("--unsafe-windows-delete", stdout.getvalue())
-            archive_processor_ctor.assert_not_called()
-            fix_archive_ext.assert_not_called()
-
-    def test_main_rejects_fingerprint_mismatch_before_windows_delete_gate(self):
+    def test_main_rejects_fingerprint_mismatch_after_windows_delete_surface_cleanup(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -5467,17 +5293,16 @@ class TestTxnPrimitives(unittest.TestCase):
                 input_root,
                 output=output_root,
                 success_policy="delete",
-                unsafe_windows_delete=False,
             )
-            unsafe_args = self._make_processing_args(
+            mismatched_args = self._make_processing_args(
                 input_root,
                 output=output_root,
                 success_policy="delete",
-                unsafe_windows_delete=True,
+                traditional_zip_policy="asis",
             )
 
             with mock.patch.object(self.m.os, "name", "nt"):
-                baseline_fingerprint = self.m._build_command_fingerprint(unsafe_args)
+                baseline_fingerprint = self.m._build_command_fingerprint(mismatched_args)
 
             self.m._create_dataset_manifest(
                 input_root=input_root,
@@ -5544,7 +5369,7 @@ class TestTxnPrimitives(unittest.TestCase):
             with open(txn_json_path, "rb") as f:
                 self.assertEqual(txn_before, f.read())
 
-    def test_main_allows_windows_transactional_delete_with_unsafe_flag(self):
+    def test_main_allows_windows_transactional_delete_without_extra_flag(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -5555,7 +5380,6 @@ class TestTxnPrimitives(unittest.TestCase):
                 input_root,
                 output=output_root,
                 success_policy="delete",
-                unsafe_windows_delete=True,
             )
             processor = types.SimpleNamespace(
                 find_archives=mock.Mock(return_value=[]),
@@ -5587,7 +5411,7 @@ class TestTxnPrimitives(unittest.TestCase):
             fix_archive_ext.assert_called_once()
             processor.find_archives.assert_called_once_with(os.path.abspath(input_root))
 
-    def test_main_allows_windows_legacy_delete_without_unsafe_flag(self):
+    def test_main_allows_windows_legacy_delete_without_extra_flag(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -5630,7 +5454,173 @@ class TestTxnPrimitives(unittest.TestCase):
             fix_archive_ext.assert_called_once()
             processor.find_archives.assert_called_once_with(os.path.abspath(input_root))
 
-    def test_validate_delete_durability_args_rejects_no_durability_before_windows_unsafe_gate(
+    def test_main_fresh_traditional_zip_asis_reaches_extract_phase(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="asis",
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.sys, "argv", self._argv_for_main(args)),
+                mock.patch.object(
+                    self.m,
+                    "safe_subprocess_run",
+                    return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+                ),
+                mock.patch.object(self.m, "fix_archive_ext") as fix_archive_ext,
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    wraps=self.m._extract_phase,
+                ) as extract_phase_mock,
+            ):
+                exit_code = self.m.main()
+
+            output = stdout.getvalue()
+            self.assertEqual(0, exit_code)
+            self.assertNotIn("No archives found to process.", output)
+            self.assertIn("Found 1 archive(s) to process.", output)
+            self.assertIn("Skipped: 1", output)
+            extract_phase_mock.assert_called_once()
+            fix_archive_ext.assert_called_once()
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            entry = manifest["archives"][archive_id]
+            self.assertEqual("succeeded", entry["state"])
+            self.assertEqual("skipped:traditional_zip_asis", entry["final_disposition"])
+            self.assertIsNone(entry["error"])
+
+    def test_main_fresh_traditional_zip_move_missing_destination_reaches_extract_phase(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=None,
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.sys, "argv", self._argv_for_main(args)),
+                mock.patch.object(
+                    self.m,
+                    "safe_subprocess_run",
+                    return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+                ),
+                mock.patch.object(self.m, "fix_archive_ext") as fix_archive_ext,
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    wraps=self.m._extract_phase,
+                ) as extract_phase_mock,
+            ):
+                exit_code = self.m.main()
+
+            output = stdout.getvalue()
+            self.assertEqual(1, exit_code)
+            self.assertNotIn(
+                "Error: --traditional-zip-to is required when using --traditional-zip-policy move",
+                output,
+            )
+            self.assertIn("Found 1 archive(s) to process.", output)
+            self.assertIn("Failed to process: 1", output)
+            extract_phase_mock.assert_called_once()
+            fix_archive_ext.assert_called_once()
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            entry = manifest["archives"][archive_id]
+            self.assertEqual("retryable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertEqual(
+                "TRADITIONAL_ZIP_MOVE_CONFIG_INVALID",
+                entry["error"]["type"],
+            )
+
+    def test_main_fresh_traditional_zip_decode_invalid_reaches_extract_phase(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="decode-bad",
+            )
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(self.m.sys, "argv", self._argv_for_main(args)),
+                mock.patch.object(
+                    self.m,
+                    "safe_subprocess_run",
+                    return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+                ),
+                mock.patch.object(self.m, "fix_archive_ext") as fix_archive_ext,
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    wraps=self.m._extract_phase,
+                ) as extract_phase_mock,
+            ):
+                exit_code = self.m.main()
+
+            output = stdout.getvalue()
+            self.assertEqual(0, exit_code)
+            self.assertNotIn(
+                "Error: Invalid decode format in --traditional-zip-policy",
+                output,
+            )
+            self.assertIn("Found 1 archive(s) to process.", output)
+            self.assertIn("Skipped: 1", output)
+            extract_phase_mock.assert_called_once()
+            fix_archive_ext.assert_called_once()
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            entry = manifest["archives"][archive_id]
+            self.assertEqual("succeeded", entry["state"])
+            self.assertEqual(
+                "skipped:traditional_zip_decode_invalid",
+                entry["final_disposition"],
+            )
+            self.assertIsNone(entry["error"])
+
+    def test_validate_delete_durability_args_rejects_no_durability_for_windows_transactional_delete(
         self,
     ):
         with tempfile.TemporaryDirectory() as td:
@@ -5672,7 +5662,7 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertTrue(result)
             self.assertEqual("", stdout.getvalue())
 
-    def test_validate_delete_durability_args_rejects_fsync_files_none_before_windows_unsafe_gate(
+    def test_validate_delete_durability_args_rejects_fsync_files_none_for_windows_transactional_delete(
         self,
     ):
         with tempfile.TemporaryDirectory() as td:
@@ -5713,6 +5703,15 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertTrue(result)
             self.assertEqual("", stdout.getvalue())
+
+    def test_validate_delete_durability_args_allows_windows_transactional_delete_without_extra_flag(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(td, success_policy="delete")
+
+        with mock.patch.object(self.m.os, "name", "nt"):
+            self.assertTrue(self.m._validate_delete_durability_args(args))
 
     def test_main_dry_run_with_fix_ext_does_not_rename_inputs(self):
         with tempfile.TemporaryDirectory() as td:
@@ -5791,6 +5790,7 @@ class TestTxnPrimitives(unittest.TestCase):
             ]
             self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
             self.assertEqual("DURABILITY_FAILED", saved_txn["error"]["type"])
+            self.assertEqual("DURABILITY_FAILED", manifest_entry["error"]["type"])
             self.assertEqual("recoverable", manifest_entry["state"])
             self.assertEqual("unknown", manifest_entry["final_disposition"])
             self.assertIsNone(manifest_entry["finalized_at"])
@@ -5824,14 +5824,16 @@ class TestTxnPrimitives(unittest.TestCase):
             ]
             self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
             self.assertEqual("DURABILITY_FAILED", saved_txn["error"]["type"])
+            self.assertEqual("DURABILITY_FAILED", manifest_entry["error"]["type"])
             self.assertEqual("recoverable", manifest_entry["state"])
             self.assertEqual("unknown", manifest_entry["final_disposition"])
             self.assertIsNone(manifest_entry["finalized_at"])
 
-    def test_windows_unsafe_delete_still_attempts_payload_directory_fsync(self):
+    def test_windows_transactional_delete_payload_dir_fsync_failure_blocks_delete(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_delete_barrier_txn_fixture(td)
-            fixture["args"].unsafe_windows_delete = True
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
             expected_payload_dirs = [
                 os.path.abspath(path) for path in fixture["expected_payload_dirs"]
             ]
@@ -5860,54 +5862,22 @@ class TestTxnPrimitives(unittest.TestCase):
                 mock.patch.object(
                     self.m, "_fsync_dir", side_effect=fail_payload_dir_fsync
                 ),
-            ):
-                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
-
-            for path in expected_payload_dirs:
-                self.assertIn(path, fsynced_dirs)
-
-    def test_windows_unsafe_delete_tolerates_payload_directory_fsync_failure(self):
-        with tempfile.TemporaryDirectory() as td:
-            fixture = self._make_delete_barrier_txn_fixture(td)
-            fixture["args"].unsafe_windows_delete = True
-
-            class DummyLock:
-                def __init__(self, path, timeout_ms, retry_ms, debug):
-                    self.path = path
-
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, exc_type, exc, tb):
-                    return False
-
-            with (
-                mock.patch.object(self.m.os, "name", "nt"),
-                mock.patch.object(self.m, "FileLock", DummyLock),
-                mock.patch.object(self.m, "same_volume", return_value=True),
-                mock.patch.object(self.m, "_fsync_file", return_value=True),
-                mock.patch.object(
-                    self.m,
-                    "_fsync_dir",
-                    side_effect=lambda path, debug=False: os.path.abspath(path)
-                    not in {
-                        os.path.abspath(p) for p in fixture["expected_payload_dirs"]
-                    },
-                ),
+                self.assertRaises(RuntimeError),
             ):
                 self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
 
             manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            manifest_entry = manifest["archives"][
-                self.m._dataset_manifest_archive_id(fixture["archive_path"])
-            ]
-            self.assertFalse(os.path.exists(os.path.abspath(fixture["archive_path"])))
-            self.assertEqual("succeeded", manifest_entry["state"])
+            entry = manifest["archives"][archive_id]
 
-    def test_windows_unsafe_delete_real_fsync_file_path_reaches_success(self):
+            self.assertIn(expected_payload_dirs[0], fsynced_dirs)
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertIsNone(entry["finalized_at"])
+
+    def test_windows_transactional_delete_real_fsync_file_path_reaches_success(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_delete_barrier_txn_fixture(td)
-            fixture["args"].unsafe_windows_delete = True
             archive_path = os.path.abspath(fixture["archive_path"])
             archive_id = self.m._dataset_manifest_archive_id(archive_path)
             expected_open_paths = {
@@ -5977,7 +5947,7 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertFalse(os.path.exists(archive_path))
             self.assertEqual("succeeded", manifest_entry["state"])
             self.assertEqual(
-                "success:delete-unsafe-windows",
+                "success:delete",
                 manifest_entry["final_disposition"],
             )
             self.assertTrue(expected_open_paths.issubset(opened_paths))
@@ -6001,7 +5971,6 @@ class TestTxnPrimitives(unittest.TestCase):
                 input_root,
                 output=output_root,
                 success_policy="delete",
-                unsafe_windows_delete=True,
             )
 
             txn = self.m._txn_create(
@@ -6036,15 +6005,17 @@ class TestTxnPrimitives(unittest.TestCase):
             ):
                 self.m._txn_snapshot(txn)
                 self.m._txn_snapshot(txn)
-                self.m._durability_barrier(
-                    txn,
-                    fsync_files="auto",
-                    delete_mode="txn_delete_unsafe_windows",
-                )
+                self.m._durability_barrier(txn, fsync_files="auto")
 
             self.assertTrue(os.path.exists(txn_json_path))
 
-    def test_windows_unsafe_delete_keeps_wal_fsync_failure_blocking(self):
+    def test_durability_barrier_no_longer_accepts_delete_mode_keyword(self):
+        self.assertNotIn(
+            "delete_mode",
+            inspect.signature(self.m._durability_barrier).parameters,
+        )
+
+    def test_windows_transactional_delete_keeps_wal_fsync_failure_blocking(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_delete_barrier_txn_fixture(td)
             wal_path = os.path.abspath(fixture["txn"]["paths"]["wal"])
@@ -6052,13 +6023,13 @@ class TestTxnPrimitives(unittest.TestCase):
             def fail_on_wal_fsync(path, debug=False):
                 return os.path.abspath(path) != wal_path
 
-            self._assert_windows_unsafe_delete_barrier_failure(
+            self._assert_windows_transactional_delete_barrier_failure(
                 fixture,
                 fsync_file_side_effect=fail_on_wal_fsync,
                 expected_error_text="journal_fsync_failed:wal",
             )
 
-    def test_windows_unsafe_delete_keeps_txn_json_fsync_failure_blocking(self):
+    def test_windows_transactional_delete_keeps_txn_json_fsync_failure_blocking(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_delete_barrier_txn_fixture(td)
             txn_json_path = os.path.abspath(fixture["txn"]["paths"]["txn_json"])
@@ -6066,13 +6037,13 @@ class TestTxnPrimitives(unittest.TestCase):
             def fail_on_txn_json_fsync(path, debug=False):
                 return os.path.abspath(path) != txn_json_path
 
-            self._assert_windows_unsafe_delete_barrier_failure(
+            self._assert_windows_transactional_delete_barrier_failure(
                 fixture,
                 fsync_file_side_effect=fail_on_txn_json_fsync,
                 expected_error_text="journal_fsync_failed:txn_json",
             )
 
-    def test_windows_unsafe_delete_keeps_payload_file_fsync_failure_blocking(self):
+    def test_windows_transactional_delete_keeps_payload_file_fsync_failure_blocking(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_delete_barrier_txn_fixture(td)
             payload_path = os.path.abspath(fixture["expected_payload_files"][0])
@@ -6080,7 +6051,7 @@ class TestTxnPrimitives(unittest.TestCase):
             def fail_on_payload_file_fsync(path, debug=False):
                 return os.path.abspath(path) != payload_path
 
-            self._assert_windows_unsafe_delete_barrier_failure(
+            self._assert_windows_transactional_delete_barrier_failure(
                 fixture,
                 fsync_file_side_effect=fail_on_payload_file_fsync,
                 expected_error_text="payload_fsync_failed:file:",
@@ -6279,27 +6250,7 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
             self.assertEqual("DURABILITY_FAILED", saved_txn["error"]["type"])
 
-    def test_delete_unsafe_windows_missing_input_allows_terminal_manifest_entry(self):
-        with tempfile.TemporaryDirectory() as td:
-            fixture = self._make_single_archive_manifest_fixture(
-                td,
-                manifest_state="succeeded",
-            )
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            entry = manifest["archives"][fixture["archive_id"]]
-            entry["state"] = "succeeded"
-            entry["final_disposition"] = "success:delete-unsafe-windows"
-
-            with mock.patch.object(self.m.os, "name", "nt"):
-                self.assertTrue(
-                    self.m._manifest_archive_allows_missing_input(
-                        manifest,
-                        entry,
-                        fixture["output_root"],
-                    )
-                )
-
-    def test_delete_unsafe_windows_source_finalization_resume_recognizes_success(
+    def test_success_delete_source_finalization_resume_recognizes_success(
         self,
     ):
         class DummyLock:
@@ -6318,12 +6269,11 @@ class TestTxnPrimitives(unittest.TestCase):
                 success_policy="delete",
             )
             txn = fixture["txn"]
-            fixture["args"].unsafe_windows_delete = True
             txn["state"] = self.m.TXN_STATE_PLACED
             self.m._set_source_finalization_plan(
                 txn,
                 manifest_state="succeeded",
-                final_disposition="success:delete-unsafe-windows",
+                final_disposition="success:delete",
                 txn_terminal_state=self.m.TXN_STATE_DONE,
             )
             self.m._txn_snapshot(txn)
@@ -6346,14 +6296,9 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertFalse(os.path.exists(fixture["archive_path"]))
             self.assertEqual(self.m.TXN_STATE_DONE, txn["state"])
             self.assertEqual("succeeded", entry["state"])
-            self.assertEqual(
-                "success:delete-unsafe-windows",
-                entry["final_disposition"],
-            )
+            self.assertEqual("success:delete", entry["final_disposition"])
 
-    def test_delete_unsafe_windows_resume_source_finalization_emits_per_txn_warning(
-        self,
-    ):
+    def test_windows_transactional_delete_success_records_success_delete(self):
         class DummyLock:
             def __init__(self, path, timeout_ms, retry_ms, debug):
                 self.path = path
@@ -6369,381 +6314,6 @@ class TestTxnPrimitives(unittest.TestCase):
                 td,
                 success_policy="delete",
             )
-            txn = fixture["txn"]
-            fixture["args"].unsafe_windows_delete = True
-            txn["state"] = self.m.TXN_STATE_PLACED
-            self.m._set_source_finalization_plan(
-                txn,
-                manifest_state="succeeded",
-                final_disposition="success:delete-unsafe-windows",
-                txn_terminal_state=self.m.TXN_STATE_DONE,
-            )
-            self.m._txn_snapshot(txn)
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(self.m.os, "name", "nt"),
-                mock.patch.object(self.m, "FileLock", DummyLock),
-                mock.patch.object(self.m, "same_volume", return_value=True),
-                mock.patch.object(self.m, "_fsync_dir", return_value=True),
-            ):
-                resumed = self.m._resume_source_finalization_if_needed(
-                    txn,
-                    args=fixture["args"],
-                )
-
-            output = stdout.getvalue().lower()
-            self.assertTrue(resumed)
-            self.assertIn("best-effort payload directory durability", output)
-            self.assertIn(
-                "source archives are deleted after transactional placement anyway",
-                output,
-            )
-
-    def test_delete_unsafe_windows_startup_warning_emitted_for_windows_transactional_delete(
-        self,
-    ):
-        with tempfile.TemporaryDirectory() as td:
-            input_root = os.path.join(td, "input")
-            output_root = os.path.join(td, "output")
-            os.makedirs(input_root)
-            os.makedirs(output_root)
-
-            args = self._make_processing_args(
-                input_root,
-                output=output_root,
-                success_policy="delete",
-                unsafe_windows_delete=True,
-            )
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
-            )
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(self.m.os, "name", "nt"),
-            ):
-                result = self.m._run_transactional(processor, [], args=args)
-
-            output = stdout.getvalue().lower()
-            self.assertIsNone(result)
-            self.assertIn("best-effort payload directory durability", output)
-            self.assertIn(
-                "source archives are deleted after transactional placement anyway",
-                output,
-            )
-
-    def test_delete_unsafe_windows_startup_warning_not_emitted_for_windows_transactional_dry_run(
-        self,
-    ):
-        with tempfile.TemporaryDirectory() as td:
-            input_root = os.path.join(td, "input")
-            output_root = os.path.join(td, "output")
-            os.makedirs(input_root)
-            os.makedirs(output_root)
-
-            archive_path = os.path.join(input_root, "dry-run.zip")
-            with open(archive_path, "wb") as f:
-                f.write(b"dry-run")
-
-            args = self._make_processing_args(
-                input_root,
-                output=output_root,
-                success_policy="delete",
-                unsafe_windows_delete=True,
-                dry_run=True,
-            )
-            processor = self._make_transactional_processor_stub()
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(self.m.os, "name", "nt"),
-            ):
-                result = self.m._run_transactional(processor, [archive_path], args=args)
-
-            output = stdout.getvalue().lower()
-            self.assertTrue(result)
-            self.assertNotIn("best-effort payload directory durability", output)
-            self.assertNotIn(
-                "source archives are deleted after transactional placement anyway",
-                output,
-            )
-            self.assertEqual(
-                [os.path.abspath(archive_path)], processor.skipped_archives
-            )
-
-    def test_delete_unsafe_windows_startup_warning_not_emitted_when_strict_resume_validation_rejects_run(
-        self,
-    ):
-        with tempfile.TemporaryDirectory() as td:
-            input_root = os.path.join(td, "input")
-            output_root = os.path.join(td, "output")
-            os.makedirs(input_root)
-            os.makedirs(output_root)
-
-            discovered = self._make_discovered_archives(
-                input_root,
-                output_root,
-                ["alpha.zip"],
-            )
-            baseline_args = self._make_processing_args(
-                input_root,
-                output=output_root,
-                success_policy="delete",
-            )
-            resume_args = self._make_processing_args(
-                input_root,
-                output=output_root,
-                success_policy="delete",
-                unsafe_windows_delete=True,
-            )
-
-            with mock.patch.object(self.m.os, "name", "nt"):
-                baseline_fingerprint = self.m._build_command_fingerprint(baseline_args)
-
-            self.m._create_dataset_manifest(
-                input_root=input_root,
-                output_root=output_root,
-                discovered_archives=discovered,
-                command_fingerprint=baseline_fingerprint,
-            )
-
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
-            )
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(self.m.os, "name", "nt"),
-            ):
-                result = self.m._run_transactional(
-                    processor,
-                    [discovered[0]["archive_path"]],
-                    args=resume_args,
-                )
-
-            output = stdout.getvalue().lower()
-            self.assertFalse(result)
-            self.assertIn("command fingerprint", output)
-            self.assertNotIn("best-effort payload directory durability", output)
-            self.assertNotIn(
-                "source archives are deleted after transactional placement anyway",
-                output,
-            )
-
-    def test_delete_unsafe_windows_per_txn_warning_emitted_before_source_finalization(
-        self,
-    ):
-        class DummyLock:
-            def __init__(self, path, timeout_ms, retry_ms, debug):
-                self.path = path
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-        with tempfile.TemporaryDirectory() as td:
-            fixture = self._make_success_finalization_txn_fixture(
-                td,
-                success_policy="delete",
-            )
-            fixture["args"].unsafe_windows_delete = True
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(self.m.os, "name", "nt"),
-                mock.patch.object(self.m, "FileLock", DummyLock),
-                mock.patch.object(self.m, "same_volume", return_value=True),
-                mock.patch.object(self.m, "_fsync_file", return_value=True),
-                mock.patch.object(self.m, "_fsync_dir", return_value=True),
-            ):
-                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
-
-            output = stdout.getvalue().lower()
-            self.assertIn("best-effort payload directory durability", output)
-            self.assertIn(
-                "source archives are deleted after transactional placement anyway",
-                output,
-            )
-
-    def test_delete_unsafe_windows_warning_not_emitted_for_windows_legacy_delete(self):
-        class DummyLock:
-            def __init__(self, path, timeout_ms, retry_ms, debug):
-                self.path = path
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-        with tempfile.TemporaryDirectory() as td:
-            input_root = os.path.join(td, "input")
-            output_root = os.path.join(td, "output")
-            os.makedirs(input_root)
-            os.makedirs(output_root)
-
-            startup_args = self._make_processing_args(
-                input_root,
-                output=output_root,
-                success_policy="delete",
-                legacy=True,
-                unsafe_windows_delete=True,
-            )
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
-            )
-            startup_stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(startup_stdout),
-                mock.patch.object(self.m.os, "name", "nt"),
-            ):
-                result = self.m._run_transactional(processor, [], args=startup_args)
-
-            finalize_root = os.path.join(td, "finalize")
-            os.makedirs(finalize_root)
-            fixture = self._make_success_finalization_txn_fixture(
-                finalize_root,
-                success_policy="delete",
-            )
-            fixture["args"].legacy = True
-            fixture["args"].unsafe_windows_delete = True
-            finalize_stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(finalize_stdout),
-                mock.patch.object(self.m.os, "name", "nt"),
-                mock.patch.object(self.m, "FileLock", DummyLock),
-                mock.patch.object(self.m, "same_volume", return_value=True),
-                mock.patch.object(self.m, "_fsync_file", return_value=True),
-                mock.patch.object(self.m, "_fsync_dir", return_value=True),
-            ):
-                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
-
-            self.assertIsNone(result)
-            self.assertNotIn(
-                "best-effort payload directory durability",
-                startup_stdout.getvalue().lower(),
-            )
-            self.assertNotIn(
-                "source archives are deleted after transactional placement anyway",
-                startup_stdout.getvalue().lower(),
-            )
-            self.assertNotIn(
-                "best-effort payload directory durability",
-                finalize_stdout.getvalue().lower(),
-            )
-            self.assertNotIn(
-                "source archives are deleted after transactional placement anyway",
-                finalize_stdout.getvalue().lower(),
-            )
-
-    def test_delete_unsafe_windows_warning_not_emitted_for_non_windows_transactional_delete(
-        self,
-    ):
-        class DummyLock:
-            def __init__(self, path, timeout_ms, retry_ms, debug):
-                self.path = path
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-        with tempfile.TemporaryDirectory() as td:
-            input_root = os.path.join(td, "input")
-            output_root = os.path.join(td, "output")
-            os.makedirs(input_root)
-            os.makedirs(output_root)
-
-            startup_args = self._make_processing_args(
-                input_root,
-                output=output_root,
-                success_policy="delete",
-                unsafe_windows_delete=True,
-            )
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
-            )
-            startup_stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(startup_stdout),
-                mock.patch.object(self.m.os, "name", "posix"),
-            ):
-                result = self.m._run_transactional(processor, [], args=startup_args)
-
-            finalize_root = os.path.join(td, "finalize")
-            os.makedirs(finalize_root)
-            fixture = self._make_success_finalization_txn_fixture(
-                finalize_root,
-                success_policy="delete",
-            )
-            fixture["args"].unsafe_windows_delete = True
-            finalize_stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(finalize_stdout),
-                mock.patch.object(self.m.os, "name", "posix"),
-                mock.patch.object(self.m, "FileLock", DummyLock),
-                mock.patch.object(self.m, "same_volume", return_value=True),
-                mock.patch.object(self.m, "_fsync_file", return_value=True),
-                mock.patch.object(self.m, "_fsync_dir", return_value=True),
-            ):
-                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
-
-            self.assertIsNone(result)
-            self.assertNotIn(
-                "best-effort payload directory durability",
-                startup_stdout.getvalue().lower(),
-            )
-            self.assertNotIn(
-                "source archives are deleted after transactional placement anyway",
-                startup_stdout.getvalue().lower(),
-            )
-            self.assertNotIn(
-                "best-effort payload directory durability",
-                finalize_stdout.getvalue().lower(),
-            )
-            self.assertNotIn(
-                "source archives are deleted after transactional placement anyway",
-                finalize_stdout.getvalue().lower(),
-            )
-
-    def test_delete_unsafe_windows_final_disposition_written_on_success(self):
-        class DummyLock:
-            def __init__(self, path, timeout_ms, retry_ms, debug):
-                self.path = path
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-        with tempfile.TemporaryDirectory() as td:
-            fixture = self._make_success_finalization_txn_fixture(
-                td,
-                success_policy="delete",
-            )
-            fixture["args"].unsafe_windows_delete = True
 
             with (
                 mock.patch.object(self.m.os, "name", "nt"),
@@ -6758,13 +6328,10 @@ class TestTxnPrimitives(unittest.TestCase):
             entry = manifest["archives"][fixture["archive_id"]]
 
             self.assertEqual("succeeded", entry["state"])
-            self.assertEqual(
-                "success:delete-unsafe-windows",
-                entry["final_disposition"],
-            )
+            self.assertEqual("success:delete", entry["final_disposition"])
             self.assertFalse(os.path.exists(os.path.abspath(fixture["archive_path"])))
 
-    def test_delete_unsafe_windows_resume_converges_persisted_source_finalization_plan(
+    def test_success_delete_resume_converges_persisted_source_finalization_plan(
         self,
     ):
         class DummyLock:
@@ -6782,7 +6349,6 @@ class TestTxnPrimitives(unittest.TestCase):
                 td,
                 success_policy="delete",
             )
-            fixture["args"].unsafe_windows_delete = True
             archive_path = os.path.abspath(fixture["archive_path"])
             archive_id = fixture["archive_id"]
             real_snapshot = self.m._txn_snapshot
@@ -6799,13 +6365,11 @@ class TestTxnPrimitives(unittest.TestCase):
                 plan = self.m._txn_source_finalization_plan(txn)
                 if (
                     plan is not None
-                    and plan["final_disposition"] == "success:delete-unsafe-windows"
+                    and plan["final_disposition"] == "success:delete"
                     and txn.get("state")
                     in (self.m.TXN_STATE_PLACED, self.m.TXN_STATE_DURABLE)
                 ):
-                    raise SystemExit(
-                        "crash-after-unsafe-delete-source-finalization-plan"
-                    )
+                    raise SystemExit("crash-after-delete-source-finalization-plan")
 
             with (
                 mock.patch.object(self.m.os, "name", "nt"),
@@ -6837,7 +6401,7 @@ class TestTxnPrimitives(unittest.TestCase):
                     self.m,
                     "_extract_phase",
                     side_effect=AssertionError(
-                        "resume should converge persisted unsafe delete finalization plan without re-extract"
+                        "resume should converge persisted transactional delete finalization plan without re-extract"
                     ),
                 ),
                 mock.patch.object(self.m, "_garbage_collect"),
@@ -6854,10 +6418,7 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual([archive_path], processor.successful_archives)
             self.assertEqual([], processor.failed_archives)
             self.assertEqual("succeeded", resumed_entry["state"])
-            self.assertEqual(
-                "success:delete-unsafe-windows",
-                resumed_entry["final_disposition"],
-            )
+            self.assertEqual("success:delete", resumed_entry["final_disposition"])
             self.assertEqual(self.m.TXN_STATE_DONE, resumed_txn["state"])
 
     def test_terminal_delete_manifest_reopens_without_missing_source_drift(self):
@@ -6875,7 +6436,6 @@ class TestTxnPrimitives(unittest.TestCase):
             fixture = self._make_success_finalization_txn_fixture(
                 td, success_policy="delete"
             )
-            fixture["args"].unsafe_windows_delete = True
             manifest = self.m._load_dataset_manifest(fixture["output_root"])
             with mock.patch.object(self.m.os, "name", "nt"):
                 manifest["command_fingerprint"] = self.m._build_command_fingerprint(
@@ -7015,11 +6575,6 @@ class TestTxnPrimitives(unittest.TestCase):
 
             extracting_processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
             with (
@@ -7087,7 +6642,6 @@ class TestTxnPrimitives(unittest.TestCase):
             fixture = self._make_success_finalization_txn_fixture(
                 td, success_policy="delete"
             )
-            fixture["args"].unsafe_windows_delete = True
             manifest = self.m._load_dataset_manifest(fixture["output_root"])
             with mock.patch.object(self.m.os, "name", "nt"):
                 manifest["command_fingerprint"] = self.m._build_command_fingerprint(
@@ -7228,7 +6782,6 @@ class TestTxnPrimitives(unittest.TestCase):
             legacy=False,
             no_durability=True,
             fsync_files="auto",
-            unsafe_windows_delete=False,
         )
 
         self.assertFalse(self.m._validate_delete_durability_args(args))
@@ -7241,7 +6794,6 @@ class TestTxnPrimitives(unittest.TestCase):
             legacy=False,
             no_durability=False,
             fsync_files="none",
-            unsafe_windows_delete=False,
         )
 
         self.assertFalse(self.m._validate_delete_durability_args(args))
@@ -7254,7 +6806,6 @@ class TestTxnPrimitives(unittest.TestCase):
             legacy=False,
             no_durability=True,
             fsync_files="auto",
-            unsafe_windows_delete=False,
         )
 
         self.assertFalse(self.m._validate_delete_durability_args(args))
@@ -7267,7 +6818,6 @@ class TestTxnPrimitives(unittest.TestCase):
             legacy=False,
             no_durability=False,
             fsync_files="none",
-            unsafe_windows_delete=False,
         )
 
         self.assertFalse(self.m._validate_delete_durability_args(args))
@@ -7280,7 +6830,6 @@ class TestTxnPrimitives(unittest.TestCase):
             legacy=False,
             no_durability=True,
             fsync_files="auto",
-            unsafe_windows_delete=False,
         )
 
         self.assertFalse(self.m._validate_delete_durability_args(args))
@@ -7293,10 +6842,437 @@ class TestTxnPrimitives(unittest.TestCase):
             legacy=False,
             no_durability=False,
             fsync_files="none",
-            unsafe_windows_delete=False,
         )
 
         self.assertFalse(self.m._validate_delete_durability_args(args))
+
+    def test_traditional_zip_policy_inspection_returns_fixed_reason_codes(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            archive_path = os.path.join(input_root, "legacy.zip")
+            text_path = os.path.join(input_root, "legacy.txt")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+            with open(text_path, "wb") as f:
+                f.write(b"plain")
+
+            move_args = self._make_processing_args(
+                input_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+            )
+            move_missing_dest_args = self._make_processing_args(
+                input_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=None,
+            )
+            asis_args = self._make_processing_args(
+                input_root,
+                traditional_zip_policy="asis",
+            )
+            auto_args = self._make_processing_args(
+                input_root,
+                traditional_zip_policy="decode-auto",
+            )
+            manual_args = self._make_processing_args(
+                input_root,
+                traditional_zip_policy="decode-932",
+            )
+            invalid_args = self._make_processing_args(
+                input_root,
+                traditional_zip_policy="decode-bad",
+            )
+
+            not_zip = self.m._inspect_traditional_zip_policy(move_args, text_path)
+            self.assertEqual(
+                {
+                    "applies",
+                    "policy",
+                    "zip_decode",
+                    "reason",
+                    "traditional_zip_to",
+                    "error",
+                },
+                set(not_zip.keys()),
+            )
+            self.assertFalse(not_zip["applies"])
+            self.assertEqual("move", not_zip["policy"])
+            self.assertIsNone(not_zip["zip_decode"])
+            self.assertEqual("not_zip", not_zip["reason"])
+            self.assertIsNone(not_zip["traditional_zip_to"])
+            self.assertIsNone(not_zip["error"])
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=False),
+            ):
+                not_traditional = self.m._inspect_traditional_zip_policy(
+                    move_args,
+                    archive_path,
+                )
+
+            self.assertFalse(not_traditional["applies"])
+            self.assertEqual("not_traditional_zip", not_traditional["reason"])
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+            ):
+                move_inspected = self.m._inspect_traditional_zip_policy(
+                    move_args, archive_path
+                )
+                missing_dest_inspected = self.m._inspect_traditional_zip_policy(
+                    move_missing_dest_args,
+                    archive_path,
+                )
+                asis_inspected = self.m._inspect_traditional_zip_policy(
+                    asis_args,
+                    archive_path,
+                )
+                auto_inspected = self.m._inspect_traditional_zip_policy(
+                    auto_args,
+                    archive_path,
+                )
+                manual_inspected = self.m._inspect_traditional_zip_policy(
+                    manual_args,
+                    archive_path,
+                )
+                invalid_inspected = self.m._inspect_traditional_zip_policy(
+                    invalid_args,
+                    archive_path,
+                )
+
+            self.assertTrue(move_inspected["applies"])
+            self.assertEqual("traditional_zip_move", move_inspected["reason"])
+            self.assertEqual(os.path.abspath(trad_to), move_inspected["traditional_zip_to"])
+            self.assertIsNone(move_inspected["error"])
+
+            self.assertTrue(missing_dest_inspected["applies"])
+            self.assertEqual(
+                "traditional_zip_move_missing_destination",
+                missing_dest_inspected["reason"],
+            )
+            self.assertEqual(
+                {"type", "message", "at"},
+                set(missing_dest_inspected["error"].keys()),
+            )
+            self.assertEqual(
+                "TRADITIONAL_ZIP_MOVE_CONFIG_INVALID",
+                missing_dest_inspected["error"]["type"],
+            )
+            self.assertEqual("traditional_zip_asis", asis_inspected["reason"])
+            self.assertEqual("traditional_zip_decode_auto", auto_inspected["reason"])
+            self.assertEqual("traditional_zip_decode_manual", manual_inspected["reason"])
+            self.assertEqual(932, manual_inspected["zip_decode"])
+            self.assertEqual("traditional_zip_decode_invalid", invalid_inspected["reason"])
+            self.assertEqual(
+                {"type", "message", "at"},
+                set(invalid_inspected["error"].keys()),
+            )
+            self.assertEqual(
+                "TRADITIONAL_ZIP_DECODE_POLICY_INVALID",
+                invalid_inspected["error"]["type"],
+            )
+
+    def test_traditional_zip_move_destination_planner_matches_txn_and_non_txn_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(os.path.join(input_root, "nested"), exist_ok=True)
+            archive_path = os.path.join(input_root, "nested", "legacy.zip")
+            volume_path = os.path.join(input_root, "nested", "legacy.z01")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+            with open(volume_path, "wb") as f:
+                f.write(b"volume")
+
+            existing_target_dir = os.path.join(trad_to, "nested")
+            os.makedirs(existing_target_dir, exist_ok=True)
+            with open(os.path.join(existing_target_dir, "legacy.zip"), "wb") as f:
+                f.write(b"existing")
+
+            args = self._make_processing_args(
+                input_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+            )
+            volumes = [archive_path, volume_path]
+
+            non_txn_destinations = self.m._traditional_zip_move_destinations(
+                args,
+                volumes,
+                collision_token="abcd1234",
+            )
+            txn_destinations = self.m._traditional_zip_move_destinations(
+                args,
+                volumes,
+                collision_token="abcd1234",
+            )
+
+            expected = [
+                (
+                    os.path.abspath(archive_path),
+                    os.path.abspath(
+                        os.path.join(trad_to, "nested", "legacy_abcd1234_1.zip")
+                    ),
+                ),
+                (
+                    os.path.abspath(volume_path),
+                    os.path.abspath(os.path.join(trad_to, "nested", "legacy.z01")),
+                ),
+            ]
+
+            self.assertEqual(expected, non_txn_destinations)
+            self.assertEqual(non_txn_destinations, txn_destinations)
+
+    def test_traditional_zip_move_token_is_deterministic_across_entrypoints(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            archive_path = os.path.join(input_root, "legacy.zip")
+            volume_path = os.path.join(input_root, "legacy.z01")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+            with open(volume_path, "wb") as f:
+                f.write(b"volume")
+
+            args = self._make_processing_args(
+                input_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+            )
+
+            token_a = self.m._traditional_zip_move_token(args, [archive_path])
+            token_b = self.m._traditional_zip_move_token(args, [archive_path])
+            token_c = self.m._traditional_zip_move_token(args, [archive_path, volume_path])
+
+            self.assertEqual(token_a, token_b)
+            self.assertEqual(8, len(token_a))
+            self.assertNotEqual(token_a, token_c)
+
+    def test_process_archive_traditional_zip_move_without_manifest_does_not_create_txn(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+            )
+            processor = self.m.ArchiveProcessor(args)
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+                mock.patch.object(self.m, "_txn_create", wraps=self.m._txn_create) as txn_create_mock,
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot",
+                    wraps=self.m._txn_snapshot,
+                ) as txn_snapshot_mock,
+                mock.patch.object(
+                    self.m,
+                    "_set_source_finalization_plan",
+                    wraps=self.m._set_source_finalization_plan,
+                ) as set_plan_mock,
+                mock.patch.object(
+                    self.m,
+                    "_complete_source_finalization_plan",
+                    wraps=self.m._complete_source_finalization_plan,
+                ) as complete_plan_mock,
+                mock.patch.object(
+                    self.m,
+                    "_update_dataset_manifest_archive",
+                    wraps=self.m._update_dataset_manifest_archive,
+                ) as manifest_update_mock,
+            ):
+                self.assertTrue(processor.process_archive(archive_path))
+
+            txn_create_mock.assert_not_called()
+            txn_snapshot_mock.assert_not_called()
+            set_plan_mock.assert_not_called()
+            complete_plan_mock.assert_not_called()
+            manifest_update_mock.assert_not_called()
+            self.assertFalse(os.path.exists(self.m._work_base(output_root)))
+
+    def test_process_archive_traditional_zip_move_no_longer_calls_handle_traditional_zip_policy(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+            )
+            processor = self.m.ArchiveProcessor(args)
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+                mock.patch.object(
+                    self.m.ArchiveProcessor,
+                    "handle_traditional_zip_policy",
+                    side_effect=AssertionError("legacy helper must not be called"),
+                    create=True,
+                ),
+            ):
+                self.assertTrue(processor.process_archive(archive_path))
+
+    def test_process_archive_traditional_zip_move_missing_destination_returns_false_without_txn(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=None,
+            )
+            processor = self.m.ArchiveProcessor(args)
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_inspect_traditional_zip_policy",
+                    wraps=self.m._inspect_traditional_zip_policy,
+                ) as inspect_mock,
+                mock.patch.object(self.m, "_txn_create", wraps=self.m._txn_create) as txn_create_mock,
+            ):
+                self.assertFalse(processor.process_archive(archive_path))
+
+            inspect_mock.assert_called_once_with(args, archive_path)
+            txn_create_mock.assert_not_called()
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(self.m._work_base(output_root)))
+
+    def test_process_archive_traditional_zip_move_uses_shared_destination_algorithm(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(os.path.join(input_root, "nested"), exist_ok=True)
+            os.makedirs(output_root)
+            archive_path = os.path.join(input_root, "nested", "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            os.makedirs(os.path.join(trad_to, "nested"), exist_ok=True)
+            with open(os.path.join(trad_to, "nested", "legacy.zip"), "wb") as f:
+                f.write(b"existing")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+            )
+            processor = self.m.ArchiveProcessor(args)
+            collision_token = self.m._traditional_zip_move_token(args, [archive_path])
+            expected_paths = self.m._traditional_zip_move_destinations(
+                args,
+                [archive_path],
+                collision_token=collision_token,
+            )
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_inspect_traditional_zip_policy",
+                    wraps=self.m._inspect_traditional_zip_policy,
+                ) as inspect_mock,
+                mock.patch.object(
+                    self.m,
+                    "_execute_non_transactional_traditional_zip_move",
+                    wraps=self.m._execute_non_transactional_traditional_zip_move,
+                ) as move_executor_mock,
+                mock.patch.object(
+                    self.m,
+                    "_txn_create",
+                    side_effect=AssertionError("transaction must not be created"),
+                ),
+            ):
+                self.assertTrue(processor.process_archive(archive_path))
+
+            inspect_mock.assert_called_once_with(args, archive_path)
+            move_executor_mock.assert_called_once()
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(expected_paths[0][1]))
+            self.assertFalse(os.path.exists(self.m._work_base(output_root)))
+
+    def test_process_archive_traditional_zip_move_dry_run_does_not_move_source_or_record_success(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                dry_run=True,
+                legacy=True,
+            )
+            processor = self.m.ArchiveProcessor(args)
+            expected_dst = self.m._traditional_zip_move_destinations(
+                args,
+                [archive_path],
+                collision_token=self.m._traditional_zip_move_token(args, [archive_path]),
+            )[0][1]
+
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+            ):
+                result = processor.process_archive(archive_path)
+
+            self.assertTrue(result)
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(expected_dst))
+            self.assertEqual([], processor.successful_archives)
+            self.assertEqual([], processor.failed_archives)
+            self.assertEqual([], processor.skipped_archives)
 
     def test_success_move_fsync_failure_after_rename_keeps_manifest_non_terminal(self):
         with tempfile.TemporaryDirectory() as td:
@@ -7681,7 +7657,6 @@ class TestTxnPrimitives(unittest.TestCase):
             fixture = self._make_success_finalization_txn_fixture(
                 td, success_policy="delete"
             )
-            fixture["args"].unsafe_windows_delete = True
             manifest = self.m._load_dataset_manifest(fixture["output_root"])
             with mock.patch.object(self.m.os, "name", "nt"):
                 manifest["command_fingerprint"] = self.m._build_command_fingerprint(
@@ -7740,14 +7715,21 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual([archive_path], processor.successful_archives)
             self.assertEqual([], processor.failed_archives)
             self.assertEqual("succeeded", resumed_entry["state"])
-            self.assertEqual(
-                "success:delete-unsafe-windows",
-                resumed_entry["final_disposition"],
-            )
+            self.assertEqual("success:delete", resumed_entry["final_disposition"])
 
-    def test_success_delete_planned_destination_journal_fsync_failure_before_rename_keeps_manifest_recoverable(
+    def test_windows_transactional_delete_failure_result_can_still_be_retryable(
         self,
     ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_success_finalization_txn_fixture(
                 td, success_policy="delete"
@@ -7777,6 +7759,9 @@ class TestTxnPrimitives(unittest.TestCase):
                 )
 
             with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "same_volume", return_value=True),
                 mock.patch.object(self.m, "_fsync_file", return_value=True),
                 mock.patch.object(self.m, "_fsync_dir", return_value=True),
                 mock.patch.object(
@@ -7798,7 +7783,7 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertTrue(os.path.exists(archive_path))
             self.assertFalse(os.path.exists(planned_dst))
             self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
-            self.assertEqual("DURABILITY_FAILED", saved_txn["error"]["type"])
+            self.assertEqual("FAIL_FINALIZE_FAILED", saved_txn["error"]["type"])
             self.assertEqual(
                 "success:delete",
                 self.m._txn_source_finalization_plan(saved_txn)["final_disposition"],
@@ -7809,10 +7794,38 @@ class TestTxnPrimitives(unittest.TestCase):
             )
             self.assertTrue(self.m._txn_has_incomplete_source_finalization(saved_txn))
             self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
-            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("retryable", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
-            self.assertEqual("DURABILITY_FAILED", entry["error"]["type"])
+            self.assertEqual("FAIL_FINALIZE_FAILED", entry["error"]["type"])
+
+    def test_manifest_archive_read_side_rejects_removed_legacy_disposition(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="succeeded",
+            )
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+            entry["state"] = "succeeded"
+            entry["final_disposition"] = "success:delete-unsafe-windows"
+            entry["finalized_at"] = self.m._now_iso()
+            self.m._save_dataset_manifest(manifest)
+            os.remove(fixture["archive"]["archive_path"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            self.assertFalse(
+                self.m._manifest_archive_allows_missing_input(
+                    manifest,
+                    entry,
+                    fixture["output_root"],
+                    missing_path=fixture["archive"]["archive_path"],
+                )
+            )
 
     def test_success_delete_trash_cleanup_false_terminalizes_success_with_residue(
         self,
@@ -7975,11 +7988,6 @@ class TestTxnPrimitives(unittest.TestCase):
 
             processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
 
@@ -8085,11 +8093,6 @@ class TestTxnPrimitives(unittest.TestCase):
 
             processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
             real_atomic_rename = self.m._atomic_rename
@@ -8198,11 +8201,6 @@ class TestTxnPrimitives(unittest.TestCase):
 
             processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 find_correct_password=lambda archive_path, encryption_status=None: None,
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
@@ -8308,11 +8306,6 @@ class TestTxnPrimitives(unittest.TestCase):
 
             processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 find_correct_password=lambda archive_path, encryption_status=None: None,
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
@@ -8600,9 +8593,7 @@ class TestTxnPrimitives(unittest.TestCase):
             )
             self.assertIsNone(resumed_entry["error"])
 
-    def test_traditional_zip_move_success_runs_per_txn_cleanup_without_changing_wrapper_contract(
-        self,
-    ):
+    def test_extract_phase_traditional_zip_move_returns_kind_txn_on_success(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -8645,15 +8636,23 @@ class TestTxnPrimitives(unittest.TestCase):
                 mock.patch.object(self.m, "is_traditional_zip", return_value=True),
             ):
                 result = self.m._extract_phase(
-                    processor, archive_path, args=args, output_base=output_root
-                )
-                self.m._handle_transactional_result(
-                    result,
-                    processor=observed_processor,
+                    processor,
+                    archive_path,
                     args=args,
                     output_base=output_root,
-                    touched_output_dirs=set(),
                 )
+
+            self.assertEqual("txn", result["kind"])
+            self.assertIn("txn", result)
+
+            touched_output_dirs = set()
+            self.m._handle_transactional_result(
+                result,
+                processor=observed_processor,
+                args=args,
+                output_base=output_root,
+                touched_output_dirs=touched_output_dirs,
+            )
 
             manifest = self.m._load_dataset_manifest(output_root)
             entry = manifest["archives"][archive_id]
@@ -8661,9 +8660,8 @@ class TestTxnPrimitives(unittest.TestCase):
             staging_root = os.path.join(txn["paths"]["work_root"], "staging", txn["txn_id"])
             incoming_root = os.path.join(txn["paths"]["work_root"], "incoming", txn["txn_id"])
 
-            self.assertEqual("skipped", result["kind"])
             self.assertEqual(
-                [os.path.abspath(archive_path)], observed_processor.skipped_archives
+                [os.path.abspath(archive_path)], observed_processor.successful_archives
             )
             self.assertEqual("succeeded", entry["state"])
             self.assertEqual("skipped:traditional_zip_moved", entry["final_disposition"])
@@ -8671,6 +8669,7 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertFalse(os.path.exists(staging_root))
             self.assertFalse(os.path.exists(incoming_root))
             self.assertTrue(os.path.exists(txn["paths"]["journal_dir"]))
+            self.assertEqual({output_root}, touched_output_dirs)
 
     def test_fail_move_fsync_failure_after_rename_keeps_manifest_retryable(self):
         with tempfile.TemporaryDirectory() as td:
@@ -8722,7 +8721,9 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
 
-    def test_traditional_zip_move_fsync_failure_after_rename_returns_retryable_result(self):
+    def test_extract_phase_traditional_zip_move_post_txn_failure_returns_txn_failed(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -8759,29 +8760,32 @@ class TestTxnPrimitives(unittest.TestCase):
                 mock.patch.object(self.m, "is_traditional_zip", return_value=True),
                 mock.patch.object(
                     self.m,
-                    "_fsync_file",
-                    side_effect=lambda path, debug=False: not path.endswith(".zip"),
+                    "_finalize_traditional_zip_move",
+                    side_effect=RuntimeError("traditional move finalize boom"),
                 ),
             ):
                 result = self.m._extract_phase(
                     processor, archive_path, args=args, output_base=output_root
                 )
-                self.m._handle_transactional_result(
-                    result,
-                    processor=types.SimpleNamespace(
-                        successful_archives=[], failed_archives=[], skipped_archives=[]
-                    ),
-                    args=args,
-                    output_base=output_root,
-                    touched_output_dirs=set(),
-                )
 
-            self.assertEqual("skipped", result["kind"])
-            self.assertEqual("retryable", result["manifest_state"])
-            self.assertEqual("unknown", result["manifest_final_disposition"])
-            self.assertEqual("FAIL_FINALIZE_FAILED", result["manifest_error"]["type"])
+            self.assertEqual("txn_failed", result["kind"])
+            self.assertEqual(self.m.TXN_STATE_ABORTED, result["txn"]["state"])
+            self.assertEqual("FAIL_FINALIZE_FAILED", result["txn"]["error"]["type"])
+
+            observed_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            self.m._handle_transactional_result(
+                result,
+                processor=observed_processor,
+                args=args,
+                output_base=output_root,
+                touched_output_dirs=set(),
+            )
+
             manifest = self.m._load_dataset_manifest(output_root)
             entry = manifest["archives"][archive_id]
+            self.assertEqual([os.path.abspath(archive_path)], observed_processor.failed_archives)
             self.assertEqual("retryable", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
@@ -8850,10 +8854,7 @@ class TestTxnPrimitives(unittest.TestCase):
             entry = manifest["archives"][archive_id]
             saved_txn = self.m._load_latest_txn_for_archive(entry, output_root)
 
-            self.assertEqual("skipped", result["kind"])
-            self.assertEqual("retryable", result["manifest_state"])
-            self.assertEqual("unknown", result["manifest_final_disposition"])
-            self.assertEqual("FAIL_FINALIZE_FAILED", result["manifest_error"]["type"])
+            self.assertEqual("txn_failed", result["kind"])
             self.assertEqual("retryable", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
@@ -8863,7 +8864,9 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
             self.assertFalse(self.m._txn_is_closed_terminal_outcome(saved_txn))
 
-    def test_traditional_zip_move_pre_txn_failure_keeps_manifest_retryable(self):
+    def test_extract_phase_traditional_zip_move_pre_txn_failure_returns_exact_failed_handoff(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -8908,34 +8911,135 @@ class TestTxnPrimitives(unittest.TestCase):
                     processor, archive_path, args=args, output_base=output_root
                 )
 
-            result_processor = types.SimpleNamespace(
+            self.assertEqual("failed", result["kind"])
+            self.assertEqual(os.path.abspath(archive_path), result["archive_path"])
+            self.assertEqual("traditional_zip_move_failed", result["reason"])
+            self.assertEqual("traditional_zip_move_failed", result["error"])
+            self.assertEqual("retryable", result["manifest_state"])
+            self.assertEqual("unknown", result["manifest_final_disposition"])
+            self.assertEqual("FAIL_FINALIZE_FAILED", result["manifest_error"]["type"])
+            self.assertIn("txn create boom", result["manifest_error"]["message"])
+
+    def test_traditional_zip_move_honors_pre_txn_failure_manifest_fields(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": "direct",
+                    }
+                ],
+                command_fingerprint=self._make_manifest_command_fingerprint(
+                    input_root, output_root
+                ),
+            )
+
+            result = {
+                "kind": "failed",
+                "archive_path": archive_path,
+                "reason": "traditional_zip_move_failed",
+                "error": "traditional_zip_move_failed",
+                "manifest_state": "retryable",
+                "manifest_final_disposition": "unknown",
+                "manifest_error": {
+                    "type": "FAIL_FINALIZE_FAILED",
+                    "message": "txn create boom",
+                    "at": self.m._now_iso(),
+                },
+            }
+            processor = types.SimpleNamespace(
                 successful_archives=[], failed_archives=[], skipped_archives=[]
             )
+
             self.m._handle_transactional_result(
                 result,
-                processor=result_processor,
-                args=args,
+                processor=processor,
+                args=self._make_processing_args(
+                    input_root,
+                    output=output_root,
+                    traditional_zip_policy="move",
+                ),
                 output_base=output_root,
                 touched_output_dirs=set(),
             )
 
-            self.assertEqual("skipped", result["kind"])
-            self.assertEqual("移动传统ZIP失败: txn create boom", result["reason"])
-            self.assertEqual("retryable", result["manifest_state"])
-            self.assertEqual("unknown", result["manifest_final_disposition"])
-            self.assertEqual("FAIL_FINALIZE_FAILED", result["manifest_error"]["type"])
-
             manifest = self.m._load_dataset_manifest(output_root)
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
             entry = manifest["archives"][archive_id]
 
             self.assertEqual(
-                [os.path.abspath(archive_path)], result_processor.skipped_archives
+                [os.path.abspath(archive_path)], processor.failed_archives
             )
             self.assertEqual("retryable", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
             self.assertEqual("FAIL_FINALIZE_FAILED", entry["error"]["type"])
             self.assertIn("txn create boom", entry["error"]["message"])
+
+    def test_finalize_traditional_zip_move_resume_fallback_does_not_use_txn_id_suffix(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            os.makedirs(trad_to)
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+            with open(os.path.join(trad_to, "legacy.zip"), "wb") as f:
+                f.write(b"existing")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+            )
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_root,
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=args.wal_fsync_every,
+                snapshot_every=args.snapshot_every,
+                durability_enabled=True,
+            )
+            txn["placement"] = {}
+
+            expected_dst = self.m._traditional_zip_move_destinations(
+                args,
+                [archive_path],
+                collision_token=self.m._traditional_zip_move_token(args, [archive_path]),
+            )[0][1]
+            txn_id_dst = os.path.join(
+                trad_to,
+                f"legacy_{txn['txn_id'][:8]}_1.zip",
+            )
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            ):
+                self.m._finalize_traditional_zip_move(txn, args=args)
+
+            self.assertTrue(os.path.exists(expected_dst))
+            self.assertFalse(os.path.exists(txn_id_dst))
 
     def test_fail_move_fsync_failure_reopen_resumes_from_persisted_destination_without_rerunning_move_or_extract(
         self,
@@ -10343,7 +10447,7 @@ class TestTxnPrimitives(unittest.TestCase):
 
         self.assertIn(("FlushFileBuffers", 123), fake_kernel32.calls)
 
-    def test_run_transactional_rejects_windows_transactional_delete_without_unsafe_flag(
+    def test_run_transactional_allows_windows_transactional_delete_without_extra_flag(
         self,
     ):
         with tempfile.TemporaryDirectory() as td:
@@ -10357,39 +10461,6 @@ class TestTxnPrimitives(unittest.TestCase):
                 output=output_root,
                 success_policy="delete",
                 fsync_files="auto",
-            )
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
-            )
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(self.m.os, "name", "nt"),
-            ):
-                result = self.m._run_transactional(processor, [], args=args)
-
-            self.assertIs(False, result)
-            self.assertIn("--unsafe-windows-delete", stdout.getvalue())
-            self.assertFalse(os.path.exists(self.m._dataset_manifest_path(output_root)))
-
-    def test_run_transactional_allows_windows_transactional_delete_with_unsafe_flag(
-        self,
-    ):
-        with tempfile.TemporaryDirectory() as td:
-            input_root = os.path.join(td, "input")
-            output_root = os.path.join(td, "output")
-            os.makedirs(input_root)
-            os.makedirs(output_root)
-
-            args = self._make_processing_args(
-                input_root,
-                output=output_root,
-                success_policy="delete",
-                fsync_files="auto",
-                unsafe_windows_delete=True,
             )
             processor = types.SimpleNamespace(
                 successful_archives=[],
@@ -10407,7 +10478,7 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertIsNone(result)
             self.assertNotIn("--unsafe-windows-delete is required", stdout.getvalue())
 
-    def test_run_transactional_allows_windows_legacy_delete_without_unsafe_flag(
+    def test_run_transactional_allows_windows_legacy_delete_without_extra_flag(
         self,
     ):
         with tempfile.TemporaryDirectory() as td:
@@ -10821,11 +10892,6 @@ class TestTxnPrimitives(unittest.TestCase):
             archive_id = self.m._dataset_manifest_archive_id(archive_path)
             processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
 
@@ -11010,11 +11076,6 @@ class TestTxnPrimitives(unittest.TestCase):
 
             processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
 
@@ -11086,11 +11147,6 @@ class TestTxnPrimitives(unittest.TestCase):
 
             processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 find_correct_password=lambda archive_path, encryption_status=None: None,
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
@@ -11162,11 +11218,6 @@ class TestTxnPrimitives(unittest.TestCase):
 
             processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
 
@@ -11240,11 +11291,6 @@ class TestTxnPrimitives(unittest.TestCase):
 
             processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 find_correct_password=lambda archive_path, encryption_status=None: None,
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
@@ -11320,11 +11366,6 @@ class TestTxnPrimitives(unittest.TestCase):
 
             processor = types.SimpleNamespace(
                 sfx_detector=None,
-                handle_traditional_zip_policy=lambda path: {
-                    "should_continue": True,
-                    "zip_decode": None,
-                    "reason": "",
-                },
                 find_correct_password=lambda archive_path, encryption_status=None: None,
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
@@ -11744,10 +11785,8 @@ class TestTxnPrimitives(unittest.TestCase):
                     touched_output_dirs=set(),
                 )
 
-            self.assertEqual("skipped", result["kind"])
-            self.assertEqual("retryable", result["manifest_state"])
-            self.assertEqual("unknown", result["manifest_final_disposition"])
-            self.assertEqual("FAIL_FINALIZE_FAILED", result["manifest_error"]["type"])
+            self.assertEqual("txn_failed", result["kind"])
+            self.assertEqual("FAIL_FINALIZE_FAILED", result["txn"]["error"]["type"])
             manifest = self.m._load_dataset_manifest(output_root)
             entry = manifest["archives"][archive_id]
             self.assertEqual("retryable", entry["state"])
@@ -15611,15 +15650,7 @@ class TestTxnPrimitives(unittest.TestCase):
             tar_args = self._make_processing_args(td, password_file=password_file)
             tar_processor = self.m.ArchiveProcessor(tar_args)
             with (
-                mock.patch.object(
-                    tar_processor,
-                    "handle_traditional_zip_policy",
-                    return_value={
-                        "should_continue": True,
-                        "zip_decode": None,
-                        "reason": "",
-                    },
-                ),
+                mock.patch.object(self.m, "is_zip_format", return_value=False),
                 mock.patch.object(tar_processor, "apply_decompress_policy"),
                 mock.patch.object(self.m, "try_extract", return_value=True),
                 mock.patch.object(
@@ -15639,15 +15670,7 @@ class TestTxnPrimitives(unittest.TestCase):
             zip_args = self._make_processing_args(td, password_file=password_file)
             zip_processor = self.m.ArchiveProcessor(zip_args)
             with (
-                mock.patch.object(
-                    zip_processor,
-                    "handle_traditional_zip_policy",
-                    return_value={
-                        "should_continue": True,
-                        "zip_decode": None,
-                        "reason": "",
-                    },
-                ),
+                mock.patch.object(self.m, "is_zip_format", return_value=False),
                 mock.patch.object(zip_processor, "apply_decompress_policy"),
                 mock.patch.object(self.m, "try_extract", return_value=True),
                 mock.patch.object(
@@ -15678,15 +15701,7 @@ class TestTxnPrimitives(unittest.TestCase):
             tar_args = self._make_processing_args(td, password_file=password_file)
             tar_processor = self.m.ArchiveProcessor(tar_args)
             with (
-                mock.patch.object(
-                    tar_processor,
-                    "handle_traditional_zip_policy",
-                    return_value={
-                        "should_continue": True,
-                        "zip_decode": None,
-                        "reason": "",
-                    },
-                ),
+                mock.patch.object(self.m, "is_zip_format", return_value=False),
                 mock.patch.object(self.m, "_validate_environment_for_output_dir"),
                 mock.patch.object(self.m, "try_extract", return_value=True),
                 mock.patch.object(
@@ -15709,15 +15724,7 @@ class TestTxnPrimitives(unittest.TestCase):
             zip_args = self._make_processing_args(td, password_file=password_file)
             zip_processor = self.m.ArchiveProcessor(zip_args)
             with (
-                mock.patch.object(
-                    zip_processor,
-                    "handle_traditional_zip_policy",
-                    return_value={
-                        "should_continue": True,
-                        "zip_decode": None,
-                        "reason": "",
-                    },
-                ),
+                mock.patch.object(self.m, "is_zip_format", return_value=False),
                 mock.patch.object(self.m, "_validate_environment_for_output_dir"),
                 mock.patch.object(self.m, "try_extract", return_value=True),
                 mock.patch.object(
