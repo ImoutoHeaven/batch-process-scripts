@@ -1,9 +1,11 @@
 import contextlib
+import errno
 import inspect
 import hashlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 import importlib.util
@@ -223,16 +225,27 @@ class TestTxnPrimitives(unittest.TestCase):
         return discovered
 
     def _make_txn_result(self, archive_path, *, output_dir, output_base):
-        name = os.path.basename(archive_path)
+        txn = self.m._txn_create(
+            archive_path=archive_path,
+            volumes=[archive_path],
+            output_dir=output_dir,
+            output_base=output_base,
+            policy="direct",
+            wal_fsync_every=1,
+            snapshot_every=1,
+            durability_enabled=False,
+        )
+        os.makedirs(txn["paths"]["staging_extracted"], exist_ok=True)
+        with open(
+            os.path.join(txn["paths"]["staging_extracted"], "payload.txt"),
+            "wb",
+        ) as f:
+            f.write(b"payload")
+        txn["state"] = self.m.TXN_STATE_EXTRACTED
+        self.m._txn_snapshot(txn)
         return {
             "kind": "txn",
-            "txn": {
-                "archive_path": archive_path,
-                "output_dir": output_dir,
-                "state": self.m.TXN_STATE_EXTRACTED,
-                "txn_id": name.replace(".", "_"),
-                "paths": {"work_root": os.path.join(output_base, "work", name)},
-            },
+            "txn": txn,
         }
 
     def _make_txn(self, archive_path, *, output_dir, output_base, work_root=None):
@@ -313,6 +326,18 @@ class TestTxnPrimitives(unittest.TestCase):
         )
         fixture["txn"] = txn
         return fixture
+
+    def _make_invalid_recovered_tree(self, root_dir):
+        os.makedirs(root_dir, exist_ok=True)
+        symlink_target = os.path.join(os.path.dirname(root_dir), "invalid-target.txt")
+        with open(symlink_target, "w", encoding="utf-8") as f:
+            f.write("blocked")
+        os.symlink(symlink_target, os.path.join(root_dir, "blocked-link"))
+
+    def _make_valid_recovered_tree(self, root_dir, *, name="payload.txt"):
+        os.makedirs(root_dir, exist_ok=True)
+        with open(os.path.join(root_dir, name), "w", encoding="utf-8") as f:
+            f.write("payload")
 
     def _make_delete_barrier_txn_fixture(self, td):
         input_root = os.path.join(td, "input")
@@ -458,6 +483,130 @@ class TestTxnPrimitives(unittest.TestCase):
             "output_dir": output_dir,
             "output_root": output_root,
         }
+
+    def _set_manifest_command_fingerprint(self, output_root, args):
+        manifest = self.m._load_dataset_manifest(output_root)
+        manifest["command_fingerprint"] = self.m._build_command_fingerprint(args)
+        self.m._save_dataset_manifest(manifest)
+
+    def _persist_post_placement_snapshot_failed_abort_fixture(
+        self, td, *, success_policy="asis"
+    ):
+        fixture = self._make_success_finalization_txn_fixture(
+            td,
+            success_policy=success_policy,
+        )
+        txn = fixture["txn"]
+        real_snapshot_v2 = self.m._txn_snapshot_v2
+        failed_once = {"done": False}
+
+        def fail_placed_snapshot(current_txn):
+            if (
+                current_txn.get("txn_id") == txn["txn_id"]
+                and current_txn.get("state") == self.m.TXN_STATE_PLACED
+                and (current_txn.get("placement_v2") or {}).get("ops")
+                and all(
+                    op.get("phase") == "MOVE_DONE"
+                    for op in current_txn["placement_v2"]["ops"]
+                )
+                and not failed_once["done"]
+            ):
+                failed_once["done"] = True
+                raise RuntimeError(
+                    "journal_dir_fsync_failed:dir:placed-snapshot-failed"
+                )
+            return real_snapshot_v2(current_txn)
+
+        with (
+            mock.patch.object(self.m, "_fsync_file", return_value=True),
+            mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            mock.patch.object(
+                self.m,
+                "_txn_snapshot_v2",
+                side_effect=fail_placed_snapshot,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "journal_dir_fsync_failed:dir:placed-snapshot-failed",
+            ),
+        ):
+            self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+        manifest = self.m._load_dataset_manifest(fixture["output_root"])
+        entry = manifest["archives"][fixture["archive_id"]]
+        saved_txn = self.m._load_latest_txn_for_archive(
+            entry,
+            fixture["output_root"],
+        )
+        fixture["saved_txn"] = saved_txn
+        fixture["entry"] = entry
+        return fixture
+
+    def _persist_recovery_time_post_placement_done_snapshot_failed_retry_fixture(
+        self, td, *, success_policy="asis"
+    ):
+        fixture = self._persist_post_placement_snapshot_failed_abort_fixture(
+            td,
+            success_policy=success_policy,
+        )
+        saved_txn = fixture["saved_txn"]
+        real_fsync_journal_checkpoint = self.m._fsync_journal_checkpoint
+        failed_once = {"done": False}
+
+        def fail_recovery_done_snapshot(current_txn, include_parent=False):
+            if (
+                current_txn.get("txn_id") == saved_txn["txn_id"]
+                and current_txn.get("state") == self.m.TXN_STATE_DONE
+                and current_txn.get("post_placement_snapshot_retry")
+                and not failed_once["done"]
+            ):
+                failed_once["done"] = True
+                raise RuntimeError(
+                    "journal_dir_fsync_failed:dir:recovery-done-snapshot-after-post-placement"
+                )
+            return real_fsync_journal_checkpoint(
+                current_txn,
+                include_parent=include_parent,
+            )
+
+        with (
+            mock.patch.object(self.m, "_fsync_file", return_value=True),
+            mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            mock.patch.object(
+                self.m,
+                "_fsync_journal_checkpoint",
+                side_effect=fail_recovery_done_snapshot,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "journal_dir_fsync_failed:dir:recovery-done-snapshot-after-post-placement",
+            ),
+        ):
+            self.m._place_and_finalize_txn(
+                saved_txn,
+                args=fixture["args"],
+                recovery=True,
+            )
+
+        manifest = self.m._load_dataset_manifest(fixture["output_root"])
+        entry = manifest["archives"][fixture["archive_id"]]
+        saved_txn = self.m._load_latest_txn_for_archive(
+            entry,
+            fixture["output_root"],
+        )
+        fixture["saved_txn"] = saved_txn
+        fixture["entry"] = entry
+        return fixture
+
+    def _success_move_dst(self, txn, success_to=None, *, basename=None):
+        success_to = success_to or os.path.join(txn["output_base"], "success")
+        basename = basename or os.path.basename(txn["archive_path"])
+        return os.path.join(os.path.abspath(success_to), txn["txn_id"], basename)
+
+    def _failure_move_dst(self, txn, fail_to=None, *, basename=None):
+        fail_to = fail_to or os.path.join(txn["output_base"], "failed")
+        basename = basename or os.path.basename(txn["archive_path"])
+        return os.path.join(os.path.abspath(fail_to), txn["txn_id"], basename)
 
     def _make_empty_dir_barrier_txn_fixture(self, td):
         input_root = os.path.join(td, "input")
@@ -705,6 +854,7 @@ class TestTxnPrimitives(unittest.TestCase):
             durability_enabled=False,
         )
         txn["state"] = self.m.TXN_STATE_EXTRACTED
+        self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
         self.m._txn_snapshot(txn)
         return txn
 
@@ -922,8 +1072,11 @@ class TestTxnPrimitives(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "txn.json")
 
-            with self._mock_windows_short_path_destination_bug(
-                remove_after_existing_hits=2
+            with (
+                self._mock_windows_short_path_destination_bug(
+                    remove_after_existing_hits=2
+                ),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
             ):
                 self.m.atomic_write_json(path, {"round": 1}, debug=False)
                 self.m.atomic_write_json(path, {"round": 2}, debug=False)
@@ -941,6 +1094,166 @@ class TestTxnPrimitives(unittest.TestCase):
 
             with open(path, "r", encoding="utf-8") as f:
                 self.assertEqual({"round": 3}, json.load(f))
+
+    def test_atomic_write_json_retries_transient_windows_replace_permission_denied(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "txn.json")
+            real_replace = self.m.os.replace
+            replace_calls = []
+            failed_once = {"done": False}
+
+            def flaky_replace(src, dst):
+                replace_calls.append((src, dst))
+                if dst == path and not failed_once["done"]:
+                    failed_once["done"] = True
+                    raise PermissionError(errno.EACCES, "Permission denied", dst)
+                return real_replace(src, dst)
+
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "is_windows", return_value=True),
+                mock.patch.object(self.m.os, "replace", side_effect=flaky_replace),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(self.m.time, "sleep"),
+            ):
+                self.m.atomic_write_json(path, {"round": 1}, debug=False)
+
+            self.assertTrue(os.path.exists(path))
+            self.assertFalse(os.path.exists(path + ".tmp"))
+            self.assertEqual(2, len(replace_calls))
+            with open(path, "r", encoding="utf-8") as f:
+                self.assertEqual({"round": 1}, json.load(f))
+
+    def test_atomic_write_json_raises_when_parent_dir_fsync_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "txn.json")
+            failed_result = self.m._FsyncDirResult(
+                False,
+                "synthetic-parent-dir-fsync-failure",
+            )
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_fsync_dir",
+                    return_value=failed_result,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "json_parent_dir_fsync_failed:.*synthetic-parent-dir-fsync-failure",
+                ),
+            ):
+                self.m.atomic_write_json(path, {"a": 1}, debug=False)
+
+    def test_save_dataset_manifest_raises_when_parent_dir_fsync_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            manifest = self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=self._make_discovered_archives(
+                    input_root,
+                    output_root,
+                    ["alpha.zip"],
+                ),
+                command_fingerprint=self._make_manifest_command_fingerprint(
+                    input_root,
+                    output_root,
+                ),
+            )
+            failed_result = self.m._FsyncDirResult(
+                False,
+                "synthetic-parent-dir-fsync-failure",
+            )
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_fsync_dir",
+                    return_value=failed_result,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "json_parent_dir_fsync_failed:.*dataset_manifest\\.json.*synthetic-parent-dir-fsync-failure",
+                ),
+            ):
+                self.m._save_dataset_manifest(manifest)
+
+    def test_txn_snapshot_uses_atomic_replace_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            txn = self.m._txn_create(
+                archive_path=os.path.join(td, "archive.zip"),
+                volumes=[],
+                output_dir=os.path.join(td, "out"),
+                output_base=td,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            calls = []
+
+            def record_atomic_write(path, data, debug=False):
+                calls.append(("atomic_write_json", path, data["txn_id"]))
+
+            def record_checkpoint(txn_arg, *, include_parent=False):
+                calls.append(
+                    (
+                        "_fsync_journal_checkpoint",
+                        txn_arg["txn_id"],
+                        include_parent,
+                    )
+                )
+
+            with (
+                mock.patch.object(
+                    self.m, "atomic_write_json", side_effect=record_atomic_write
+                ),
+                mock.patch.object(
+                    self.m,
+                    "_fsync_journal_checkpoint",
+                    side_effect=record_checkpoint,
+                ),
+            ):
+                self.m._txn_snapshot_v2(txn)
+
+            self.assertEqual(
+                [
+                    (
+                        "atomic_write_json",
+                        txn["paths"]["txn_json"],
+                        txn["txn_id"],
+                    ),
+                    (
+                        "_fsync_journal_checkpoint",
+                        txn["txn_id"],
+                        False,
+                    ),
+                ],
+                calls,
+            )
+
+    def test_txn_snapshot_delegates_to_v2(self):
+        with tempfile.TemporaryDirectory() as td:
+            txn = self.m._txn_create(
+                archive_path=os.path.join(td, "archive.zip"),
+                volumes=[],
+                output_dir=os.path.join(td, "out"),
+                output_base=td,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+
+            with mock.patch.object(self.m, "_txn_snapshot_v2") as snapshot_v2:
+                self.m._txn_snapshot(txn)
+
+            snapshot_v2.assert_called_once_with(txn)
 
     def test_patch_cmd_paths_uses_external_path_normalization_only(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1241,8 +1554,11 @@ class TestTxnPrimitives(unittest.TestCase):
                 output_root,
             )
 
-            with self._mock_windows_short_path_destination_bug(
-                remove_after_existing_hits=2
+            with (
+                self._mock_windows_short_path_destination_bug(
+                    remove_after_existing_hits=2
+                ),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
             ):
                 manifest = self.m._create_dataset_manifest(
                     input_root=input_root,
@@ -1454,6 +1770,117 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual("txn-alpha", manifest["archives"][alpha_id]["last_txn_id"])
             self.assertEqual("retryable", manifest["archives"][beta_id]["state"])
             self.assertEqual("txn-beta", manifest["archives"][beta_id]["last_txn_id"])
+
+    def test_same_output_manifest_read_retries_transient_windows_permission_denied(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["alpha.zip", "beta.zip"],
+            )
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+
+            manifest_path = self.m._dataset_manifest_path(output_root)
+            real_open = open
+            failed_once = {"done": False}
+
+            def flaky_open(path, *args, **kwargs):
+                if (
+                    os.path.abspath(path) == os.path.abspath(manifest_path)
+                    and args
+                    and args[0] == "r"
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise PermissionError(errno.EACCES, "Permission denied", path)
+                return real_open(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "is_windows", return_value=True),
+                mock.patch("builtins.open", side_effect=flaky_open),
+                mock.patch.object(self.m.time, "sleep"),
+            ):
+                self.assertFalse(
+                    self.m._same_output_archive_is_next_expected(
+                        discovered[1]["archive_path"],
+                        discovered[1]["output_dir"],
+                        output_root,
+                    )
+                )
+
+            self.assertTrue(failed_once["done"])
+
+    def test_selected_txn_read_retries_transient_windows_permission_denied(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            output_root = fixture["output_root"]
+
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][fixture["archive_id"]]
+            txn_json_path = os.path.abspath(txn["paths"]["txn_json"])
+            real_open = open
+            failed_once = {"done": False}
+
+            def flaky_open(path, *args, **kwargs):
+                if (
+                    os.path.abspath(path) == txn_json_path
+                    and args
+                    and args[0] == "r"
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise PermissionError(errno.EACCES, "Permission denied", path)
+                return real_open(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "is_windows", return_value=True),
+                mock.patch("builtins.open", side_effect=flaky_open),
+                mock.patch.object(self.m.time, "sleep"),
+            ):
+                selected = self.m._selected_txn_for_manifest_archive(entry, output_root)
+
+            self.assertTrue(failed_once["done"])
+            self.assertEqual(txn["txn_id"], selected["txn_id"])
 
     def test_command_fingerprint_includes_semantic_fields(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2120,6 +2547,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
             self.m._txn_snapshot(txn)
             self.m._update_dataset_manifest_archive(
                 fixture["output_root"],
@@ -2142,6 +2570,52 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
 
+    def test_strict_resume_rejects_manifest_without_schema_version(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            manifest_path = self.m._dataset_manifest_path(fixture["output_root"])
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            manifest.pop("schema_version", None)
+
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn("missing schema_version metadata", stdout.getvalue())
+            self.assertIn(
+                "Delete the existing strict-resume work directory before starting over: "
+                + self.m._work_base(fixture["output_root"]),
+                stdout.getvalue(),
+            )
+
+    def test_strict_resume_rejects_manifest_with_unsupported_schema_version(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            manifest_path = self.m._dataset_manifest_path(fixture["output_root"])
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            manifest["schema_version"] = 999
+
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn("unsupported schema_version metadata", stdout.getvalue())
+            self.assertIn(
+                "Delete the existing strict-resume work directory before starting over: "
+                + self.m._work_base(fixture["output_root"]),
+                stdout.getvalue(),
+            )
+
     def test_invalid_candidate_txn_json_makes_startup_ambiguous(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(
@@ -2162,6 +2636,84 @@ class TestTxnPrimitives(unittest.TestCase):
                 f.write("{broken json")
 
             self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_strict_resume_rejects_txn_without_schema_version(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td, manifest_state="recoverable"
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn.pop("schema_version", None)
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn("missing schema_version metadata", stdout.getvalue())
+            self.assertIn(
+                "Delete the existing strict-resume work directory before starting over: "
+                + self.m._work_base(fixture["output_root"]),
+                stdout.getvalue(),
+            )
+
+    def test_strict_resume_rejects_txn_with_unsupported_schema_version(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td, manifest_state="recoverable"
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["schema_version"] = 999
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn("unsupported schema_version metadata", stdout.getvalue())
+            self.assertIn(
+                "Delete the existing strict-resume work directory before starting over: "
+                + self.m._work_base(fixture["output_root"]),
+                stdout.getvalue(),
+            )
 
     def test_invalid_orphan_txn_json_makes_startup_ambiguous(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2265,7 +2817,7 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertFalse(os.path.exists(orphan_txn["paths"]["txn_json"]))
             self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
 
-    def test_nonterminal_nonrecoverable_orphan_txn_makes_startup_ambiguous(self):
+    def test_nonterminal_nonrecoverable_orphan_txn_refuses_startup(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(
                 td, manifest_state="succeeded"
@@ -2293,11 +2845,96 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertFalse(self.m._txn_has_recovery_responsibility(orphan_txn))
             self.assertFalse(self.m._txn_is_closed_terminal_outcome(orphan_txn))
-            self.assertEqual(
-                "ambiguous",
-                self.m._classify_existing_work_base(manifest, fixture["output_root"]),
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
+                self.m._classify_existing_work_base(manifest, fixture["output_root"])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
             )
-            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+            self.assertNotIn(
+                "ambiguous and requires manual intervention",
+                stdout.getvalue(),
+            )
+
+    def test_orphan_aborted_completed_source_finalization_refuses_startup(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="succeeded",
+                rel_path="orphan.zip",
+            )
+            orphan_output_dir = fixture["archive"]["output_dir"]
+            orphan_txn = self.m._txn_create(
+                archive_path=fixture["archive"]["archive_path"],
+                volumes=fixture["archive"]["volumes"],
+                output_dir=orphan_output_dir,
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            args = self._make_processing_args(
+                fixture["input_root"],
+                output=fixture["output_root"],
+                decompress_policy="direct",
+                success_policy="move",
+                success_to=os.path.join(td, "success"),
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self._set_manifest_command_fingerprint(fixture["output_root"], args)
+            finalized_dst = self._success_move_dst(orphan_txn, args.success_to)
+            os.makedirs(os.path.dirname(finalized_dst), exist_ok=True)
+            os.replace(orphan_txn["archive_path"], finalized_dst)
+            orphan_txn["state"] = self.m.TXN_STATE_ABORTED
+            orphan_txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": orphan_txn["archive_path"],
+                        "dst": finalized_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(orphan_txn)
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
+                self.m._classify_existing_work_base(manifest, fixture["output_root"])
+
+            work_base = self.m._work_base(fixture["output_root"])
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(args)
+
+            self.assertFalse(result)
+            self.assertTrue(os.path.exists(work_base))
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertNotIn(
+                "ambiguous and requires manual intervention",
+                stdout.getvalue(),
+            )
 
     def test_selected_txn_prefers_lexicographically_greatest_id_when_mtimes_match(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2327,6 +2964,7 @@ class TestTxnPrimitives(unittest.TestCase):
             )
             for txn in (txn_a, txn_b):
                 txn["state"] = self.m.TXN_STATE_DONE
+                txn["terminal_final_disposition"] = "success:asis"
                 self.m._txn_snapshot(txn)
 
             manifest = self.m._load_dataset_manifest(fixture["output_root"])
@@ -2359,6 +2997,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
             txn.setdefault("placement", {}).pop("move_plan_snapshot", None)
             txn.setdefault("placement", {}).pop("move_done_ids_snapshot", None)
             self.m._txn_snapshot(txn)
@@ -2390,6 +3029,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
             self.m._txn_snapshot(txn)
 
             self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
@@ -2415,7 +3055,65 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
 
-    def test_cleaned_txn_is_treated_as_terminal_historical_compatibility_state(self):
+    def test_candidate_txn_output_base_mismatch_refuses_strict_resume_and_plan(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td, manifest_state="recoverable"
+            )
+            archive = fixture["archive"]
+            output_root = fixture["output_root"]
+            wrong_output_base = os.path.join(td, "wrong-output-root")
+            os.makedirs(wrong_output_base, exist_ok=True)
+
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
+            txn["output_base"] = wrong_output_base
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(ValueError, "txn output_base mismatch"):
+                self.m._selected_txn_for_manifest_archive(entry, output_root)
+            with self.assertRaisesRegex(ValueError, "txn output_base mismatch"):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    output_root,
+                    persist=False,
+                )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is ambiguous during startup classification: txn output_base mismatch",
+                stdout.getvalue(),
+            )
+
+    def test_cleaned_txn_without_source_finalization_v2_refuses_terminal_classification_and_startup(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(
                 td, manifest_state="recoverable"
@@ -2441,7 +3139,49 @@ class TestTxnPrimitives(unittest.TestCase):
                 error=None,
             )
 
-            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._startup_raise_explicit_refuse_if_needed(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._classify_existing_work_base(manifest, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+            work_base = self.m._work_base(fixture["output_root"])
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertTrue(os.path.exists(work_base))
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
 
     def test_selected_last_txn_id_controls_startup_plan_and_missing_input(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2463,6 +3203,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             selected_txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(selected_txn["paths"]["staging_extracted"])
             self.m._txn_snapshot(selected_txn)
 
             newer_txn = self.m._txn_create(
@@ -2476,7 +3217,9 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             newer_txn["state"] = self.m.TXN_STATE_DONE
+            newer_txn["terminal_final_disposition"] = "success:asis"
             self.m._txn_snapshot(newer_txn)
+            self._age_txn_journal(newer_txn, timestamp=2)
 
             self.m._update_dataset_manifest_archive(
                 output_root,
@@ -2518,7 +3261,424 @@ class TestTxnPrimitives(unittest.TestCase):
                 )
             )
 
-    def test_historical_source_finalized_without_plan_is_terminal_for_classification(self):
+    def test_selected_last_txn_id_missing_refuses_strict_resume_and_plan(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td, manifest_state="recoverable"
+            )
+            archive = fixture["archive"]
+            output_root = fixture["output_root"]
+
+            older_txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            older_txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(
+                older_txn["paths"]["staging_extracted"],
+                name="older.txt",
+            )
+            self.m._txn_snapshot(older_txn)
+
+            selected_txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            selected_txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(
+                selected_txn["paths"]["staging_extracted"],
+                name="selected.txt",
+            )
+            self.m._txn_snapshot(selected_txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=selected_txn["txn_id"],
+                error=None,
+            )
+
+            os.remove(selected_txn["paths"]["txn_json"])
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_selected_txn"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    output_root,
+                    persist=False,
+                )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+    def test_plan_build_does_not_manufacture_last_txn_id_when_manifest_did_not_select_one(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td, manifest_state="recoverable"
+            )
+            archive = fixture["archive"]
+            output_root = fixture["output_root"]
+
+            older_txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            older_txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(
+                older_txn["paths"]["staging_extracted"],
+                name="older.txt",
+            )
+            self.m._txn_snapshot(older_txn)
+            self._age_txn_journal(older_txn, timestamp=1)
+
+            newer_txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            newer_txn["state"] = self.m.TXN_STATE_DONE
+            newer_txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(newer_txn)
+            self._age_txn_journal(newer_txn, timestamp=2)
+
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=None,
+                error=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][fixture["archive_id"]]
+            self.assertIsNone(entry.get("last_txn_id"))
+
+            recoverable_archives, retryable_archives, pending_archives = (
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    output_root,
+                    persist=False,
+                )
+            )
+
+            self.assertEqual(
+                [],
+                recoverable_archives,
+            )
+            self.assertEqual([], retryable_archives)
+            self.assertEqual([], pending_archives)
+            self.assertIsNone(entry.get("last_txn_id"))
+
+            os.remove(newer_txn["paths"]["txn_json"])
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][fixture["archive_id"]]
+            self.assertIsNone(entry.get("last_txn_id"))
+            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+
+            recoverable_archives, retryable_archives, pending_archives = (
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    output_root,
+                    persist=False,
+                )
+            )
+
+            self.assertEqual(
+                [
+                    {
+                        "archive_path": os.path.abspath(archive["archive_path"]),
+                        "output_dir": os.path.abspath(archive["output_dir"]),
+                    }
+                ],
+                recoverable_archives,
+            )
+            self.assertEqual([], retryable_archives)
+            self.assertEqual([], pending_archives)
+
+    def test_selected_terminal_success_txn_missing_refuses_strict_resume_and_plan(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td, manifest_state="succeeded"
+            )
+            archive = fixture["archive"]
+            output_root = fixture["output_root"]
+
+            older_txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            older_txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(
+                older_txn["paths"]["staging_extracted"],
+                name="older.txt",
+            )
+            self.m._txn_snapshot(older_txn)
+
+            selected_txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            selected_txn["state"] = self.m.TXN_STATE_DONE
+            selected_txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(selected_txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive["archive_path"],
+                state="succeeded",
+                last_txn_id=selected_txn["txn_id"],
+                final_disposition="success:asis",
+                error=None,
+                finalized_at=self.m._now_iso(),
+            )
+
+            os.remove(selected_txn["paths"]["txn_json"])
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_selected_txn"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    output_root,
+                    persist=False,
+                )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+    def test_selected_terminal_failure_txn_missing_refuses_strict_resume_and_plan(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td, manifest_state="failed"
+            )
+            archive = fixture["archive"]
+            output_root = fixture["output_root"]
+
+            older_txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            older_txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(
+                older_txn["paths"]["staging_extracted"],
+                name="older.txt",
+            )
+            self.m._txn_snapshot(older_txn)
+
+            selected_txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            self.m._txn_fail(selected_txn, "PLACE_FAILED", "boom")
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive["archive_path"],
+                state="failed",
+                last_txn_id=selected_txn["txn_id"],
+                final_disposition="failure:asis",
+                error=selected_txn["error"],
+                finalized_at=self.m._now_iso(),
+            )
+
+            os.remove(selected_txn["paths"]["txn_json"])
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_selected_txn"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    output_root,
+                    persist=False,
+                )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+    def test_selected_terminal_success_txn_missing_after_manual_journal_corruption_refuses_strict_resume_and_plan(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td, manifest_state="succeeded"
+            )
+            archive = fixture["archive"]
+            output_root = fixture["output_root"]
+
+            selected_txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            selected_txn["state"] = self.m.TXN_STATE_DONE
+            selected_txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(selected_txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive["archive_path"],
+                state="succeeded",
+                last_txn_id=selected_txn["txn_id"],
+                final_disposition="success:asis",
+                error=None,
+                finalized_at=self.m._now_iso(),
+            )
+
+            shutil.rmtree(selected_txn["paths"]["journal_dir"])
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_selected_txn"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    output_root,
+                    persist=False,
+                )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+    def test_selected_terminal_failure_txn_missing_after_manual_journal_corruption_refuses_strict_resume_and_plan(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td, manifest_state="failed"
+            )
+            archive = fixture["archive"]
+            output_root = fixture["output_root"]
+
+            selected_txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            self.m._txn_fail(selected_txn, "PLACE_FAILED", "boom")
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive["archive_path"],
+                state="failed",
+                last_txn_id=selected_txn["txn_id"],
+                final_disposition="failure:asis",
+                error=selected_txn["error"],
+                finalized_at=self.m._now_iso(),
+            )
+
+            shutil.rmtree(selected_txn["paths"]["journal_dir"])
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_selected_txn"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    output_root,
+                    persist=False,
+                )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+    def test_source_finalized_without_source_finalization_v2_refuses_terminal_classification_and_recovery(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(
                 td, manifest_state="recoverable"
@@ -2544,11 +3704,136 @@ class TestTxnPrimitives(unittest.TestCase):
                 error=None,
             )
 
-            self.assertFalse(self.m._txn_has_recovery_responsibility(txn))
-            self.assertTrue(self.m._txn_is_closed_terminal_outcome(txn))
-            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
 
-    def test_cleaned_txn_with_incomplete_source_finalization_is_recoverable(self):
+            self.assertFalse(self.m._txn_has_recovery_responsibility(txn))
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._startup_raise_explicit_refuse_if_needed(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._classify_existing_work_base(manifest, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+            work_base = self.m._work_base(fixture["output_root"])
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertTrue(os.path.exists(work_base))
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+    def test_cleaned_txn_with_incomplete_source_finalization_is_not_recoverable(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td, manifest_state="recoverable"
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            recovery_args = self._make_processing_args(
+                fixture["args"].path,
+                output=fixture["output_root"],
+                success_policy="move",
+                success_to=os.path.join(td, "success"),
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            fixture["args"] = recovery_args
+            self._set_manifest_command_fingerprint(fixture["output_root"], recovery_args)
+            self.m._set_source_finalization_plan(
+                txn,
+                manifest_state="succeeded",
+                final_disposition="success:move",
+                txn_terminal_state=self.m.TXN_STATE_DONE,
+                args=recovery_args,
+            )
+            txn["state"] = self.m.TXN_STATE_CLEANED
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            self.assertFalse(self.m._txn_has_recovery_responsibility(txn))
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertNotIn(
+                "ambiguous during startup classification",
+                stdout.getvalue(),
+            )
+
+    def test_cleaned_txn_with_incomplete_source_finalization_reports_refuse_before_input_drift(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(
                 td, manifest_state="recoverable"
@@ -2580,18 +3865,21 @@ class TestTxnPrimitives(unittest.TestCase):
                 error=None,
             )
 
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            entry = manifest["archives"][fixture["archive_id"]]
+            with open(archive["archive_path"], "ab") as f:
+                f.write(b"-drift")
 
-            self.assertTrue(self.m._txn_has_recovery_responsibility(txn))
-            self.assertFalse(self.m._txn_is_closed_terminal_outcome(txn))
-            self.assertEqual(
-                "recoverable",
-                self.m._classify_manifest_archive_state(entry, fixture["output_root"]),
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
             )
-            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+            self.assertNotIn("recorded size", stdout.getvalue())
 
-    def test_cleaned_completed_failure_plan_uses_success_historical_compatibility(self):
+    def test_cleaned_completed_failure_plan_refuses_closed_success_classification(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(
                 td, manifest_state="recoverable"
@@ -2632,14 +3920,20 @@ class TestTxnPrimitives(unittest.TestCase):
             entry = manifest["archives"][fixture["archive_id"]]
 
             self.assertFalse(self.m._txn_has_incomplete_source_finalization(txn))
-            self.assertTrue(self.m._txn_is_closed_terminal_outcome(txn))
-            self.assertEqual("succeeded", self.m._txn_terminal_manifest_state(txn))
-            self.assertEqual(
-                "succeeded",
-                self.m._reconciled_archive_classification(entry, txn),
-            )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._txn_terminal_manifest_state(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._reconciled_archive_classification(entry, txn)
 
-    def test_cleaned_success_compatibility_conflicting_failed_manifest_is_ambiguous(
+    def test_cleaned_completed_failure_plan_conflicting_failed_manifest_refuses_startup(
         self,
     ):
         with tempfile.TemporaryDirectory() as td:
@@ -2683,12 +3977,17 @@ class TestTxnPrimitives(unittest.TestCase):
             manifest = self.m._load_dataset_manifest(fixture["output_root"])
             entry = manifest["archives"][fixture["archive_id"]]
 
-            self.assertEqual("succeeded", self.m._txn_terminal_manifest_state(txn))
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._txn_terminal_manifest_state(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
                 self.m._reconciled_archive_classification(entry, txn)
             self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
 
-    def test_aborted_completed_source_finalization_is_startup_ambiguous(self):
+    def test_aborted_completed_source_finalization_refuses_recovery(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_success_finalization_txn_fixture(
                 td,
@@ -2725,11 +4024,260 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertTrue(self.m._txn_source_finalization_completed(txn))
             self.assertFalse(self.m._txn_has_recovery_responsibility(txn))
             self.assertFalse(self.m._txn_is_closed_terminal_outcome(txn))
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
                 self.m._reconciled_archive_classification(entry, txn)
-            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
 
-    def test_interrupt_after_completed_source_finalization_is_startup_ambiguous(self):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertNotIn(
+                "ambiguous during startup classification",
+                stdout.getvalue(),
+            )
+
+    def test_aborted_after_move_done_snapshot_failure_refuses_recovery_without_post_placement_provenance(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(
+                os.path.join(incoming_dir, "payload.txt"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write("payload")
+            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            real_fsync_journal_checkpoint = self.m._fsync_journal_checkpoint
+            failed_once = {"done": False}
+
+            def fail_move_done_snapshot(current_txn, include_parent=False):
+                placement_ops = ((current_txn.get("placement_v2") or {}).get("ops") or [])
+                if (
+                    current_txn.get("state") == self.m.TXN_STATE_PLACING
+                    and placement_ops
+                    and all(op.get("phase") == "MOVE_DONE" for op in placement_ops)
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise RuntimeError(
+                        "journal_dir_fsync_failed:dir:move-done-snapshot"
+                    )
+                return real_fsync_journal_checkpoint(
+                    current_txn, include_parent=include_parent
+                )
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_fsync_journal_checkpoint",
+                    side_effect=fail_move_done_snapshot,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "journal_dir_fsync_failed:dir:move-done-snapshot",
+                ),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+            payload_dst = os.path.join(archive["output_dir"], "payload.txt")
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual("PLACE_FAILED", saved_txn["error"]["type"])
+            self.assertEqual(
+                ["MOVE_DONE"],
+                [op["phase"] for op in (saved_txn["placement_v2"]["ops"] or [])],
+            )
+            self.assertFalse(saved_txn.get("post_placement_snapshot_retry"))
+            self.assertTrue(os.path.isdir(saved_txn["paths"]["incoming_dir"]))
+            self.assertEqual(
+                (0, 0),
+                self.m.count_items_in_dir(saved_txn["paths"]["incoming_dir"]),
+            )
+            self.assertTrue(os.path.exists(payload_dst))
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:aborted_recovery_contradiction",
+            ):
+                self.m._recoverable_txn_state_from_aborted(saved_txn)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:aborted_recovery_contradiction",
+            ):
+                self.m._place_and_finalize_txn(
+                    saved_txn,
+                    args=fixture["args"],
+                    recovery=True,
+                )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][fixture["archive_id"]]
+            resumed_txn = self.m._load_latest_txn_for_archive(
+                resumed_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, resumed_txn["state"])
+            self.assertEqual("recoverable", resumed_entry["state"])
+            self.assertEqual("unknown", resumed_entry["final_disposition"])
+            self.assertTrue(os.path.exists(payload_dst))
+
+    def test_aborted_completed_failure_move_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="retryable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            fixture["args"].fail_policy = "move"
+            fixture["args"].fail_to = os.path.join(td, "failed")
+            self._set_manifest_command_fingerprint(fixture["output_root"], fixture["args"])
+            payload_dst = os.path.join(archive["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(payload_dst), exist_ok=True)
+            with open(payload_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            fail_dst = self._failure_move_dst(txn, fixture["args"].fail_to)
+            os.makedirs(os.path.dirname(fail_dst), exist_ok=True)
+            os.replace(archive["archive_path"], fail_dst)
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": payload_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+            txn["state"] = self.m.TXN_STATE_ABORTED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic contradictory aborted failure move state",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": archive["archive_path"],
+                        "dst": fail_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="retryable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:(aborted_recovery_contradiction|invalid_placement_v2)"
+            ):
+                self.m._recoverable_txn_state_from_aborted(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
+                self.m._reconciled_archive_classification(entry, txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+    def test_interrupt_after_completed_source_finalization_keeps_durable_done(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_success_finalization_txn_fixture(
                 td,
@@ -2757,15 +4305,3026 @@ class TestTxnPrimitives(unittest.TestCase):
             )
 
             self.assertFalse(os.path.exists(fixture["archive_path"]))
-            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
-            self.assertEqual("ABORTED", saved_txn["error"]["type"])
-            self.assertEqual("retryable", entry["state"])
+            self.assertEqual(self.m.TXN_STATE_DONE, saved_txn["state"])
+            self.assertEqual("succeeded", entry["state"])
+            self.assertEqual("success:move", entry["final_disposition"])
             self.assertTrue(self.m._txn_source_finalization_completed(saved_txn))
             self.assertFalse(self.m._txn_has_recovery_responsibility(saved_txn))
+            self.assertTrue(self.m._txn_is_closed_terminal_outcome(saved_txn))
+            self.assertEqual(
+                "succeeded",
+                self.m._reconciled_archive_classification(entry, saved_txn),
+            )
+            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_durable_after_initial_source_mutating_done_snapshot_failure_completes_terminal_success(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="move",
+            )
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+            real_fsync_journal_checkpoint = self.m._fsync_journal_checkpoint
+            failed_once = {"done": False}
+
+            def fail_terminal_done_snapshot(current_txn, include_parent=False):
+                source_ops = self.m._source_finalization_ops(current_txn)
+                if (
+                    current_txn.get("state") == self.m.TXN_STATE_DONE
+                    and source_ops
+                    and all(op.get("phase") == "FINALIZE_DONE" for op in source_ops)
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise RuntimeError(
+                        "journal_dir_fsync_failed:dir:terminal-success-done-snapshot"
+                    )
+                return real_fsync_journal_checkpoint(
+                    current_txn, include_parent=include_parent
+                )
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_fsync_journal_checkpoint",
+                    side_effect=fail_terminal_done_snapshot,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "journal_dir_fsync_failed:dir:terminal-success-done-snapshot",
+                ),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+            moved_dst = self._success_move_dst(saved_txn, fixture["args"].success_to)
+
+            self.assertEqual(self.m.TXN_STATE_DURABLE, saved_txn["state"])
+            self.assertIsNone(saved_txn.get("error"))
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertIsNone(entry["finalized_at"])
+            self.assertTrue(saved_txn.get("payload_durable"))
+            self.assertEqual(
+                ["FINALIZE_DONE"],
+                [op["phase"] for op in self.m._source_finalization_ops(saved_txn)],
+            )
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(moved_dst))
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+
+            self.assertEqual("", stdout.getvalue())
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "initial source-mutating done-snapshot retry must not re-extract"
+                    ),
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(processor, [], args=fixture["args"])
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(
+                resumed_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual([archive_path], processor.successful_archives)
+            self.assertEqual([], processor.failed_archives)
+            self.assertEqual([], processor.skipped_archives)
+            self.assertEqual(self.m.TXN_STATE_DONE, resumed_txn["state"])
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual("success:move", resumed_entry["final_disposition"])
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(moved_dst))
+
+    def test_placed_after_done_snapshot_failure_without_source_finalization_reopens_to_terminal_success(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="asis",
+            )
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+            real_fsync_journal_checkpoint = self.m._fsync_journal_checkpoint
+            failed_once = {"done": False}
+
+            def fail_done_snapshot(current_txn, include_parent=False):
+                if current_txn.get("state") == self.m.TXN_STATE_DONE and not failed_once["done"]:
+                    failed_once["done"] = True
+                    raise RuntimeError("journal_dir_fsync_failed:dir:done-snapshot")
+                return real_fsync_journal_checkpoint(
+                    current_txn, include_parent=include_parent
+                )
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_fsync_journal_checkpoint",
+                    side_effect=fail_done_snapshot,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "journal_dir_fsync_failed:dir:done-snapshot",
+                ),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+            root_payload = os.path.join(fixture["output_dir"], "root.txt")
+            nested_payload = os.path.join(
+                fixture["output_dir"], "a", "b", "payload.txt"
+            )
+
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(root_payload))
+            self.assertTrue(os.path.exists(nested_payload))
+            self.assertEqual(self.m.TXN_STATE_PLACED, saved_txn["state"])
+            self.assertIsNone(saved_txn.get("error"))
+            self.assertEqual("recoverable", entry["state"])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+
+            self.assertEqual("", stdout.getvalue())
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                        self.m,
+                        "_extract_phase",
+                        side_effect=AssertionError(
+                            "done-snapshot resume must not re-extract after payload placement completed"
+                        ),
+                    ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(processor, [], args=fixture["args"])
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][archive_id]
+
+            self.assertEqual([archive_path], processor.successful_archives)
+            self.assertEqual([], processor.failed_archives)
+            self.assertEqual([], processor.skipped_archives)
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual("success:asis", resumed_entry["final_disposition"])
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(root_payload))
+            self.assertTrue(os.path.exists(nested_payload))
+
+    def test_placed_after_done_atomic_write_failure_without_source_finalization_reopens_to_terminal_success(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="asis",
+            )
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+            real_atomic_write_json = self.m.atomic_write_json
+            failed_once = {"done": False}
+
+            def fail_done_atomic_write(path, data, debug=False):
+                if data.get("state") == self.m.TXN_STATE_DONE and not failed_once["done"]:
+                    failed_once["done"] = True
+                    raise RuntimeError("synthetic_done_atomic_write_failure")
+                return real_atomic_write_json(path, data, debug=debug)
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "atomic_write_json",
+                    side_effect=fail_done_atomic_write,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic_done_atomic_write_failure",
+                ),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+            root_payload = os.path.join(fixture["output_dir"], "root.txt")
+            nested_payload = os.path.join(
+                fixture["output_dir"], "a", "b", "payload.txt"
+            )
+
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(root_payload))
+            self.assertTrue(os.path.exists(nested_payload))
+            self.assertEqual(self.m.TXN_STATE_PLACED, saved_txn["state"])
+            self.assertIsNone(saved_txn.get("error"))
+            self.assertEqual("recoverable", entry["state"])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+
+            self.assertEqual("", stdout.getvalue())
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "done-atomic-write resume must not re-extract after payload placement completed"
+                    ),
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(processor, [], args=fixture["args"])
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][archive_id]
+
+            self.assertEqual([archive_path], processor.successful_archives)
+            self.assertEqual([], processor.failed_archives)
+            self.assertEqual([], processor.skipped_archives)
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual("success:asis", resumed_entry["final_disposition"])
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(root_payload))
+            self.assertTrue(os.path.exists(nested_payload))
+
+    def test_strict_resume_allows_missing_or_drifted_input_after_done_atomic_write_failure_without_source_finalization(
+        self,
+    ):
+        for mutate_input in ("missing", "drifted"):
+            with self.subTest(mutate_input=mutate_input):
+                with tempfile.TemporaryDirectory() as td:
+                    fixture = self._make_success_finalization_txn_fixture(
+                        td,
+                        success_policy="asis",
+                    )
+                    archive_path = os.path.abspath(fixture["archive_path"])
+                    archive_id = fixture["archive_id"]
+                    real_atomic_write_json = self.m.atomic_write_json
+                    failed_once = {"done": False}
+
+                    def fail_done_atomic_write(path, data, debug=False):
+                        if (
+                            data.get("state") == self.m.TXN_STATE_DONE
+                            and not failed_once["done"]
+                        ):
+                            failed_once["done"] = True
+                            raise RuntimeError("synthetic_done_atomic_write_failure")
+                        return real_atomic_write_json(path, data, debug=debug)
+
+                    with (
+                        mock.patch.object(self.m, "_fsync_file", return_value=True),
+                        mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                        mock.patch.object(
+                            self.m,
+                            "atomic_write_json",
+                            side_effect=fail_done_atomic_write,
+                        ),
+                        self.assertRaisesRegex(
+                            RuntimeError,
+                            "synthetic_done_atomic_write_failure",
+                        ),
+                    ):
+                        self.m._place_and_finalize_txn(
+                            fixture["txn"], args=fixture["args"]
+                        )
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][archive_id]
+                    saved_txn = self.m._load_latest_txn_for_archive(
+                        entry,
+                        fixture["output_root"],
+                    )
+
+                    self.assertEqual(self.m.TXN_STATE_PLACED, saved_txn["state"])
+                    self.assertIsNone(saved_txn.get("error"))
+                    self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
+
+                    if mutate_input == "missing":
+                        os.remove(archive_path)
+                    else:
+                        with open(archive_path, "ab") as f:
+                            f.write(b"drift")
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][archive_id]
+                    if mutate_input == "missing":
+                        self.assertTrue(
+                            self.m._manifest_archive_allows_missing_input(
+                                manifest,
+                                entry,
+                                fixture["output_root"],
+                                missing_path=archive_path,
+                            )
+                        )
+
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        result = self.m._validate_strict_resume_startup(fixture["args"])
+
+                    self.assertTrue(result)
+                    self.assertEqual("", stdout.getvalue())
+
+    def test_strict_resume_allows_file_type_drift_after_done_atomic_write_failure_without_source_finalization(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="asis",
+            )
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+            real_atomic_write_json = self.m.atomic_write_json
+            failed_once = {"done": False}
+
+            def fail_done_atomic_write(path, data, debug=False):
+                if data.get("state") == self.m.TXN_STATE_DONE and not failed_once["done"]:
+                    failed_once["done"] = True
+                    raise RuntimeError("synthetic_done_atomic_write_failure")
+                return real_atomic_write_json(path, data, debug=debug)
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "atomic_write_json",
+                    side_effect=fail_done_atomic_write,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic_done_atomic_write_failure",
+                ),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_PLACED, saved_txn["state"])
+            self.assertIsNone(saved_txn.get("error"))
+
+            os.remove(archive_path)
+            os.makedirs(archive_path)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertTrue(result)
+            self.assertEqual("", stdout.getvalue())
+
+    def test_incoming_committed_snapshot_failure_after_commit_stays_recoverable_and_keeps_incoming_payload(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            staging_extracted = txn["paths"]["staging_extracted"]
+            payload_path = os.path.join(staging_extracted, "payload.txt")
+            os.makedirs(staging_extracted, exist_ok=True)
+            with open(payload_path, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            real_snapshot_v2 = self.m._txn_snapshot_v2
+            failed_once = {"done": False}
+
+            def fail_incoming_committed_snapshot(current_txn):
+                if (
+                    current_txn["txn_id"] == txn["txn_id"]
+                    and current_txn.get("state") == self.m.TXN_STATE_INCOMING_COMMITTED
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise RuntimeError(
+                        "journal_dir_fsync_failed:dir:incoming-committed-snapshot"
+                    )
+                return real_snapshot_v2(current_txn)
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=fail_incoming_committed_snapshot,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "journal_dir_fsync_failed:dir:incoming-committed-snapshot",
+                ),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+            incoming_payload = os.path.join(saved_txn["paths"]["incoming_dir"], "payload.txt")
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual(
+                "INCOMING_COMMITTED_SNAPSHOT_FAILED", saved_txn["error"]["type"]
+            )
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertFalse(os.path.exists(saved_txn["paths"]["staging_extracted"]))
+            self.assertTrue(os.path.exists(saved_txn["paths"]["incoming_dir"]))
+            self.assertTrue(os.path.exists(incoming_payload))
+
+            self.assertEqual(
+                self.m.TXN_STATE_INCOMING_COMMITTED,
+                self.m._recoverable_txn_state_from_aborted(saved_txn),
+            )
+
+    def test_placed_snapshot_failure_stays_recoverable_and_does_not_terminalize_placement(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="asis",
+            )
+            txn = fixture["txn"]
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+            real_snapshot_v2 = self.m._txn_snapshot_v2
+            failed_once = {"done": False}
+
+            def fail_placed_snapshot(current_txn):
+                if (
+                    current_txn.get("txn_id") == txn["txn_id"]
+                    and current_txn.get("state") == self.m.TXN_STATE_PLACED
+                    and (current_txn.get("placement_v2") or {}).get("ops")
+                    and all(
+                        op.get("phase") == "MOVE_DONE"
+                        for op in current_txn["placement_v2"]["ops"]
+                    )
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise RuntimeError(
+                        "journal_dir_fsync_failed:dir:placed-snapshot-failed"
+                    )
+                return real_snapshot_v2(current_txn)
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=fail_placed_snapshot,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "journal_dir_fsync_failed:dir:placed-snapshot-failed",
+                ),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual("PLACE_FAILED", saved_txn["error"]["type"])
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
             self.assertFalse(self.m._txn_is_closed_terminal_outcome(saved_txn))
-            with self.assertRaises(ValueError):
-                self.m._reconciled_archive_classification(entry, saved_txn)
-            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+            self.assertEqual(
+                self.m.TXN_STATE_PLACED,
+                self.m._recoverable_txn_state_from_aborted(saved_txn),
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertTrue(result)
+            self.assertEqual("", stdout.getvalue())
+
+    def test_strict_resume_allows_missing_input_and_size_drift_for_placed_snapshot_failed_abort_on_non_source_mutating_policy(
+        self,
+    ):
+        for mutate_input in ("missing", "size"):
+            with self.subTest(mutate_input=mutate_input):
+                with tempfile.TemporaryDirectory() as td:
+                    fixture = self._make_success_finalization_txn_fixture(
+                        td,
+                        success_policy="asis",
+                    )
+                    txn = fixture["txn"]
+                    archive_path = os.path.abspath(fixture["archive_path"])
+                    archive_id = fixture["archive_id"]
+                    real_snapshot_v2 = self.m._txn_snapshot_v2
+                    failed_once = {"done": False}
+
+                    def fail_placed_snapshot(current_txn):
+                        if (
+                            current_txn.get("txn_id") == txn["txn_id"]
+                            and current_txn.get("state") == self.m.TXN_STATE_PLACED
+                            and (current_txn.get("placement_v2") or {}).get("ops")
+                            and all(
+                                op.get("phase") == "MOVE_DONE"
+                                for op in current_txn["placement_v2"]["ops"]
+                            )
+                            and not failed_once["done"]
+                        ):
+                            failed_once["done"] = True
+                            raise RuntimeError(
+                                "journal_dir_fsync_failed:dir:placed-snapshot-failed"
+                            )
+                        return real_snapshot_v2(current_txn)
+
+                    with (
+                        mock.patch.object(self.m, "_fsync_file", return_value=True),
+                        mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                        mock.patch.object(
+                            self.m,
+                            "_txn_snapshot_v2",
+                            side_effect=fail_placed_snapshot,
+                        ),
+                        self.assertRaisesRegex(
+                            RuntimeError,
+                            "journal_dir_fsync_failed:dir:placed-snapshot-failed",
+                        ),
+                    ):
+                        self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][archive_id]
+                    saved_txn = self.m._load_latest_txn_for_archive(
+                        entry,
+                        fixture["output_root"],
+                    )
+
+                    self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+                    self.assertEqual("PLACE_FAILED", saved_txn["error"]["type"])
+                    self.assertEqual(
+                        self.m.TXN_STATE_PLACED,
+                        self.m._recoverable_txn_state_from_aborted(saved_txn),
+                    )
+
+                    if mutate_input == "missing":
+                        os.remove(archive_path)
+                    else:
+                        with open(archive_path, "ab") as f:
+                            f.write(b"-drift")
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][archive_id]
+                    if mutate_input == "missing":
+                        self.assertTrue(
+                            self.m._manifest_archive_allows_missing_input(
+                                manifest,
+                                entry,
+                                fixture["output_root"],
+                                missing_path=archive_path,
+                            )
+                        )
+                    else:
+                        self.assertTrue(
+                            self.m._manifest_archive_allows_replay_safe_input_drift(
+                                manifest,
+                                entry,
+                                fixture["output_root"],
+                            )
+                        )
+
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        result = self.m._validate_strict_resume_startup(fixture["args"])
+
+                    self.assertTrue(result)
+                    self.assertEqual("", stdout.getvalue())
+
+    def test_strict_resume_refuses_missing_input_and_size_drift_for_placed_snapshot_failed_abort_on_source_mutating_success_policy(
+        self,
+    ):
+        for success_policy in ("move", "delete"):
+            for mutate_input in ("missing", "size"):
+                with self.subTest(
+                    success_policy=success_policy,
+                    mutate_input=mutate_input,
+                ):
+                    with tempfile.TemporaryDirectory() as td:
+                        fixture = self._make_success_finalization_txn_fixture(
+                            td,
+                            success_policy=success_policy,
+                        )
+                        txn = fixture["txn"]
+                        archive_path = os.path.abspath(fixture["archive_path"])
+                        archive_id = fixture["archive_id"]
+                        real_snapshot_v2 = self.m._txn_snapshot_v2
+                        failed_once = {"done": False}
+
+                        def fail_placed_snapshot(current_txn):
+                            if (
+                                current_txn.get("txn_id") == txn["txn_id"]
+                                and current_txn.get("state") == self.m.TXN_STATE_PLACED
+                                and (current_txn.get("placement_v2") or {}).get("ops")
+                                and all(
+                                    op.get("phase") == "MOVE_DONE"
+                                    for op in current_txn["placement_v2"]["ops"]
+                                )
+                                and not failed_once["done"]
+                            ):
+                                failed_once["done"] = True
+                                raise RuntimeError(
+                                    "journal_dir_fsync_failed:dir:placed-snapshot-failed"
+                                )
+                            return real_snapshot_v2(current_txn)
+
+                        with (
+                            mock.patch.object(self.m, "_fsync_file", return_value=True),
+                            mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                            mock.patch.object(
+                                self.m,
+                                "_txn_snapshot_v2",
+                                side_effect=fail_placed_snapshot,
+                            ),
+                            self.assertRaisesRegex(
+                                RuntimeError,
+                                "journal_dir_fsync_failed:dir:placed-snapshot-failed",
+                            ),
+                        ):
+                            self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+                        manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                        entry = manifest["archives"][archive_id]
+                        saved_txn = self.m._load_latest_txn_for_archive(
+                            entry,
+                            fixture["output_root"],
+                        )
+
+                        self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+                        self.assertEqual("PLACE_FAILED", saved_txn["error"]["type"])
+                        self.assertEqual(
+                            self.m.TXN_STATE_PLACED,
+                            self.m._recoverable_txn_state_from_aborted(saved_txn),
+                        )
+
+                        if mutate_input == "missing":
+                            os.remove(archive_path)
+                        else:
+                            with open(archive_path, "ab") as f:
+                                f.write(b"-drift")
+
+                        manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                        entry = manifest["archives"][archive_id]
+                        if mutate_input == "missing":
+                            self.assertFalse(
+                                self.m._manifest_archive_allows_missing_input(
+                                    manifest,
+                                    entry,
+                                    fixture["output_root"],
+                                    missing_path=archive_path,
+                                )
+                            )
+                        else:
+                            self.assertFalse(
+                                self.m._manifest_archive_allows_replay_safe_input_drift(
+                                    manifest,
+                                    entry,
+                                    fixture["output_root"],
+                                )
+                            )
+
+                        stdout = io.StringIO()
+                        with contextlib.redirect_stdout(stdout):
+                            result = self.m._validate_strict_resume_startup(
+                                fixture["args"]
+                            )
+
+                        self.assertFalse(result)
+                        self.assertIn(archive_path, stdout.getvalue())
+                        self.assertIn(
+                            (
+                                "archive is missing"
+                                if mutate_input == "missing"
+                                else "size"
+                            ),
+                            stdout.getvalue().lower(),
+                        )
+
+    def test_strict_resume_allows_missing_input_and_size_drift_for_placed_snapshot_failed_abort_with_non_source_mutating_success_under_mixed_policies(
+        self,
+    ):
+        for policy_field, policy_value, path_field in (
+            ("fail_policy", "move", "fail_to"),
+            ("traditional_zip_policy", "move", "traditional_zip_to"),
+        ):
+            for mutate_input in ("missing", "size"):
+                with self.subTest(
+                    policy_field=policy_field,
+                    mutate_input=mutate_input,
+                ):
+                    with tempfile.TemporaryDirectory() as td:
+                        fixture = self._make_success_finalization_txn_fixture(
+                            td,
+                            success_policy="asis",
+                        )
+                        setattr(fixture["args"], policy_field, policy_value)
+                        setattr(
+                            fixture["args"],
+                            path_field,
+                            os.path.join(td, f"{policy_field}-dst"),
+                        )
+                        self._set_manifest_command_fingerprint(
+                            fixture["output_root"], fixture["args"]
+                        )
+
+                        txn = fixture["txn"]
+                        archive_path = os.path.abspath(fixture["archive_path"])
+                        archive_id = fixture["archive_id"]
+                        real_snapshot_v2 = self.m._txn_snapshot_v2
+                        failed_once = {"done": False}
+
+                        def fail_placed_snapshot(current_txn):
+                            if (
+                                current_txn.get("txn_id") == txn["txn_id"]
+                                and current_txn.get("state") == self.m.TXN_STATE_PLACED
+                                and (current_txn.get("placement_v2") or {}).get("ops")
+                                and all(
+                                    op.get("phase") == "MOVE_DONE"
+                                    for op in current_txn["placement_v2"]["ops"]
+                                )
+                                and not failed_once["done"]
+                            ):
+                                failed_once["done"] = True
+                                raise RuntimeError(
+                                    "journal_dir_fsync_failed:dir:placed-snapshot-failed"
+                                )
+                            return real_snapshot_v2(current_txn)
+
+                        with (
+                            mock.patch.object(self.m, "_fsync_file", return_value=True),
+                            mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                            mock.patch.object(
+                                self.m,
+                                "_txn_snapshot_v2",
+                                side_effect=fail_placed_snapshot,
+                            ),
+                            self.assertRaisesRegex(
+                                RuntimeError,
+                                "journal_dir_fsync_failed:dir:placed-snapshot-failed",
+                            ),
+                        ):
+                            self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+                        manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                        entry = manifest["archives"][archive_id]
+                        saved_txn = self.m._load_latest_txn_for_archive(
+                            entry,
+                            fixture["output_root"],
+                        )
+
+                        self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+                        self.assertEqual("PLACE_FAILED", saved_txn["error"]["type"])
+                        self.assertEqual(
+                            self.m.TXN_STATE_PLACED,
+                            self.m._recoverable_txn_state_from_aborted(saved_txn),
+                        )
+
+                        if mutate_input == "missing":
+                            os.remove(archive_path)
+                        else:
+                            with open(archive_path, "ab") as f:
+                                f.write(b"-drift")
+
+                        manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                        entry = manifest["archives"][archive_id]
+                        if mutate_input == "missing":
+                            self.assertTrue(
+                                self.m._manifest_archive_allows_missing_input(
+                                    manifest,
+                                    entry,
+                                    fixture["output_root"],
+                                    missing_path=archive_path,
+                                )
+                            )
+                        else:
+                            self.assertTrue(
+                                self.m._manifest_archive_allows_replay_safe_input_drift(
+                                    manifest,
+                                    entry,
+                                    fixture["output_root"],
+                                )
+                            )
+
+                        stdout = io.StringIO()
+                        with contextlib.redirect_stdout(stdout):
+                            result = self.m._validate_strict_resume_startup(
+                                fixture["args"]
+                            )
+
+                        self.assertTrue(result)
+                        self.assertEqual("", stdout.getvalue())
+
+    def test_recovery_time_placed_promotion_snapshot_failure_stays_recoverable(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="asis",
+            )
+            txn = fixture["txn"]
+            archive_id = fixture["archive_id"]
+            real_snapshot_v2 = self.m._txn_snapshot_v2
+            initial_failed_once = {"done": False}
+
+            def fail_initial_placed_snapshot(current_txn):
+                if (
+                    current_txn.get("txn_id") == txn["txn_id"]
+                    and current_txn.get("state") == self.m.TXN_STATE_PLACED
+                    and (current_txn.get("placement_v2") or {}).get("ops")
+                    and all(
+                        op.get("phase") == "MOVE_DONE"
+                        for op in current_txn["placement_v2"]["ops"]
+                    )
+                    and not initial_failed_once["done"]
+                ):
+                    initial_failed_once["done"] = True
+                    raise RuntimeError(
+                        "journal_dir_fsync_failed:dir:placed-snapshot-failed"
+                    )
+                return real_snapshot_v2(current_txn)
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=fail_initial_placed_snapshot,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "journal_dir_fsync_failed:dir:placed-snapshot-failed",
+                ),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual("PLACE_FAILED", saved_txn["error"]["type"])
+            self.assertEqual(
+                self.m.TXN_STATE_PLACED,
+                self.m._recoverable_txn_state_from_aborted(saved_txn),
+            )
+
+            recovery_failed_once = {"done": False}
+
+            class DummyLock:
+                def __init__(self, path, timeout_ms, retry_ms, debug):
+                    self.path = path
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            def fail_recovery_promotion_snapshot(current_txn):
+                if (
+                    current_txn.get("txn_id") == saved_txn["txn_id"]
+                    and current_txn.get("state") == self.m.TXN_STATE_PLACED
+                    and (current_txn.get("placement_v2") or {}).get("ops")
+                    and all(
+                        op.get("phase") == "MOVE_DONE"
+                        for op in current_txn["placement_v2"]["ops"]
+                    )
+                    and not recovery_failed_once["done"]
+                ):
+                    recovery_failed_once["done"] = True
+                    raise RuntimeError(
+                        "journal_dir_fsync_failed:dir:placed-recovery-promotion-snapshot"
+                    )
+                return real_snapshot_v2(current_txn)
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=fail_recovery_promotion_snapshot,
+                ),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+            ):
+                self.m._recover_output_dir(
+                    fixture["output_dir"],
+                    args=fixture["args"],
+                    successful_archives=set(),
+                    failed_archives=set(),
+                )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            reopened_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, reopened_txn["state"])
+            self.assertNotEqual("RECOVER_FAILED", reopened_txn["error"]["type"])
+            self.assertEqual(
+                self.m.TXN_STATE_PLACED,
+                self.m._recoverable_txn_state_from_aborted(reopened_txn),
+            )
+            self.assertFalse(self.m._txn_is_closed_terminal_outcome(reopened_txn))
+
+            self.m._place_and_finalize_txn(
+                reopened_txn,
+                args=fixture["args"],
+                recovery=True,
+            )
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(
+                resumed_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_DONE, resumed_txn["state"])
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual("success:asis", resumed_entry["final_disposition"])
+
+    def test_post_placement_completed_abort_without_retry_provenance_refuses_recovery_everywhere(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._persist_post_placement_snapshot_failed_abort_fixture(td)
+            saved_txn = fixture["saved_txn"]
+            saved_txn.pop("post_placement_snapshot_retry", None)
+            self.m._txn_snapshot(saved_txn)
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+
+            self.assertFalse(saved_txn.get("post_placement_snapshot_retry"))
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual("PLACE_FAILED", saved_txn["error"]["type"])
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:aborted_recovery_contradiction",
+            ):
+                self.m._recoverable_txn_state_from_aborted(saved_txn)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:aborted_recovery_contradiction",
+            ):
+                self.m._startup_raise_explicit_refuse_if_needed(saved_txn)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:aborted_recovery_contradiction",
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:aborted_recovery_contradiction",
+            ):
+                self.m._place_and_finalize_txn(
+                    saved_txn,
+                    args=fixture["args"],
+                    recovery=True,
+                )
+
+            reopened_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            reopened_entry = reopened_manifest["archives"][fixture["archive_id"]]
+            reopened_txn = self.m._load_latest_txn_for_archive(
+                reopened_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, reopened_txn["state"])
+            self.assertEqual("recoverable", reopened_entry["state"])
+            self.assertFalse(self.m._txn_is_closed_terminal_outcome(reopened_txn))
+
+    def test_post_placement_snapshot_retry_with_contradictory_residue_refuses_recovery_everywhere(
+        self,
+    ):
+        for residue_path_key, residue_name in (
+            ("incoming_dir", "unplaced.txt"),
+            ("staging_extracted", "leftover.txt"),
+        ):
+            with self.subTest(residue_path_key=residue_path_key):
+                with tempfile.TemporaryDirectory() as td:
+                    fixture = self._persist_post_placement_snapshot_failed_abort_fixture(td)
+                    saved_txn = fixture["saved_txn"]
+                    contradictory_path = os.path.join(
+                        saved_txn["paths"][residue_path_key],
+                        residue_name,
+                    )
+                    os.makedirs(saved_txn["paths"][residue_path_key], exist_ok=True)
+                    with open(contradictory_path, "w", encoding="utf-8") as f:
+                        f.write("leftover")
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][fixture["archive_id"]]
+                    saved_txn = self.m._load_latest_txn_for_archive(
+                        entry,
+                        fixture["output_root"],
+                    )
+
+                    self.assertTrue(saved_txn.get("post_placement_snapshot_retry"))
+                    self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+                    self.assertTrue(os.path.exists(contradictory_path))
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "refuse_recovery:aborted_recovery_contradiction",
+                    ):
+                        self.m._recoverable_txn_state_from_aborted(saved_txn)
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "refuse_recovery:aborted_recovery_contradiction",
+                    ):
+                        self.m._startup_raise_explicit_refuse_if_needed(saved_txn)
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "refuse_recovery:aborted_recovery_contradiction",
+                    ):
+                        self.m._classify_manifest_archive_state(
+                            entry,
+                            fixture["output_root"],
+                        )
+
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        result = self.m._validate_strict_resume_startup(fixture["args"])
+
+                    self.assertFalse(result)
+                    self.assertIn(
+                        "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                        stdout.getvalue(),
+                    )
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "refuse_recovery:aborted_recovery_contradiction",
+                    ):
+                        self.m._recover_output_dir(
+                            fixture["output_dir"],
+                            args=fixture["args"],
+                            successful_archives=set(),
+                            failed_archives=set(),
+                        )
+
+                    reopened_manifest = self.m._load_dataset_manifest(
+                        fixture["output_root"]
+                    )
+                    reopened_entry = reopened_manifest["archives"][fixture["archive_id"]]
+                    reopened_txn = self.m._load_latest_txn_for_archive(
+                        reopened_entry,
+                        fixture["output_root"],
+                    )
+
+                    self.assertEqual(self.m.TXN_STATE_ABORTED, reopened_txn["state"])
+                    self.assertEqual("recoverable", reopened_entry["state"])
+                    self.assertTrue(os.path.exists(contradictory_path))
+                    self.assertFalse(self.m._txn_is_closed_terminal_outcome(reopened_txn))
+
+    def test_post_placement_snapshot_retry_with_non_directory_residue_refuses_recovery_everywhere(
+        self,
+    ):
+        for residue_path_key in ("incoming_dir", "staging_extracted"):
+            with self.subTest(residue_path_key=residue_path_key):
+                with tempfile.TemporaryDirectory() as td:
+                    fixture = self._persist_post_placement_snapshot_failed_abort_fixture(td)
+                    saved_txn = fixture["saved_txn"]
+                    residue_path = saved_txn["paths"][residue_path_key]
+                    if os.path.isdir(residue_path):
+                        shutil.rmtree(residue_path)
+                    elif os.path.exists(residue_path):
+                        os.remove(residue_path)
+                    with open(residue_path, "w", encoding="utf-8") as f:
+                        f.write("contradictory-non-directory")
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][fixture["archive_id"]]
+                    saved_txn = self.m._load_latest_txn_for_archive(
+                        entry,
+                        fixture["output_root"],
+                    )
+
+                    self.assertTrue(saved_txn.get("post_placement_snapshot_retry"))
+                    self.assertTrue(os.path.isfile(residue_path))
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "refuse_recovery:aborted_recovery_contradiction",
+                    ):
+                        self.m._recoverable_txn_state_from_aborted(saved_txn)
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "refuse_recovery:aborted_recovery_contradiction",
+                    ):
+                        self.m._startup_raise_explicit_refuse_if_needed(saved_txn)
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "refuse_recovery:aborted_recovery_contradiction",
+                    ):
+                        self.m._classify_manifest_archive_state(
+                            entry,
+                            fixture["output_root"],
+                        )
+
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        result = self.m._validate_strict_resume_startup(fixture["args"])
+
+                    self.assertFalse(result)
+                    self.assertIn(
+                        "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                        stdout.getvalue(),
+                    )
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "refuse_recovery:aborted_recovery_contradiction",
+                    ):
+                        self.m._recover_output_dir(
+                            fixture["output_dir"],
+                            args=fixture["args"],
+                            successful_archives=set(),
+                            failed_archives=set(),
+                        )
+
+    def test_recovery_time_post_placement_done_snapshot_failure_stays_non_terminal(self):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._persist_post_placement_snapshot_failed_abort_fixture(td)
+            saved_txn = fixture["saved_txn"]
+            archive_id = fixture["archive_id"]
+            real_fsync_journal_checkpoint = self.m._fsync_journal_checkpoint
+            direct_failed_once = {"done": False}
+
+            def fail_recovery_done_snapshot(current_txn, include_parent=False):
+                if (
+                    current_txn.get("txn_id") == saved_txn["txn_id"]
+                    and current_txn.get("state") == self.m.TXN_STATE_DONE
+                    and current_txn.get("post_placement_snapshot_retry")
+                    and not direct_failed_once["done"]
+                ):
+                    direct_failed_once["done"] = True
+                    raise RuntimeError(
+                        "journal_dir_fsync_failed:dir:recovery-done-snapshot-after-post-placement"
+                    )
+                return real_fsync_journal_checkpoint(
+                    current_txn, include_parent=include_parent
+                )
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_fsync_journal_checkpoint",
+                    side_effect=fail_recovery_done_snapshot,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "journal_dir_fsync_failed:dir:recovery-done-snapshot-after-post-placement",
+                ),
+            ):
+                self.m._place_and_finalize_txn(
+                    saved_txn,
+                    args=fixture["args"],
+                    recovery=True,
+                )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            direct_retry_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_PLACED, direct_retry_txn["state"])
+            self.assertIsNone(direct_retry_txn.get("error"))
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+
+            recover_failed_archives = set()
+            recover_successful_archives = set()
+            reopen_failed_once = {"done": False}
+
+            def fail_reopen_done_snapshot(current_txn, include_parent=False):
+                if (
+                    current_txn.get("txn_id") == direct_retry_txn["txn_id"]
+                    and current_txn.get("state") == self.m.TXN_STATE_DONE
+                    and current_txn.get("post_placement_snapshot_retry")
+                    and not reopen_failed_once["done"]
+                ):
+                    reopen_failed_once["done"] = True
+                    raise RuntimeError(
+                        "journal_dir_fsync_failed:dir:recovery-done-snapshot-after-post-placement"
+                    )
+                return real_fsync_journal_checkpoint(
+                    current_txn, include_parent=include_parent
+                )
+
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_fsync_journal_checkpoint",
+                    side_effect=fail_reopen_done_snapshot,
+                ),
+            ):
+                self.m._recover_output_dir(
+                    fixture["output_dir"],
+                    args=fixture["args"],
+                    failed_archives=recover_failed_archives,
+                    successful_archives=recover_successful_archives,
+                )
+
+            reopened_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            reopened_entry = reopened_manifest["archives"][archive_id]
+            reopened_txn = self.m._load_latest_txn_for_archive(
+                reopened_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(set(), recover_failed_archives)
+            self.assertEqual(set(), recover_successful_archives)
+            self.assertNotEqual(self.m.TXN_STATE_FAILED, reopened_txn["state"])
+            self.assertNotEqual(
+                "RECOVER_FAILED", (reopened_txn.get("error") or {}).get("type")
+            )
+            self.assertEqual(self.m.TXN_STATE_PLACED, reopened_txn["state"])
+            self.assertEqual("recoverable", reopened_entry["state"])
+            self.assertEqual("unknown", reopened_entry["final_disposition"])
+            self.assertFalse(self.m._txn_is_closed_terminal_outcome(reopened_txn))
+            self.assertEqual(
+                self.m.TXN_STATE_PLACED,
+                self.m._classify_recoverable_txn_state(reopened_txn),
+            )
+
+    def test_persisted_placed_post_placement_retry_with_contradictory_residue_refuses_recovery_everywhere(
+        self,
+    ):
+        for mutate_input in ("missing", "size"):
+            with self.subTest(mutate_input=mutate_input):
+                with tempfile.TemporaryDirectory() as td:
+                    fixture = self._persist_recovery_time_post_placement_done_snapshot_failed_retry_fixture(
+                        td
+                    )
+                    archive_path = os.path.abspath(fixture["archive_path"])
+                    saved_txn = fixture["saved_txn"]
+                    contradictory_path = os.path.join(
+                        saved_txn["paths"]["incoming_dir"],
+                        "leftover.txt",
+                    )
+                    os.makedirs(saved_txn["paths"]["incoming_dir"], exist_ok=True)
+                    with open(contradictory_path, "w", encoding="utf-8") as f:
+                        f.write("leftover")
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][fixture["archive_id"]]
+                    saved_txn = self.m._load_latest_txn_for_archive(
+                        entry,
+                        fixture["output_root"],
+                    )
+
+                    self.assertEqual(self.m.TXN_STATE_PLACED, saved_txn["state"])
+                    self.assertTrue(saved_txn.get("post_placement_snapshot_retry"))
+                    self.assertIsNone(saved_txn.get("error"))
+                    self.assertTrue(os.path.exists(contradictory_path))
+
+                    with self.assertRaisesRegex(RuntimeError, "refuse_recovery:"):
+                        self.m._classify_recoverable_txn_state(saved_txn)
+
+                    with self.assertRaisesRegex(RuntimeError, "refuse_recovery:"):
+                        self.m._startup_raise_explicit_refuse_if_needed(saved_txn)
+
+                    with self.assertRaisesRegex(RuntimeError, "refuse_recovery:"):
+                        self.m._classify_manifest_archive_state(
+                            entry,
+                            fixture["output_root"],
+                        )
+
+                    if mutate_input == "missing":
+                        os.remove(archive_path)
+                    else:
+                        with open(archive_path, "ab") as f:
+                            f.write(b"-drift")
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][fixture["archive_id"]]
+                    saved_txn = self.m._load_latest_txn_for_archive(
+                        entry,
+                        fixture["output_root"],
+                    )
+
+                    if mutate_input == "missing":
+                        self.assertFalse(
+                            self.m._manifest_archive_allows_missing_input(
+                                manifest,
+                                entry,
+                                fixture["output_root"],
+                                missing_path=archive_path,
+                            )
+                        )
+                    else:
+                        self.assertFalse(
+                            self.m._manifest_archive_allows_replay_safe_input_drift(
+                                manifest,
+                                entry,
+                                fixture["output_root"],
+                            )
+                        )
+
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        result = self.m._validate_strict_resume_startup(fixture["args"])
+
+                    self.assertFalse(result)
+                    self.assertIn(
+                        "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                        stdout.getvalue(),
+                    )
+
+                    with self.assertRaisesRegex(RuntimeError, "refuse_recovery:"):
+                        self.m._place_and_finalize_txn(
+                            saved_txn,
+                            args=fixture["args"],
+                            recovery=True,
+                        )
+
+                    reopened_manifest = self.m._load_dataset_manifest(
+                        fixture["output_root"]
+                    )
+                    reopened_entry = reopened_manifest["archives"][fixture["archive_id"]]
+                    reopened_txn = self.m._load_latest_txn_for_archive(
+                        reopened_entry,
+                        fixture["output_root"],
+                    )
+
+                    self.assertEqual(self.m.TXN_STATE_PLACED, reopened_txn["state"])
+                    self.assertEqual("recoverable", reopened_entry["state"])
+                    self.assertEqual("unknown", reopened_entry["final_disposition"])
+                    self.assertFalse(self.m._txn_is_closed_terminal_outcome(reopened_txn))
+                    self.assertTrue(os.path.exists(contradictory_path))
+
+    def test_post_placement_snapshot_retry_marker_does_not_authorize_later_durability_abort(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._persist_post_placement_snapshot_failed_abort_fixture(
+                td,
+                success_policy="move",
+            )
+            saved_txn = fixture["saved_txn"]
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+
+            self.assertTrue(saved_txn.get("post_placement_snapshot_retry"))
+            self.assertEqual("PLACE_FAILED", saved_txn["error"]["type"])
+
+            saved_txn["error"] = {
+                "type": "DURABILITY_FAILED",
+                "message": "payload durability barrier failed after post-placement retry provenance",
+                "at": self.m._now_iso(),
+            }
+            self.m._txn_snapshot(saved_txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=saved_txn["txn_id"],
+                final_disposition="unknown",
+                error=saved_txn["error"],
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+
+            self.assertTrue(saved_txn.get("post_placement_snapshot_retry"))
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual("DURABILITY_FAILED", saved_txn["error"]["type"])
+            self.assertIsNone(saved_txn.get("payload_durable"))
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:aborted_recovery_contradiction",
+            ):
+                self.m._recoverable_txn_state_from_aborted(saved_txn)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:aborted_recovery_contradiction",
+            ):
+                self.m._startup_raise_explicit_refuse_if_needed(saved_txn)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:aborted_recovery_contradiction",
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+            self.assertTrue(os.path.exists(archive_path))
+
+    def test_completed_placement_later_abort_with_contradictory_residue_refuses_recovery_everywhere(
+        self,
+    ):
+        scenarios = (
+            ("DURABILITY_FAILED", "incoming_dir", "leftover.txt"),
+            ("FAIL_FINALIZE_FAILED", "incoming_dir", "leftover.txt"),
+            ("DURABILITY_FAILED", "staging_extracted", "leftover.txt"),
+        )
+
+        for error_type, residue_path_key, residue_name in scenarios:
+            with self.subTest(
+                error_type=error_type,
+                residue_path_key=residue_path_key,
+            ):
+                with tempfile.TemporaryDirectory() as td:
+                    fixture = self._persist_post_placement_snapshot_failed_abort_fixture(
+                        td,
+                        success_policy="move",
+                    )
+                    saved_txn = fixture["saved_txn"]
+                    residue_root = saved_txn["paths"][residue_path_key]
+                    os.makedirs(residue_root, exist_ok=True)
+                    contradictory_path = os.path.join(residue_root, residue_name)
+                    with open(contradictory_path, "w", encoding="utf-8") as f:
+                        f.write("leftover")
+
+                    saved_txn["error"] = {
+                        "type": error_type,
+                        "message": f"synthetic stale later abort with contradictory {residue_path_key}",
+                        "at": self.m._now_iso(),
+                    }
+                    self.m._txn_snapshot(saved_txn)
+                    self.m._update_dataset_manifest_archive(
+                        fixture["output_root"],
+                        fixture["archive_path"],
+                        state="recoverable",
+                        last_txn_id=saved_txn["txn_id"],
+                        final_disposition="unknown",
+                        error=saved_txn["error"],
+                        finalized_at=None,
+                    )
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][fixture["archive_id"]]
+                    saved_txn = self.m._load_latest_txn_for_archive(
+                        entry,
+                        fixture["output_root"],
+                    )
+
+                    self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+                    self.assertEqual(error_type, saved_txn["error"]["type"])
+                    self.assertTrue(saved_txn.get("post_placement_snapshot_retry"))
+                    self.assertTrue(os.path.exists(contradictory_path))
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "refuse_recovery:aborted_recovery_contradiction",
+                    ):
+                        self.m._recoverable_txn_state_from_aborted(saved_txn)
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "refuse_recovery:aborted_recovery_contradiction",
+                    ):
+                        self.m._startup_raise_explicit_refuse_if_needed(saved_txn)
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "refuse_recovery:aborted_recovery_contradiction",
+                    ):
+                        self.m._classify_manifest_archive_state(
+                            entry,
+                            fixture["output_root"],
+                        )
+
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        result = self.m._validate_strict_resume_startup(fixture["args"])
+
+                    self.assertFalse(result)
+                    self.assertIn(
+                        "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                        stdout.getvalue(),
+                    )
+
+    def test_strict_resume_refuses_post_placement_snapshot_retry_with_contradictory_incoming_residue(self):
+        for mutate_input in ("missing", "size"):
+            with self.subTest(mutate_input=mutate_input):
+                with tempfile.TemporaryDirectory() as td:
+                    fixture = self._make_success_finalization_txn_fixture(
+                        td,
+                        success_policy="asis",
+                    )
+                    txn = fixture["txn"]
+                    archive_path = os.path.abspath(fixture["archive_path"])
+                    archive_id = fixture["archive_id"]
+                    real_snapshot_v2 = self.m._txn_snapshot_v2
+                    failed_once = {"done": False}
+
+                    def fail_placed_snapshot(current_txn):
+                        if (
+                            current_txn.get("txn_id") == txn["txn_id"]
+                            and current_txn.get("state") == self.m.TXN_STATE_PLACED
+                            and (current_txn.get("placement_v2") or {}).get("ops")
+                            and all(
+                                op.get("phase") == "MOVE_DONE"
+                                for op in current_txn["placement_v2"]["ops"]
+                            )
+                            and not failed_once["done"]
+                        ):
+                            failed_once["done"] = True
+                            raise RuntimeError(
+                                "journal_dir_fsync_failed:dir:placed-snapshot-failed"
+                            )
+                        return real_snapshot_v2(current_txn)
+
+                    with (
+                        mock.patch.object(self.m, "_fsync_file", return_value=True),
+                        mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                        mock.patch.object(
+                            self.m,
+                            "_txn_snapshot_v2",
+                            side_effect=fail_placed_snapshot,
+                        ),
+                        self.assertRaisesRegex(
+                            RuntimeError,
+                            "journal_dir_fsync_failed:dir:placed-snapshot-failed",
+                        ),
+                    ):
+                        self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][archive_id]
+                    saved_txn = self.m._load_latest_txn_for_archive(
+                        entry,
+                        fixture["output_root"],
+                    )
+
+                    contradictory_path = os.path.join(
+                        saved_txn["paths"]["incoming_dir"],
+                        "unplaced.txt",
+                    )
+                    os.makedirs(saved_txn["paths"]["incoming_dir"], exist_ok=True)
+                    with open(contradictory_path, "w", encoding="utf-8") as f:
+                        f.write("leftover")
+
+                    if mutate_input == "missing":
+                        os.remove(archive_path)
+                    else:
+                        with open(archive_path, "ab") as f:
+                            f.write(b"-drift")
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][archive_id]
+                    if mutate_input == "missing":
+                        self.assertFalse(
+                            self.m._manifest_archive_allows_missing_input(
+                                manifest,
+                                entry,
+                                fixture["output_root"],
+                                missing_path=archive_path,
+                            )
+                        )
+                    else:
+                        self.assertFalse(
+                            self.m._manifest_archive_allows_replay_safe_input_drift(
+                                manifest,
+                                entry,
+                                fixture["output_root"],
+                            )
+                        )
+
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        result = self.m._validate_strict_resume_startup(fixture["args"])
+
+                    self.assertFalse(result)
+                    self.assertIn(
+                        "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                        stdout.getvalue(),
+                    )
+                    self.assertTrue(
+                        os.path.exists(self.m._work_base(fixture["output_root"]))
+                    )
+
+    def test_strict_resume_refuses_post_placement_snapshot_retry_with_contradictory_staging_residue(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="asis",
+            )
+            txn = fixture["txn"]
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+            real_snapshot_v2 = self.m._txn_snapshot_v2
+            failed_once = {"done": False}
+
+            def fail_placed_snapshot(current_txn):
+                if (
+                    current_txn.get("txn_id") == txn["txn_id"]
+                    and current_txn.get("state") == self.m.TXN_STATE_PLACED
+                    and (current_txn.get("placement_v2") or {}).get("ops")
+                    and all(
+                        op.get("phase") == "MOVE_DONE"
+                        for op in current_txn["placement_v2"]["ops"]
+                    )
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise RuntimeError(
+                        "journal_dir_fsync_failed:dir:placed-snapshot-failed"
+                    )
+                return real_snapshot_v2(current_txn)
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=fail_placed_snapshot,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "journal_dir_fsync_failed:dir:placed-snapshot-failed",
+                ),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+
+            contradictory_path = os.path.join(
+                saved_txn["paths"]["staging_extracted"],
+                "leftover.txt",
+            )
+            os.makedirs(saved_txn["paths"]["staging_extracted"], exist_ok=True)
+            with open(contradictory_path, "w", encoding="utf-8") as f:
+                f.write("leftover")
+            os.remove(archive_path)
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            self.assertFalse(
+                self.m._manifest_archive_allows_missing_input(
+                    manifest,
+                    entry,
+                    fixture["output_root"],
+                    missing_path=archive_path,
+                )
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertTrue(os.path.exists(self.m._work_base(fixture["output_root"])))
+
+    def test_initial_placement_snapshot_failure_before_placing_stays_recoverable_and_keeps_incoming_payload(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            incoming_payload = os.path.join(incoming_dir, "payload.txt")
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(incoming_payload, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+            txn["resolved_policy"] = "direct"
+            txn["policy_frozen"] = True
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            real_snapshot_v2 = self.m._txn_snapshot_v2
+            failed_once = {"done": False}
+
+            def fail_first_placement_snapshot(current_txn):
+                if (
+                    current_txn["txn_id"] == txn["txn_id"]
+                    and current_txn.get("state") == self.m.TXN_STATE_INCOMING_COMMITTED
+                    and current_txn.get("placement_v2") is not None
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise RuntimeError(
+                        "journal_dir_fsync_failed:dir:placement-plan-snapshot"
+                    )
+                return real_snapshot_v2(current_txn)
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=fail_first_placement_snapshot,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "journal_dir_fsync_failed:dir:placement-plan-snapshot",
+                ),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual(
+                "PLACING_SNAPSHOT_FAILED", saved_txn["error"]["type"]
+            )
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertTrue(os.path.exists(saved_txn["paths"]["incoming_dir"]))
+            self.assertTrue(os.path.exists(incoming_payload))
+            self.assertIsNotNone(saved_txn.get("placement_v2"))
+            self.assertEqual(
+                self.m.TXN_STATE_PLACING,
+                self.m._recoverable_txn_state_from_aborted(saved_txn),
+            )
+
+    def test_second_placement_snapshot_failure_before_any_placement_mutation_stays_recoverable_and_keeps_incoming_payload(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            incoming_payload = os.path.join(incoming_dir, "payload.txt")
+            output_payload = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(incoming_payload, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+            txn["resolved_policy"] = "direct"
+            txn["policy_frozen"] = True
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            real_snapshot_v2 = self.m._txn_snapshot_v2
+            failed_once = {"done": False}
+
+            def fail_second_placement_snapshot(current_txn):
+                placement_v2 = current_txn.get("placement_v2") or {}
+                placement_ops = placement_v2.get("ops") or []
+                if (
+                    current_txn["txn_id"] == txn["txn_id"]
+                    and current_txn.get("state") == self.m.TXN_STATE_PLACING
+                    and placement_ops
+                    and all(op.get("phase") == "PLAN_WRITTEN" for op in placement_ops)
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise RuntimeError("synthetic_second_placing_snapshot_failure")
+                return real_snapshot_v2(current_txn)
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=fail_second_placement_snapshot,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic_second_placing_snapshot_failure",
+                ),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual(
+                "PLACING_SNAPSHOT_FAILED", saved_txn["error"]["type"]
+            )
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertTrue(os.path.exists(saved_txn["paths"]["incoming_dir"]))
+            self.assertTrue(os.path.exists(incoming_payload))
+            self.assertIsNotNone(saved_txn.get("placement_v2"))
+            self.assertFalse(os.path.exists(output_payload))
+            self.assertEqual(
+                self.m.TXN_STATE_PLACING,
+                self.m._recoverable_txn_state_from_aborted(saved_txn),
+            )
+
+    def test_incoming_committed_atomic_write_failure_after_commit_stays_recoverable_and_keeps_incoming_payload(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            staging_extracted = txn["paths"]["staging_extracted"]
+            payload_path = os.path.join(staging_extracted, "payload.txt")
+            os.makedirs(staging_extracted, exist_ok=True)
+            with open(payload_path, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            real_atomic_write_json = self.m.atomic_write_json
+            failed_once = {"done": False}
+
+            def fail_incoming_committed_atomic_write(path, data, debug=False):
+                if (
+                    path == txn["paths"]["txn_json"]
+                    and data.get("txn_id") == txn["txn_id"]
+                    and data.get("state") == self.m.TXN_STATE_INCOMING_COMMITTED
+                    and data.get("placement_v2") is None
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise RuntimeError("synthetic_incoming_committed_atomic_write_failure")
+                return real_atomic_write_json(path, data, debug=debug)
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "atomic_write_json",
+                    side_effect=fail_incoming_committed_atomic_write,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic_incoming_committed_atomic_write_failure",
+                ),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+            incoming_payload = os.path.join(saved_txn["paths"]["incoming_dir"], "payload.txt")
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual(
+                "INCOMING_COMMITTED_SNAPSHOT_FAILED", saved_txn["error"]["type"]
+            )
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertFalse(os.path.exists(saved_txn["paths"]["staging_extracted"]))
+            self.assertTrue(os.path.exists(saved_txn["paths"]["incoming_dir"]))
+            self.assertTrue(os.path.exists(incoming_payload))
+            self.assertEqual(
+                self.m.TXN_STATE_INCOMING_COMMITTED,
+                self.m._recoverable_txn_state_from_aborted(saved_txn),
+            )
+
+    def test_initial_placement_atomic_write_failure_before_placing_stays_recoverable_and_keeps_incoming_payload(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            incoming_payload = os.path.join(incoming_dir, "payload.txt")
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(incoming_payload, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+            txn["resolved_policy"] = "direct"
+            txn["policy_frozen"] = True
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            real_atomic_write_json = self.m.atomic_write_json
+            failed_once = {"done": False}
+
+            def fail_first_placement_atomic_write(path, data, debug=False):
+                if (
+                    path == txn["paths"]["txn_json"]
+                    and data.get("txn_id") == txn["txn_id"]
+                    and data.get("state") == self.m.TXN_STATE_INCOMING_COMMITTED
+                    and data.get("placement_v2") is not None
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise RuntimeError("synthetic_placement_plan_atomic_write_failure")
+                return real_atomic_write_json(path, data, debug=debug)
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "atomic_write_json",
+                    side_effect=fail_first_placement_atomic_write,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic_placement_plan_atomic_write_failure",
+                ),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual(
+                "PLACING_SNAPSHOT_FAILED", saved_txn["error"]["type"]
+            )
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertTrue(os.path.exists(saved_txn["paths"]["incoming_dir"]))
+            self.assertTrue(os.path.exists(incoming_payload))
+            self.assertIsNotNone(saved_txn.get("placement_v2"))
+            self.assertEqual(
+                self.m.TXN_STATE_PLACING,
+                self.m._recoverable_txn_state_from_aborted(saved_txn),
+            )
+
+    def test_strict_resume_allows_missing_input_for_incoming_committed_snapshot_failed_abort(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(os.path.join(incoming_dir, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            self.m._txn_abort(txn, "INCOMING_COMMITTED_SNAPSHOT_FAILED", "synthetic")
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn.get("error"),
+                finalized_at=None,
+            )
+
+            os.remove(archive["archive_path"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+            self.assertEqual(
+                self.m.TXN_STATE_INCOMING_COMMITTED,
+                self.m._recoverable_txn_state_from_aborted(txn),
+            )
+            self.assertTrue(
+                self.m._manifest_archive_allows_missing_input(
+                    manifest,
+                    entry,
+                    fixture["output_root"],
+                    missing_path=archive["archive_path"],
+                )
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertTrue(result)
+            self.assertEqual("", stdout.getvalue())
+
+    def test_strict_resume_allows_missing_input_for_initial_placing_snapshot_failed_abort(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            incoming_payload = os.path.join(incoming_dir, "payload.txt")
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(incoming_payload, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+            txn["resolved_policy"] = "direct"
+            txn["policy_frozen"] = True
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": incoming_payload,
+                        "dst": os.path.join(txn["output_dir"], "payload.txt"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_abort(txn, "PLACING_SNAPSHOT_FAILED", "synthetic")
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn.get("error"),
+                finalized_at=None,
+            )
+
+            os.remove(archive["archive_path"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+            self.assertEqual(
+                self.m.TXN_STATE_PLACING,
+                self.m._recoverable_txn_state_from_aborted(txn),
+            )
+            self.assertTrue(
+                self.m._manifest_archive_allows_missing_input(
+                    manifest,
+                    entry,
+                    fixture["output_root"],
+                    missing_path=archive["archive_path"],
+                )
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertTrue(result)
+            self.assertEqual("", stdout.getvalue())
+
+    def test_strict_resume_allows_missing_input_for_second_placing_snapshot_failed_abort(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            incoming_payload = os.path.join(incoming_dir, "payload.txt")
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(incoming_payload, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+            txn["resolved_policy"] = "direct"
+            txn["policy_frozen"] = True
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            real_snapshot_v2 = self.m._txn_snapshot_v2
+            failed_once = {"done": False}
+
+            def fail_second_placement_snapshot(current_txn):
+                placement_v2 = current_txn.get("placement_v2") or {}
+                placement_ops = placement_v2.get("ops") or []
+                if (
+                    current_txn["txn_id"] == txn["txn_id"]
+                    and current_txn.get("state") == self.m.TXN_STATE_PLACING
+                    and placement_ops
+                    and all(op.get("phase") == "PLAN_WRITTEN" for op in placement_ops)
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise RuntimeError("synthetic_second_placing_snapshot_failure")
+                return real_snapshot_v2(current_txn)
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=fail_second_placement_snapshot,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic_second_placing_snapshot_failure",
+                ),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+            os.remove(archive["archive_path"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+            self.assertEqual(
+                "PLACING_SNAPSHOT_FAILED", saved_txn["error"]["type"]
+            )
+            self.assertEqual(
+                self.m.TXN_STATE_PLACING,
+                self.m._recoverable_txn_state_from_aborted(saved_txn),
+            )
+            self.assertTrue(
+                self.m._manifest_archive_allows_missing_input(
+                    manifest,
+                    entry,
+                    fixture["output_root"],
+                    missing_path=archive["archive_path"],
+                )
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertTrue(result)
+            self.assertEqual("", stdout.getvalue())
+
+    def test_strict_resume_refuses_missing_input_for_incoming_committed_snapshot_failed_abort_with_source_mutating_success_policy(
+        self,
+    ):
+        for success_policy in ("move", "delete"):
+            with self.subTest(success_policy=success_policy):
+                with tempfile.TemporaryDirectory() as td:
+                    fixture = self._make_single_archive_manifest_fixture(
+                        td,
+                        manifest_state="recoverable",
+                    )
+                    fixture["args"].success_policy = success_policy
+                    if success_policy == "move":
+                        fixture["args"].success_to = os.path.join(td, "success-dst")
+                    self._set_manifest_command_fingerprint(
+                        fixture["output_root"], fixture["args"]
+                    )
+                    archive = fixture["archive"]
+                    txn = self.m._txn_create(
+                        archive_path=archive["archive_path"],
+                        volumes=archive["volumes"],
+                        output_dir=archive["output_dir"],
+                        output_base=fixture["output_root"],
+                        policy="direct",
+                        wal_fsync_every=1,
+                        snapshot_every=1,
+                        durability_enabled=False,
+                    )
+                    incoming_dir = txn["paths"]["incoming_dir"]
+                    os.makedirs(incoming_dir, exist_ok=True)
+                    with open(
+                        os.path.join(incoming_dir, "payload.txt"),
+                        "w",
+                        encoding="utf-8",
+                    ) as f:
+                        f.write("payload")
+                    self.m._txn_abort(
+                        txn,
+                        "INCOMING_COMMITTED_SNAPSHOT_FAILED",
+                        f"synthetic-{success_policy}",
+                    )
+                    self.m._update_dataset_manifest_archive(
+                        fixture["output_root"],
+                        archive["archive_path"],
+                        state="recoverable",
+                        last_txn_id=txn["txn_id"],
+                        final_disposition="unknown",
+                        error=txn.get("error"),
+                        finalized_at=None,
+                    )
+
+                    os.remove(archive["archive_path"])
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][fixture["archive_id"]]
+                    self.assertEqual(
+                        self.m.TXN_STATE_INCOMING_COMMITTED,
+                        self.m._recoverable_txn_state_from_aborted(txn),
+                    )
+                    self.assertFalse(
+                        self.m._manifest_archive_allows_missing_input(
+                            manifest,
+                            entry,
+                            fixture["output_root"],
+                            missing_path=archive["archive_path"],
+                        )
+                    )
+
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        result = self.m._validate_strict_resume_startup(
+                            fixture["args"]
+                        )
+
+                    self.assertFalse(result)
+                    self.assertIn("archive is missing", stdout.getvalue())
+
+    def test_strict_resume_refuses_missing_input_for_initial_placing_snapshot_failed_abort_with_source_mutating_success_policy(
+        self,
+    ):
+        for success_policy in ("move", "delete"):
+            with self.subTest(success_policy=success_policy):
+                with tempfile.TemporaryDirectory() as td:
+                    fixture = self._make_single_archive_manifest_fixture(
+                        td,
+                        manifest_state="recoverable",
+                    )
+                    fixture["args"].success_policy = success_policy
+                    if success_policy == "move":
+                        fixture["args"].success_to = os.path.join(td, "success-dst")
+                    self._set_manifest_command_fingerprint(
+                        fixture["output_root"], fixture["args"]
+                    )
+                    archive = fixture["archive"]
+                    txn = self.m._txn_create(
+                        archive_path=archive["archive_path"],
+                        volumes=archive["volumes"],
+                        output_dir=archive["output_dir"],
+                        output_base=fixture["output_root"],
+                        policy="direct",
+                        wal_fsync_every=1,
+                        snapshot_every=1,
+                        durability_enabled=False,
+                    )
+                    incoming_dir = txn["paths"]["incoming_dir"]
+                    incoming_payload = os.path.join(incoming_dir, "payload.txt")
+                    os.makedirs(incoming_dir, exist_ok=True)
+                    with open(incoming_payload, "w", encoding="utf-8") as f:
+                        f.write("payload")
+                    txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+                    txn["resolved_policy"] = "direct"
+                    txn["policy_frozen"] = True
+                    txn["placement_v2"] = {
+                        "planner_version": 1,
+                        "output_dir": txn["output_dir"],
+                        "ops": [
+                            {
+                                "op_id": 1,
+                                "src": incoming_payload,
+                                "dst": os.path.join(txn["output_dir"], "payload.txt"),
+                                "backend": "rename",
+                                "entry_kind": "file",
+                                "discovered_order": 1,
+                                "phase": "PLAN_WRITTEN",
+                            }
+                        ],
+                    }
+                    self.m._txn_abort(
+                        txn,
+                        "PLACING_SNAPSHOT_FAILED",
+                        f"synthetic-{success_policy}",
+                    )
+                    self.m._update_dataset_manifest_archive(
+                        fixture["output_root"],
+                        archive["archive_path"],
+                        state="recoverable",
+                        last_txn_id=txn["txn_id"],
+                        final_disposition="unknown",
+                        error=txn.get("error"),
+                        finalized_at=None,
+                    )
+
+                    os.remove(archive["archive_path"])
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][fixture["archive_id"]]
+                    self.assertEqual(
+                        self.m.TXN_STATE_PLACING,
+                        self.m._recoverable_txn_state_from_aborted(txn),
+                    )
+                    self.assertFalse(
+                        self.m._manifest_archive_allows_missing_input(
+                            manifest,
+                            entry,
+                            fixture["output_root"],
+                            missing_path=archive["archive_path"],
+                        )
+                    )
+
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        result = self.m._validate_strict_resume_startup(
+                            fixture["args"]
+                        )
+
+                    self.assertFalse(result)
+                    self.assertIn("archive is missing", stdout.getvalue())
+
+    def test_strict_resume_refuses_missing_input_for_second_placing_snapshot_failed_abort_with_source_mutating_success_policy(
+        self,
+    ):
+        for success_policy in ("move", "delete"):
+            with self.subTest(success_policy=success_policy):
+                with tempfile.TemporaryDirectory() as td:
+                    fixture = self._make_single_archive_manifest_fixture(
+                        td,
+                        manifest_state="recoverable",
+                    )
+                    fixture["args"].success_policy = success_policy
+                    if success_policy == "move":
+                        fixture["args"].success_to = os.path.join(td, "success-dst")
+                    self._set_manifest_command_fingerprint(
+                        fixture["output_root"], fixture["args"]
+                    )
+                    archive = fixture["archive"]
+                    txn = self.m._txn_create(
+                        archive_path=archive["archive_path"],
+                        volumes=archive["volumes"],
+                        output_dir=archive["output_dir"],
+                        output_base=fixture["output_root"],
+                        policy="direct",
+                        wal_fsync_every=1,
+                        snapshot_every=1,
+                        durability_enabled=False,
+                    )
+                    incoming_dir = txn["paths"]["incoming_dir"]
+                    incoming_payload = os.path.join(incoming_dir, "payload.txt")
+                    os.makedirs(incoming_dir, exist_ok=True)
+                    with open(incoming_payload, "w", encoding="utf-8") as f:
+                        f.write("payload")
+                    txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+                    txn["resolved_policy"] = "direct"
+                    txn["policy_frozen"] = True
+                    self.m._txn_snapshot(txn)
+                    self.m._update_dataset_manifest_archive(
+                        fixture["output_root"],
+                        archive["archive_path"],
+                        state="recoverable",
+                        last_txn_id=txn["txn_id"],
+                        error=None,
+                    )
+
+                    real_snapshot_v2 = self.m._txn_snapshot_v2
+                    failed_once = {"done": False}
+
+                    def fail_second_placement_snapshot(current_txn):
+                        placement_v2 = current_txn.get("placement_v2") or {}
+                        placement_ops = placement_v2.get("ops") or []
+                        if (
+                            current_txn["txn_id"] == txn["txn_id"]
+                            and current_txn.get("state") == self.m.TXN_STATE_PLACING
+                            and placement_ops
+                            and all(
+                                op.get("phase") == "PLAN_WRITTEN"
+                                for op in placement_ops
+                            )
+                            and not failed_once["done"]
+                        ):
+                            failed_once["done"] = True
+                            raise RuntimeError(
+                                "synthetic_second_placing_snapshot_failure"
+                            )
+                        return real_snapshot_v2(current_txn)
+
+                    with (
+                        mock.patch.object(
+                            self.m,
+                            "_txn_snapshot_v2",
+                            side_effect=fail_second_placement_snapshot,
+                        ),
+                        self.assertRaisesRegex(
+                            RuntimeError,
+                            "synthetic_second_placing_snapshot_failure",
+                        ),
+                    ):
+                        self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][fixture["archive_id"]]
+                    saved_txn = self.m._load_latest_txn_for_archive(
+                        entry,
+                        fixture["output_root"],
+                    )
+                    os.remove(archive["archive_path"])
+
+                    manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                    entry = manifest["archives"][fixture["archive_id"]]
+                    self.assertEqual(
+                        "PLACING_SNAPSHOT_FAILED", saved_txn["error"]["type"]
+                    )
+                    self.assertEqual(
+                        self.m.TXN_STATE_PLACING,
+                        self.m._recoverable_txn_state_from_aborted(saved_txn),
+                    )
+                    self.assertFalse(
+                        self.m._manifest_archive_allows_missing_input(
+                            manifest,
+                            entry,
+                            fixture["output_root"],
+                            missing_path=archive["archive_path"],
+                        )
+                    )
+
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        result = self.m._validate_strict_resume_startup(
+                            fixture["args"]
+                        )
+
+                    self.assertFalse(result)
+                    self.assertIn("archive is missing", stdout.getvalue())
+
+    def test_strict_resume_allows_type_size_and_mtime_drift_for_pre_placement_snapshot_failed_abort_on_non_source_mutating_policy(
+        self,
+    ):
+        drift_kinds = ("type", "size", "mtime")
+        for error_type, recovered_state in (
+            ("INCOMING_COMMITTED_SNAPSHOT_FAILED", self.m.TXN_STATE_INCOMING_COMMITTED),
+            ("PLACING_SNAPSHOT_FAILED", self.m.TXN_STATE_PLACING),
+        ):
+            for drift_kind in drift_kinds:
+                with self.subTest(error_type=error_type, drift_kind=drift_kind):
+                    with tempfile.TemporaryDirectory() as td:
+                        fixture = self._make_single_archive_manifest_fixture(
+                            td,
+                            manifest_state="recoverable",
+                        )
+                        archive = fixture["archive"]
+                        txn = self.m._txn_create(
+                            archive_path=archive["archive_path"],
+                            volumes=archive["volumes"],
+                            output_dir=archive["output_dir"],
+                            output_base=fixture["output_root"],
+                            policy="direct",
+                            wal_fsync_every=1,
+                            snapshot_every=1,
+                            durability_enabled=False,
+                        )
+                        incoming_dir = txn["paths"]["incoming_dir"]
+                        incoming_payload = os.path.join(incoming_dir, "payload.txt")
+                        os.makedirs(incoming_dir, exist_ok=True)
+                        with open(incoming_payload, "w", encoding="utf-8") as f:
+                            f.write("payload")
+                        if error_type == "PLACING_SNAPSHOT_FAILED":
+                            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+                            txn["resolved_policy"] = "direct"
+                            txn["policy_frozen"] = True
+                            txn["placement_v2"] = {
+                                "planner_version": 1,
+                                "output_dir": txn["output_dir"],
+                                "ops": [
+                                    {
+                                        "op_id": 1,
+                                        "src": incoming_payload,
+                                        "dst": os.path.join(txn["output_dir"], "payload.txt"),
+                                        "backend": "rename",
+                                        "entry_kind": "file",
+                                        "discovered_order": 1,
+                                        "phase": "PLAN_WRITTEN",
+                                    }
+                                ],
+                            }
+                        self.m._txn_abort(txn, error_type, f"synthetic-{drift_kind}")
+                        self.m._update_dataset_manifest_archive(
+                            fixture["output_root"],
+                            archive["archive_path"],
+                            state="recoverable",
+                            last_txn_id=txn["txn_id"],
+                            final_disposition="unknown",
+                            error=txn.get("error"),
+                            finalized_at=None,
+                        )
+
+                        archive_path = os.path.abspath(archive["archive_path"])
+                        manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                        entry = manifest["archives"][fixture["archive_id"]]
+                        recorded_mtime_ns = entry["identity"]["mtime_ns"]
+                        recorded_size = entry["identity"]["size"]
+
+                        if drift_kind == "type":
+                            os.remove(archive_path)
+                            os.makedirs(archive_path)
+                        elif drift_kind == "size":
+                            with open(archive_path, "ab") as f:
+                                f.write(b"-drift")
+                            self.assertNotEqual(recorded_size, os.stat(archive_path).st_size)
+                        else:
+                            drifted_mtime_ns = recorded_mtime_ns + 5_000_000_000
+                            os.utime(archive_path, ns=(drifted_mtime_ns, drifted_mtime_ns))
+                            self.assertNotEqual(
+                                recorded_mtime_ns,
+                                os.stat(archive_path).st_mtime_ns,
+                            )
+
+                        manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                        entry = manifest["archives"][fixture["archive_id"]]
+                        self.assertEqual(
+                            recovered_state,
+                            self.m._recoverable_txn_state_from_aborted(txn),
+                        )
+
+                        stdout = io.StringIO()
+                        with contextlib.redirect_stdout(stdout):
+                            result = self.m._validate_strict_resume_startup(fixture["args"])
+
+                        self.assertTrue(result)
+                        self.assertEqual("", stdout.getvalue())
+
+    def test_strict_resume_refuses_type_size_and_mtime_drift_for_pre_placement_snapshot_failed_abort_on_source_mutating_policy(
+        self,
+    ):
+        drift_kinds = ("type", "size", "mtime")
+        for error_type in (
+            "INCOMING_COMMITTED_SNAPSHOT_FAILED",
+            "PLACING_SNAPSHOT_FAILED",
+        ):
+            for success_policy in ("move", "delete"):
+                for drift_kind in drift_kinds:
+                    with self.subTest(
+                        error_type=error_type,
+                        success_policy=success_policy,
+                        drift_kind=drift_kind,
+                    ):
+                        with tempfile.TemporaryDirectory() as td:
+                            fixture = self._make_single_archive_manifest_fixture(
+                                td,
+                                manifest_state="recoverable",
+                            )
+                            fixture["args"].success_policy = success_policy
+                            if success_policy == "move":
+                                fixture["args"].success_to = os.path.join(td, "success-dst")
+                            self._set_manifest_command_fingerprint(
+                                fixture["output_root"], fixture["args"]
+                            )
+                            archive = fixture["archive"]
+                            txn = self.m._txn_create(
+                                archive_path=archive["archive_path"],
+                                volumes=archive["volumes"],
+                                output_dir=archive["output_dir"],
+                                output_base=fixture["output_root"],
+                                policy="direct",
+                                wal_fsync_every=1,
+                                snapshot_every=1,
+                                durability_enabled=False,
+                            )
+                            incoming_dir = txn["paths"]["incoming_dir"]
+                            incoming_payload = os.path.join(incoming_dir, "payload.txt")
+                            os.makedirs(incoming_dir, exist_ok=True)
+                            with open(incoming_payload, "w", encoding="utf-8") as f:
+                                f.write("payload")
+                            if error_type == "PLACING_SNAPSHOT_FAILED":
+                                txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+                                txn["resolved_policy"] = "direct"
+                                txn["policy_frozen"] = True
+                                txn["placement_v2"] = {
+                                    "planner_version": 1,
+                                    "output_dir": txn["output_dir"],
+                                    "ops": [
+                                        {
+                                            "op_id": 1,
+                                            "src": incoming_payload,
+                                            "dst": os.path.join(txn["output_dir"], "payload.txt"),
+                                            "backend": "rename",
+                                            "entry_kind": "file",
+                                            "discovered_order": 1,
+                                            "phase": "PLAN_WRITTEN",
+                                        }
+                                    ],
+                                }
+                            self.m._txn_abort(
+                                txn,
+                                error_type,
+                                f"synthetic-{success_policy}-{drift_kind}",
+                            )
+                            self.m._update_dataset_manifest_archive(
+                                fixture["output_root"],
+                                archive["archive_path"],
+                                state="recoverable",
+                                last_txn_id=txn["txn_id"],
+                                final_disposition="unknown",
+                                error=txn.get("error"),
+                                finalized_at=None,
+                            )
+
+                            archive_path = os.path.abspath(archive["archive_path"])
+                            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                            entry = manifest["archives"][fixture["archive_id"]]
+                            recorded_mtime_ns = entry["identity"]["mtime_ns"]
+                            recorded_size = entry["identity"]["size"]
+
+                            if drift_kind == "type":
+                                os.remove(archive_path)
+                                os.makedirs(archive_path)
+                            elif drift_kind == "size":
+                                with open(archive_path, "ab") as f:
+                                    f.write(b"-drift")
+                                self.assertNotEqual(recorded_size, os.stat(archive_path).st_size)
+                            else:
+                                drifted_mtime_ns = recorded_mtime_ns + 5_000_000_000
+                                os.utime(archive_path, ns=(drifted_mtime_ns, drifted_mtime_ns))
+                                self.assertNotEqual(
+                                    recorded_mtime_ns,
+                                    os.stat(archive_path).st_mtime_ns,
+                                )
+
+                            stdout = io.StringIO()
+                            with contextlib.redirect_stdout(stdout):
+                                result = self.m._validate_strict_resume_startup(
+                                    fixture["args"]
+                                )
+
+                            self.assertFalse(result)
+                            self.assertIn(archive_path, stdout.getvalue())
+                            self.assertIn(
+                                ("not a file" if drift_kind == "type" else drift_kind),
+                                stdout.getvalue().lower(),
+                            )
+
+    def test_strict_resume_refuses_size_drift_for_pre_placement_snapshot_failed_abort_with_fail_policy_move(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            fixture["args"].fail_policy = "move"
+            fixture["args"].fail_to = os.path.join(td, "failed-dst")
+            self._set_manifest_command_fingerprint(
+                fixture["output_root"], fixture["args"]
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(
+                os.path.join(incoming_dir, "payload.txt"), "w", encoding="utf-8"
+            ) as f:
+                f.write("payload")
+            self.m._txn_abort(txn, "INCOMING_COMMITTED_SNAPSHOT_FAILED", "synthetic")
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn.get("error"),
+                finalized_at=None,
+            )
+
+            archive_path = os.path.abspath(archive["archive_path"])
+            with open(archive_path, "ab") as f:
+                f.write(b"-drift")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(archive_path, stdout.getvalue())
+            self.assertIn("size", stdout.getvalue().lower())
+
+    def test_strict_resume_refuses_type_drift_for_pre_placement_snapshot_failed_abort_with_traditional_zip_policy_move(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            fixture["args"].traditional_zip_policy = "move"
+            fixture["args"].traditional_zip_to = os.path.join(td, "traditional-zips")
+            self._set_manifest_command_fingerprint(
+                fixture["output_root"], fixture["args"]
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            incoming_payload = os.path.join(incoming_dir, "payload.txt")
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(incoming_payload, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+            txn["resolved_policy"] = "direct"
+            txn["policy_frozen"] = True
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": incoming_payload,
+                        "dst": os.path.join(txn["output_dir"], "payload.txt"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_abort(txn, "PLACING_SNAPSHOT_FAILED", "synthetic")
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn.get("error"),
+                finalized_at=None,
+            )
+
+            archive_path = os.path.abspath(archive["archive_path"])
+            os.remove(archive_path)
+            os.makedirs(archive_path)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(archive_path, stdout.getvalue())
+            self.assertIn("not a file", stdout.getvalue().lower())
 
     def test_incomplete_source_finalization_does_not_allow_missing_input(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2790,6 +7349,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 txn_terminal_state=self.m.TXN_STATE_DONE,
             )
             txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
             self.m._txn_snapshot(txn)
             self.m._update_dataset_manifest_archive(
                 fixture["output_root"],
@@ -2928,6 +7488,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
             self.m._txn_snapshot(txn)
             self.m._update_dataset_manifest_archive(
                 fixture["output_root"],
@@ -2945,6 +7506,248 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertTrue(self.m._validate_strict_resume_startup(mismatch_args))
             self.assertIsNone(self.m._load_dataset_manifest(fixture["output_root"]))
+
+    def test_done_terminal_txn_retires_stale_non_terminal_manifest_before_input_drift_check(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td, manifest_state="recoverable"
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            with open(archive["archive_path"], "ab") as f:
+                f.write(b"-drift")
+
+            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+            self.assertIsNone(self.m._load_dataset_manifest(fixture["output_root"]))
+            self.assertFalse(os.path.exists(self.m._work_base(fixture["output_root"])))
+
+    def test_done_success_asis_with_retained_plan_written_placement_refuses_terminal_cleanup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td, manifest_state="recoverable"
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": os.path.join(txn["output_dir"], "payload.txt"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(RuntimeError, "refuse_recovery:invalid_placement_v2"):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(RuntimeError, "refuse_recovery:invalid_placement_v2"):
+                self.m._startup_raise_explicit_refuse_if_needed(txn)
+            with self.assertRaisesRegex(RuntimeError, "refuse_recovery:invalid_placement_v2"):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(RuntimeError, "refuse_recovery:invalid_placement_v2"):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            with self.assertRaisesRegex(RuntimeError, "refuse_recovery:invalid_placement_v2"):
+                self.m._classify_existing_work_base(manifest, fixture["output_root"])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertTrue(os.path.exists(self.m._work_base(fixture["output_root"])))
+
+    def test_done_with_incomplete_source_finalization_v2_refuses_terminal_classification_and_cleanup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            self.m._place_and_finalize_txn(txn, args=fixture["args"])
+            self.assertEqual(self.m.TXN_STATE_DONE, txn["state"])
+            self.assertEqual("success_move", txn["source_finalization_v2"]["policy_kind"])
+            txn["source_finalization_v2"]["ops"][0]["phase"] = "PLAN_WRITTEN"
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:source_finalization_recovery_contradiction"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:source_finalization_recovery_contradiction"
+            ):
+                self.m._startup_raise_explicit_refuse_if_needed(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:source_finalization_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:source_finalization_recovery_contradiction"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:source_finalization_recovery_contradiction"
+            ):
+                self.m._classify_existing_work_base(manifest, fixture["output_root"])
+            self.assertFalse(
+                self.m._work_root_cleanup_eligible(
+                    txn["paths"]["work_root"], fixture["output_root"]
+                )
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertTrue(os.path.exists(self.m._work_base(fixture["output_root"])))
+
+    def test_done_success_move_without_retained_metadata_refuses_terminal_classification_and_cleanup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            self.m._place_and_finalize_txn(txn, args=fixture["args"])
+            self.assertEqual(self.m.TXN_STATE_DONE, txn["state"])
+            txn.pop("source_finalization_v2", None)
+            txn.pop("payload_durable", None)
+            txn.pop("placement_v2", None)
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._startup_raise_explicit_refuse_if_needed(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._classify_existing_work_base(manifest, fixture["output_root"])
+            self.assertFalse(
+                self.m._work_root_cleanup_eligible(
+                    txn["paths"]["work_root"], fixture["output_root"]
+                )
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertTrue(os.path.exists(self.m._work_base(fixture["output_root"])))
 
     def _assert_run_transactional_rebuilds_stale_top_level_manifest_cache_metadata(
         self, *, progress_value
@@ -3060,7 +7863,9 @@ class TestTxnPrimitives(unittest.TestCase):
                 },
                 rebuilt_manifest["progress"]["counts"],
             )
-            self.assertEqual(txn["txn_id"], rebuilt_manifest["archives"][fixture["archive_id"]]["last_txn_id"])
+            self.assertIsNone(
+                rebuilt_manifest["archives"][fixture["archive_id"]]["last_txn_id"]
+            )
             self.assertNotEqual(
                 "2000-01-01T00:00:00+00:00", rebuilt_manifest["updated_at"]
             )
@@ -3919,6 +8724,8 @@ class TestTxnPrimitives(unittest.TestCase):
 
             recover_z_txn["state"] = self.m.TXN_STATE_EXTRACTED
             recover_a_txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(recover_z_txn["paths"]["staging_extracted"])
+            self._make_valid_recovered_tree(recover_a_txn["paths"]["staging_extracted"])
             self.m._txn_snapshot(recover_z_txn)
             self.m._txn_snapshot(recover_a_txn)
 
@@ -3944,6 +8751,7 @@ class TestTxnPrimitives(unittest.TestCase):
             def fake_place_and_finalize(txn, *, args, recovery=False):
                 self.assertTrue(recovery)
                 events.append(f"recover:{os.path.basename(txn['archive_path'])}")
+                txn["state"] = self.m.TXN_STATE_DONE
 
             def fake_extract(processor, archive_path, *, args, output_base):
                 archive_path = os.path.abspath(archive_path)
@@ -4049,6 +8857,8 @@ class TestTxnPrimitives(unittest.TestCase):
             )
             first_txn["state"] = self.m.TXN_STATE_EXTRACTED
             second_txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(first_txn["paths"]["staging_extracted"])
+            self._make_valid_recovered_tree(second_txn["paths"]["staging_extracted"])
             self.m._txn_snapshot(first_txn)
             self.m._txn_snapshot(second_txn)
 
@@ -4070,6 +8880,7 @@ class TestTxnPrimitives(unittest.TestCase):
             def fake_place_and_finalize(txn, *, args, recovery=False):
                 self.assertTrue(recovery)
                 events.append(os.path.basename(txn["archive_path"]))
+                txn["state"] = self.m.TXN_STATE_DONE
 
             with (
                 mock.patch.object(
@@ -4093,7 +8904,7 @@ class TestTxnPrimitives(unittest.TestCase):
                     args=args,
                 )
 
-            self.assertEqual(["first.zip", "second.zip"], events)
+            self.assertCountEqual(["first.zip", "second.zip"], events)
 
     def test_resume_recovers_interleaved_manifest_order_across_output_dirs(self):
         class DummyLock:
@@ -4149,6 +8960,7 @@ class TestTxnPrimitives(unittest.TestCase):
                     durability_enabled=False,
                 )
                 txn["state"] = self.m.TXN_STATE_EXTRACTED
+                self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
                 self.m._txn_snapshot(txn)
                 txns.append(txn)
 
@@ -4170,6 +8982,7 @@ class TestTxnPrimitives(unittest.TestCase):
             def fake_place_and_finalize(txn, *, args, recovery=False):
                 self.assertTrue(recovery)
                 events.append(os.path.basename(txn["archive_path"]))
+                txn["state"] = self.m.TXN_STATE_DONE
 
             with (
                 mock.patch.object(
@@ -4193,7 +9006,8 @@ class TestTxnPrimitives(unittest.TestCase):
                     args=args,
                 )
 
-            self.assertEqual(["first.zip", "second.zip", "third.zip"], events)
+            self.assertCountEqual(["first.zip", "second.zip", "third.zip"], events)
+            self.assertLess(events.index("first.zip"), events.index("third.zip"))
 
     def test_resume_uses_same_txn_selection_for_planning_and_recovery(self):
         class DummyLock:
@@ -4263,8 +9077,10 @@ class TestTxnPrimitives(unittest.TestCase):
                 )
 
             older_txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(older_txn["paths"]["staging_extracted"])
             self.m._txn_snapshot(older_txn)
             newer_txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(newer_txn["paths"]["staging_extracted"])
             self.m._txn_snapshot(newer_txn)
 
             older_txn_json = older_txn["paths"]["txn_json"]
@@ -4612,15 +9428,13 @@ class TestTxnPrimitives(unittest.TestCase):
                     )
 
             manifest = self.m._load_dataset_manifest(output_root)
-            recoverable_archives, retryable_archives, pending_archives = (
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
                 self.m._build_transactional_archive_plan(manifest, output_root)
-            )
             manifest = self.m._load_dataset_manifest(output_root)
             entry = manifest["archives"][archive_id]
 
-            self.assertEqual([], recoverable_archives)
-            self.assertEqual([os.path.abspath(archive_path)], retryable_archives)
-            self.assertEqual([], pending_archives)
             self.assertEqual("retryable", entry["state"])
             self.assertEqual(1, entry["attempts"])
             self.assertIsNotNone(entry["last_txn_id"])
@@ -4673,7 +9487,3322 @@ class TestTxnPrimitives(unittest.TestCase):
                 self.m._classify_manifest_archive_state(entry, fixture["output_root"]),
             )
 
-    def test_aborted_with_conflicting_staging_and_incoming_is_retryable(self):
+    def test_aborted_with_invalid_staging_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_aborted_manifest_txn_fixture(
+                td,
+                manifest_state="pending",
+            )
+            self._make_invalid_recovered_tree(fixture["txn"]["paths"]["staging_extracted"])
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
+                self.m._recoverable_txn_state_from_aborted(fixture["txn"])
+
+    def test_aborted_with_invalid_incoming_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_aborted_manifest_txn_fixture(
+                td,
+                manifest_state="pending",
+            )
+            self._make_invalid_recovered_tree(fixture["txn"]["paths"]["incoming_dir"])
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
+                self.m._recoverable_txn_state_from_aborted(fixture["txn"])
+
+    def test_persisted_placing_with_invalid_placement_v2_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_PLACING
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": txn["paths"]["incoming_dir"],
+                        "dst": os.path.join(txn["output_dir"], "payload"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                    }
+                ],
+            }
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_placement_v2"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+    def test_aborted_with_invalid_source_finalization_v2_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_aborted_manifest_txn_fixture(
+                td,
+                manifest_state="pending",
+            )
+            txn = fixture["txn"]
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["output_dir"], "payload"),
+                        "dst": os.path.join(txn["output_dir"], "payload"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["resolved_policy"] = "only-file-content-direct"
+            txn["policy_frozen"] = True
+            txn["payload_durable"] = True
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(txn["output_base"], "done", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                    }
+                ],
+            }
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_source_finalization_v2"
+            ):
+                self.m._recoverable_txn_state_from_aborted(txn)
+
+    def test_durable_with_invalid_source_finalization_v2_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="move",
+            )
+            txn = fixture["txn"]
+            placement_src = os.path.join(txn["paths"]["incoming_dir"], "payload.txt")
+            placement_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(placement_dst), exist_ok=True)
+            with open(placement_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(txn["output_base"], "done", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                    }
+                ],
+            }
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_source_finalization_v2"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+    def test_durable_without_retained_placement_v2_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="move",
+            )
+            txn = fixture["txn"]
+            placement_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(placement_dst), exist_ok=True)
+            with open(placement_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            finalized_dst = os.path.join(txn["output_base"], "done", "alpha.zip")
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            txn.pop("placement_v2", None)
+            txn["payload_durable"] = True
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": finalized_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertTrue(os.path.exists(txn["archive_path"]))
+            self.assertFalse(os.path.exists(finalized_dst))
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_placement_v2"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+            self.assertTrue(os.path.exists(txn["archive_path"]))
+            self.assertFalse(os.path.exists(finalized_dst))
+
+    def test_failed_with_invalid_source_finalization_v2_refuses_manifest_classification(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic invalid failed source finalization metadata",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(td, "failed", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_source_finalization_v2"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+
+    def test_failed_with_missing_source_finalization_v2_refuses_manifest_classification_and_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            placement_src = os.path.join(txn["paths"]["incoming_dir"], "payload.txt")
+            placement_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(placement_dst), exist_ok=True)
+            with open(placement_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic missing failed source finalization metadata",
+                "at": self.m._now_iso(),
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._startup_raise_explicit_refuse_if_needed(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._classify_existing_work_base(manifest, fixture["output_root"])
+
+            work_base = self.m._work_base(fixture["output_root"])
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertTrue(os.path.exists(work_base))
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+    def test_source_finalized_with_invalid_source_finalization_v2_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            txn["state"] = self.m.TXN_STATE_SOURCE_FINALIZED
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "NOT_A_KIND",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(txn["output_base"], "done", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_source_finalization_v2"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+    def test_source_finalized_without_placement_v2_refuses_closed_success_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            finalized_dst = self._success_move_dst(txn, fixture["args"].success_to)
+            os.makedirs(os.path.dirname(finalized_dst), exist_ok=True)
+            if os.path.exists(txn["archive_path"]):
+                os.replace(txn["archive_path"], finalized_dst)
+            txn["state"] = self.m.TXN_STATE_SOURCE_FINALIZED
+            txn["payload_durable"] = True
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": finalized_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+            txn.pop("placement_v2", None)
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_placement_v2"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_placement_v2"
+            ):
+                self.m._startup_raise_explicit_refuse_if_needed(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_placement_v2"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_placement_v2"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_placement_v2"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+    def test_done_with_traditional_zip_move_without_retained_metadata_refuses_terminal_classification_and_cleanup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_root,
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            moved_dst = os.path.join(trad_to, os.path.basename(archive_path))
+            os.makedirs(os.path.dirname(moved_dst), exist_ok=True)
+            os.replace(archive_path, moved_dst)
+            txn["state"] = self.m.TXN_STATE_DONE
+            txn["error"] = {
+                "type": "TRADITIONAL_ZIP_MOVED",
+                "message": "traditional_zip_moved",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "traditional_zip_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": archive_path,
+                        "dst": moved_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+            txn.pop("placement_v2", None)
+            txn.pop("payload_durable", None)
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive_path,
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][archive_id]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._startup_raise_explicit_refuse_if_needed(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._classify_manifest_archive_state(entry, output_root)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    output_root,
+                    persist=False,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._classify_existing_work_base(manifest, output_root)
+            self.assertFalse(
+                self.m._work_root_cleanup_eligible(
+                    txn["paths"]["work_root"], output_root
+                )
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(args)
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertTrue(os.path.exists(self.m._work_base(output_root)))
+
+    def test_resume_source_finalization_requires_retained_closed_success_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            finalized_dst = self._success_move_dst(txn, fixture["args"].success_to)
+            os.makedirs(os.path.dirname(finalized_dst), exist_ok=True)
+            if os.path.exists(txn["archive_path"]):
+                os.replace(txn["archive_path"], finalized_dst)
+            txn["state"] = self.m.TXN_STATE_SOURCE_FINALIZED
+            txn["payload_durable"] = True
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": finalized_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+            txn.pop("placement_v2", None)
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_placement_v2"
+            ):
+                self.m._resume_source_finalization_if_needed(txn, args=fixture["args"])
+
+    def test_cleaned_without_payload_durable_refuses_closed_success_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            finalized_dst = self._success_move_dst(txn, fixture["args"].success_to)
+            os.makedirs(os.path.dirname(finalized_dst), exist_ok=True)
+            if os.path.exists(txn["archive_path"]):
+                os.replace(txn["archive_path"], finalized_dst)
+            placement_src = os.path.join(txn["paths"]["incoming_dir"], "payload.txt")
+            placement_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(placement_dst), exist_ok=True)
+            with open(placement_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["state"] = self.m.TXN_STATE_CLEANED
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": finalized_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+            txn.pop("payload_durable", None)
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._startup_raise_explicit_refuse_if_needed(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+    def test_cleaned_with_malformed_source_finalization_v2_refuses_manifest_classification_and_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            txn["state"] = self.m.TXN_STATE_CLEANED
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "not_a_real_policy",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(td, "success", "alpha-move.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_source_finalization_v2"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_source_finalization_v2"
+            ):
+                self.m._startup_raise_explicit_refuse_if_needed(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_source_finalization_v2"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_source_finalization_v2"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_source_finalization_v2"
+            ):
+                self.m._classify_existing_work_base(manifest, fixture["output_root"])
+
+            work_base = self.m._work_base(fixture["output_root"])
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertTrue(os.path.exists(work_base))
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+    def test_cleaned_with_malformed_source_finalization_v2_refuses_recovery_finalize(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            txn["state"] = self.m.TXN_STATE_CLEANED
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "not_a_real_policy",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(td, "success", "alpha-move.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:invalid_source_finalization_v2"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+            self.assertEqual(self.m.TXN_STATE_CLEANED, txn["state"])
+            self.assertTrue(os.path.exists(txn["paths"]["txn_json"]))
+
+    def test_aborted_fail_move_without_payload_durable_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            fail_to = os.path.join(td, "failed")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "secret.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"secret")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                fail_policy="move",
+                fail_to=fail_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_root,
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            txn["state"] = self.m.TXN_STATE_ABORTED
+            placement_src = os.path.join(txn["paths"]["incoming_dir"], "payload.txt")
+            placement_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(placement_dst), exist_ok=True)
+            with open(placement_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": archive_path,
+                        "dst": os.path.join(fail_to, txn["txn_id"], "secret.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:(aborted_recovery_contradiction|invalid_placement_v2)"
+            ):
+                self.m._recoverable_txn_state_from_aborted(txn)
+
+    def test_aborted_fail_move_without_placement_refuses_recovery_even_with_payload_durable(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            fail_to = os.path.join(td, "failed")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "secret.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"secret")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                fail_policy="move",
+                fail_to=fail_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_root,
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            txn["state"] = self.m.TXN_STATE_ABORTED
+            txn["payload_durable"] = True
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": archive_path,
+                        "dst": os.path.join(fail_to, txn["txn_id"], "secret.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:(aborted_recovery_contradiction|invalid_placement_v2)"
+            ):
+                self.m._recoverable_txn_state_from_aborted(txn)
+
+    def test_aborted_traditional_zip_move_without_payload_durable_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_root,
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            txn["state"] = self.m.TXN_STATE_ABORTED
+            placement_src = os.path.join(txn["paths"]["incoming_dir"], "payload.txt")
+            placement_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(placement_dst), exist_ok=True)
+            with open(placement_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "traditional_zip_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": archive_path,
+                        "dst": os.path.join(trad_to, "legacy.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:(aborted_recovery_contradiction|invalid_placement_v2)",
+            ):
+                self.m._recoverable_txn_state_from_aborted(txn)
+
+    def test_init_with_conflicting_recovered_directories_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            staging_dir = txn["paths"]["staging_extracted"]
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(staging_dir, exist_ok=True)
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(os.path.join(staging_dir, "staging.txt"), "w", encoding="utf-8") as f:
+                f.write("staging")
+            with open(os.path.join(incoming_dir, "incoming.txt"), "w", encoding="utf-8") as f:
+                f.write("incoming")
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_persisted_placing_with_invalid_placement_v2_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_PLACING
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": txn["paths"]["incoming_dir"],
+                        "dst": os.path.join(txn["output_dir"], "payload"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_persisted_init_with_valid_staging_is_classified_recoverable(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="extracting",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            staging_dir = txn["paths"]["staging_extracted"]
+            os.makedirs(staging_dir, exist_ok=True)
+            with open(os.path.join(staging_dir, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="extracting",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            self.assertEqual(
+                self.m.TXN_STATE_EXTRACTED,
+                self.m._classify_recoverable_txn_state(txn),
+            )
+            self.assertEqual(
+                "recoverable",
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"]),
+            )
+            recoverable_archives, retryable_archives, pending_archives = (
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            )
+            self.assertEqual(
+                [
+                    {
+                        "archive_path": os.path.abspath(archive["archive_path"]),
+                        "output_dir": os.path.abspath(archive["output_dir"]),
+                    }
+                ],
+                recoverable_archives,
+            )
+            self.assertEqual([], retryable_archives)
+            self.assertEqual([], pending_archives)
+
+    def test_validate_placement_v2_rejects_copy_plan_written_without_src(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            src = os.path.join(txn["paths"]["incoming_dir"], "payload.txt")
+            dst = os.path.join(txn["output_dir"], "payload.txt")
+            tmp_dst = self.m._placement_copy_tmp_dst(txn, dst, 1)
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": src,
+                        "dst": os.path.join(txn["output_dir"], "payload.txt"),
+                        "tmp_dst": tmp_dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_placement_v2(txn))
+
+            txn["placement_v2"]["ops"][0]["tmp_dst"] = "relative-payload.tmp"
+            self.assertFalse(self.m._validate_placement_v2(txn))
+
+    def test_validate_placement_v2_rejects_move_done_without_dst(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            src = os.path.join(txn["paths"]["incoming_dir"], "payload.txt")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": src,
+                        "dst": os.path.join(txn["output_dir"], "payload.txt"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_placement_v2(txn))
+
+    def test_validate_placement_v2_rejects_copy_move_done_without_dst(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            src = os.path.join(txn["paths"]["incoming_dir"], "payload.txt")
+            dst = os.path.join(txn["output_dir"], "payload.txt")
+            tmp_dst = self.m._placement_copy_tmp_dst(txn, dst, 1)
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": src,
+                        "dst": os.path.join(txn["output_dir"], "payload.txt"),
+                        "tmp_dst": tmp_dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_placement_v2(txn))
+
+    def test_validate_placement_v2_accepts_copy_copy_staged_with_dst_present(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            src = os.path.join(txn["paths"]["incoming_dir"], "payload.txt")
+            dst = os.path.join(txn["output_dir"], "payload.txt")
+            tmp_dst = self.m._placement_copy_tmp_dst(txn, dst, 1)
+            os.makedirs(os.path.dirname(src), exist_ok=True)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("payload")
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": src,
+                        "dst": dst,
+                        "tmp_dst": tmp_dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "COPY_STAGED",
+                    }
+                ],
+            }
+
+            self.assertTrue(self.m._validate_placement_v2(txn))
+
+    def test_validate_placement_v2_rejects_split_brain_output_dir_and_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            valid_src = os.path.join(incoming_dir, "payload.txt")
+            with open(valid_src, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            split_brain_output_dir = os.path.join(td, "other-output")
+            os.makedirs(split_brain_output_dir, exist_ok=True)
+            split_brain_dst = os.path.join(split_brain_output_dir, "payload.txt")
+            external_src = os.path.join(td, "external", "payload.txt")
+            os.makedirs(os.path.dirname(external_src), exist_ok=True)
+            with open(external_src, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": split_brain_output_dir,
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": valid_src,
+                        "dst": split_brain_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.assertFalse(self.m._validate_placement_v2(txn))
+
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": valid_src,
+                        "dst": split_brain_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.assertFalse(self.m._validate_placement_v2(txn))
+
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": external_src,
+                        "dst": os.path.join(txn["output_dir"], "payload.txt"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.assertFalse(self.m._validate_placement_v2(txn))
+
+    def test_validate_placement_v2_rejects_internal_workdir_sources_and_copy_tmp_dst(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            valid_src = os.path.join(incoming_dir, "payload.txt")
+            with open(valid_src, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            dst = os.path.join(txn["output_dir"], "payload.txt")
+            workdir_junk_paths = [
+                txn["paths"]["txn_json"],
+                os.path.join(txn["paths"]["journal_dir"], "leaked-journal.txt"),
+                os.path.join(txn["paths"]["trash_dir"], "leaked-trash.txt"),
+            ]
+            os.makedirs(txn["paths"]["trash_dir"], exist_ok=True)
+            with open(workdir_junk_paths[1], "w", encoding="utf-8") as f:
+                f.write("journal")
+            with open(workdir_junk_paths[2], "w", encoding="utf-8") as f:
+                f.write("trash")
+
+            for bad_src in workdir_junk_paths:
+                txn["placement_v2"] = {
+                    "planner_version": 1,
+                    "output_dir": txn["output_dir"],
+                    "ops": [
+                        {
+                            "op_id": 1,
+                            "src": bad_src,
+                            "dst": dst,
+                            "backend": "rename",
+                            "entry_kind": "file",
+                            "discovered_order": 1,
+                            "phase": "PLAN_WRITTEN",
+                        }
+                    ],
+                }
+                self.assertFalse(self.m._validate_placement_v2(txn))
+
+            bad_tmp_dst = os.path.join(td, "external-tmp", "payload.txt")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": valid_src,
+                        "dst": dst,
+                        "tmp_dst": bad_tmp_dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_placement_v2(txn))
+
+    def test_validate_source_finalization_v2_rejects_source_move_copy_plan_written_without_src(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            src = txn["archive_path"]
+            os.remove(src)
+            dst = os.path.join(txn["output_base"], "done", "alpha.zip")
+            tmp_dst = self.m._source_finalization_tmp_dst(txn, dst, 1)
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": src,
+                        "dst": os.path.join(txn["output_base"], "done", "alpha.zip"),
+                        "tmp_dst": tmp_dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+            txn["source_finalization_v2"]["ops"][0]["tmp_dst"] = "relative-finalize.tmp"
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+    def test_validate_source_finalization_v2_rejects_source_move_finalize_done_without_dst(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(txn["output_base"], "done", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+    def test_validate_source_finalization_v2_rejects_source_move_rename_dst_promoted(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            src = txn["archive_path"]
+            dst = os.path.join(txn["output_base"], "done", "alpha.zip")
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write("moved")
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": src,
+                        "dst": dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "DST_PROMOTED",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+    def test_validate_source_finalization_v2_accepts_source_move_copy_copy_staged_with_dst_present(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            src = txn["archive_path"]
+            dst = self._success_move_dst(txn, fixture["args"].success_to)
+            tmp_dst = self.m._source_finalization_tmp_dst(txn, dst, 1)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write("moved")
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": src,
+                        "dst": dst,
+                        "tmp_dst": tmp_dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "phase": "COPY_STAGED",
+                    }
+                ],
+            }
+
+            self.assertTrue(self.m._validate_source_finalization_v2(txn))
+
+    def test_validate_source_finalization_v2_rejects_split_brain_source_move(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            archive_path = os.path.abspath(txn["archive_path"])
+            fail_to = os.path.abspath(fixture["args"].fail_to or os.path.join(td, "failed"))
+            success_to = os.path.abspath(fixture["args"].success_to)
+            os.makedirs(fail_to, exist_ok=True)
+
+            payload_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(payload_dst), exist_ok=True)
+            with open(payload_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": payload_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+
+            external_src = os.path.join(td, "external", "other.zip")
+            os.makedirs(os.path.dirname(external_src), exist_ok=True)
+            with open(external_src, "w", encoding="utf-8") as f:
+                f.write("other")
+
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": external_src,
+                        "dst": os.path.join(success_to, txn["txn_id"], os.path.basename(external_src)),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+    def test_validate_source_finalization_v2_rejects_copy_tmp_dst_outside_planner_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            archive_path = os.path.abspath(txn["archive_path"])
+            fail_to = os.path.join(td, "failed")
+            payload_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(payload_dst), exist_ok=True)
+            with open(payload_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": payload_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+            dst = self._success_move_dst(txn, fixture["args"].success_to)
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": dst,
+                        "tmp_dst": os.path.join(td, "external-finalize", "alpha.zip"),
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": archive_path,
+                        "dst": os.path.join(fail_to, txn["txn_id"], os.path.basename(archive_path)),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": archive_path,
+                        "dst": os.path.join(
+                            fixture["args"].success_to,
+                            txn["txn_id"],
+                            os.path.basename(archive_path),
+                        ),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+    def test_validate_source_finalization_v2_rejects_contradictory_success_delete_source_move(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="delete")
+            txn = fixture["txn"]
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_delete",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(txn["output_base"], "done", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+    def test_validate_source_finalization_v2_rejects_contradictory_fail_move_source_delete(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_DELETE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(txn["paths"]["trash_dir"], "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+    def test_validate_source_finalization_v2_rejects_source_delete_rename_finalize_done_with_trash(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            dst = os.path.join(txn["paths"]["trash_dir"], "alpha.zip")
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write("trash")
+            os.remove(txn["archive_path"])
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_delete",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_DELETE",
+                        "src": txn["archive_path"],
+                        "dst": dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+    def test_validate_source_finalization_v2_rejects_source_delete_rename_src_removed_with_trash(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            dst = os.path.join(txn["paths"]["trash_dir"], "alpha.zip")
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write("trash")
+            os.remove(txn["archive_path"])
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_delete",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_DELETE",
+                        "src": txn["archive_path"],
+                        "dst": dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "SRC_REMOVED",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+    def test_validate_source_finalization_v2_rejects_source_delete_copy_finalize_done_with_src(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            dst = os.path.join(txn["paths"]["trash_dir"], "alpha.zip")
+            tmp_dst = self.m._source_finalization_tmp_dst(txn, dst, 1)
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_delete",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_DELETE",
+                        "src": txn["archive_path"],
+                        "dst": dst,
+                        "tmp_dst": tmp_dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+    def test_validate_source_finalization_v2_rejects_source_delete_copy_finalize_done_with_trash(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            dst = os.path.join(txn["paths"]["trash_dir"], "alpha.zip")
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write("trash")
+            tmp_dst = self.m._source_finalization_tmp_dst(txn, dst, 1)
+            os.remove(txn["archive_path"])
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_delete",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_DELETE",
+                        "src": txn["archive_path"],
+                        "dst": dst,
+                        "tmp_dst": tmp_dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+
+            self.assertFalse(self.m._validate_source_finalization_v2(txn))
+
+    def test_validate_source_finalization_v2_accepts_source_delete_rename_dst_promoted_without_trash(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="delete")
+            txn = fixture["txn"]
+            trash_dst = os.path.join(
+                txn["paths"]["trash_dir"], os.path.basename(fixture["archive_path"])
+            )
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_delete",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_DELETE",
+                        "src": fixture["archive_path"],
+                        "dst": trash_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "DST_PROMOTED",
+                    }
+                ],
+            }
+            os.makedirs(os.path.dirname(trash_dst), exist_ok=True)
+            os.replace(fixture["archive_path"], trash_dst)
+            os.remove(trash_dst)
+
+            self.assertTrue(self.m._validate_source_finalization_v2(txn))
+
+    def test_durable_with_source_delete_rename_finalize_done_trash_rejects_startup(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            placement_src = os.path.join(txn["paths"]["incoming_dir"], "payload.txt")
+            placement_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(placement_dst), exist_ok=True)
+            with open(placement_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            dst = os.path.join(txn["paths"]["trash_dir"], "alpha.zip")
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write("trash")
+            os.remove(txn["archive_path"])
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_delete",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_DELETE",
+                        "src": txn["archive_path"],
+                        "dst": dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_durable_without_payload_durable_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="move",
+            )
+            txn = fixture["txn"]
+            placement_src = os.path.join(txn["paths"]["incoming_dir"], "payload.txt")
+            placement_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(placement_dst), exist_ok=True)
+            with open(placement_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": self._success_move_dst(
+                            txn,
+                            fixture["args"].success_to,
+                        ),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_payload_durable"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+    def test_durable_with_invalid_source_finalization_v2_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="move",
+            )
+            txn = fixture["txn"]
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": os.path.join(txn["output_dir"], "payload.txt"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(txn["output_base"], "done", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_failed_with_invalid_source_finalization_v2_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic invalid failed source finalization metadata",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(td, "failed", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_failed_with_semantically_invalid_source_finalization_v2_refuses_manifest_classification(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            fixture["args"].success_policy = "move"
+            fixture["args"].success_to = os.path.join(td, "success")
+            self._set_manifest_command_fingerprint(fixture["output_root"], fixture["args"])
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic semantically invalid failed source finalization metadata",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": self._success_move_dst(txn, fixture["args"].success_to),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+
+    def test_failed_with_semantically_invalid_source_finalization_v2_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic semantically invalid failed source finalization metadata",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(td, "success", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_failed_with_completed_contradictory_source_finalization_v2_refuses_manifest_classification(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            fixture["args"].success_policy = "move"
+            fixture["args"].success_to = os.path.join(td, "success")
+            self._set_manifest_command_fingerprint(fixture["output_root"], fixture["args"])
+            contradictory_dst = self._success_move_dst(txn, fixture["args"].success_to)
+            os.makedirs(os.path.dirname(contradictory_dst), exist_ok=True)
+            os.replace(archive["archive_path"], contradictory_dst)
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic completed contradictory failed source finalization metadata",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": contradictory_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+
+    def test_failed_with_completed_contradictory_source_finalization_v2_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            contradictory_dst = os.path.join(td, "success", "alpha.zip")
+            os.makedirs(os.path.dirname(contradictory_dst), exist_ok=True)
+            os.replace(archive["archive_path"], contradictory_dst)
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic completed contradictory failed source finalization metadata",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": contradictory_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_failed_fail_move_with_completed_payload_and_source_finalization_is_terminal(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            fixture["args"].fail_policy = "move"
+            fixture["args"].fail_to = os.path.join(td, "failed")
+            self._set_manifest_command_fingerprint(fixture["output_root"], fixture["args"])
+            payload_dst = os.path.join(archive["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(payload_dst), exist_ok=True)
+            with open(payload_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            fail_dst = self._failure_move_dst(txn, fixture["args"].fail_to)
+            os.makedirs(os.path.dirname(fail_dst), exist_ok=True)
+            os.replace(archive["archive_path"], fail_dst)
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": payload_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic split-brain failed terminal state",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": archive["archive_path"],
+                        "dst": fail_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            self.assertTrue(self.m._txn_is_closed_terminal_outcome(txn))
+            self.m._startup_raise_explicit_refuse_if_needed(txn)
+            self.assertEqual(
+                "failed",
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"]),
+            )
+            self.assertEqual(
+                "terminal_residue",
+                self.m._classify_existing_work_base(manifest, fixture["output_root"]),
+            )
+
+    def test_failed_with_traditional_zip_move_source_finalization_v2_refuses_manifest_classification(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            fixture["args"].traditional_zip_policy = "move"
+            fixture["args"].traditional_zip_to = os.path.join(td, "traditional-zips")
+            self._set_manifest_command_fingerprint(fixture["output_root"], fixture["args"])
+            traditional_dst = self.m._traditional_zip_move_destinations(
+                fixture["args"],
+                [txn["archive_path"]],
+                collision_token=self.m._traditional_zip_move_token(
+                    fixture["args"],
+                    [txn["archive_path"]],
+                ),
+            )[0][1]
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic unfinished traditional zip move metadata on failed txn",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "traditional_zip_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": traditional_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+
+    def test_failed_with_traditional_zip_move_source_finalization_v2_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic unfinished traditional zip move metadata on failed txn",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "traditional_zip_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(td, "traditional-zips", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_failed_with_traditional_zip_move_source_finalization_v2_reports_not_safely_recoverable_on_strict_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic unfinished traditional zip move metadata on failed txn",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "traditional_zip_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(td, "traditional-zips", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertNotIn("ambiguous during startup classification", stdout.getvalue())
+
+    def test_failed_with_fail_move_source_finalization_v2_refuses_manifest_classification(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            fixture["args"].fail_policy = "move"
+            fixture["args"].fail_to = os.path.join(td, "failed")
+            self._set_manifest_command_fingerprint(fixture["output_root"], fixture["args"])
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic unfinished fail-move metadata on failed txn",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": self._failure_move_dst(txn, fixture["args"].fail_to),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+
+    def test_failed_with_fail_move_source_finalization_v2_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic unfinished fail-move metadata on failed txn",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(td, "failed", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_failed_with_fail_move_source_finalization_v2_reports_not_safely_recoverable_on_strict_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic unfinished fail-move metadata on failed txn",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(td, "failed", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertNotIn("ambiguous during startup classification", stdout.getvalue())
+
+    def test_failed_with_unfinished_placement_v2_refuses_manifest_classification(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "PLACE_FAILED",
+                "message": "synthetic unfinished placement metadata on failed txn",
+                "at": self.m._now_iso(),
+            }
+            os.makedirs(txn["paths"]["incoming_dir"], exist_ok=True)
+            placement_dst = os.path.join(archive["output_dir"], "placed-payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": txn["paths"]["incoming_dir"],
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "dir",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+
+    def test_failed_with_unfinished_placement_v2_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "PLACE_FAILED",
+                "message": "synthetic unfinished placement metadata on failed txn",
+                "at": self.m._now_iso(),
+            }
+            os.makedirs(txn["paths"]["incoming_dir"], exist_ok=True)
+            placement_dst = os.path.join(archive["output_dir"], "placed-payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": txn["paths"]["incoming_dir"],
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "dir",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_failed_with_unfinished_placement_v2_reports_not_safely_recoverable_on_strict_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "PLACE_FAILED",
+                "message": "synthetic unfinished placement metadata on failed txn",
+                "at": self.m._now_iso(),
+            }
+            os.makedirs(txn["paths"]["incoming_dir"], exist_ok=True)
+            placement_dst = os.path.join(archive["output_dir"], "placed-payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": txn["paths"]["incoming_dir"],
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "dir",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertNotIn("ambiguous during startup classification", stdout.getvalue())
+
+    def test_failed_with_unfinished_placement_v2_refuses_direct_recovery_execution(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "PLACE_FAILED",
+                "message": "synthetic unfinished placement metadata on failed txn",
+                "at": self.m._now_iso(),
+            }
+            os.makedirs(txn["paths"]["incoming_dir"], exist_ok=True)
+            placement_dst = os.path.join(archive["output_dir"], "placed-payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": txn["paths"]["incoming_dir"],
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "dir",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+    def test_failed_with_move_done_payload_and_no_failure_replay_metadata_refuses_terminal_classification_and_cleanup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            placement_dst = os.path.join(archive["output_dir"], "placed-payload.txt")
+            os.makedirs(os.path.dirname(placement_dst), exist_ok=True)
+            with open(placement_dst, "w", encoding="utf-8") as f:
+                f.write("placed")
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "PLACE_FAILED",
+                "message": "synthetic visible payload without failure replay metadata",
+                "at": self.m._now_iso(),
+            }
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn.pop("source_finalization_v2", None)
+            txn.pop("payload_durable", None)
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._startup_raise_explicit_refuse_if_needed(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:failed_recovery_contradiction"
+            ):
+                self.m._classify_existing_work_base(manifest, fixture["output_root"])
+            self.assertFalse(
+                self.m._work_root_cleanup_eligible(
+                    txn["paths"]["work_root"], fixture["output_root"]
+                )
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertTrue(os.path.exists(self.m._work_base(fixture["output_root"])))
+
+    def test_failed_with_semantically_invalid_source_finalization_v2_reports_not_safely_recoverable_on_strict_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_FAILED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "synthetic semantically invalid failed source finalization metadata",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": os.path.join(td, "success", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertNotIn("ambiguous during startup classification", stdout.getvalue())
+
+    def test_init_with_persisted_source_finalization_metadata_reports_not_safely_recoverable_on_strict_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": os.path.abspath(archive["archive_path"]),
+                        "dst": os.path.join(td, "failed", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertNotIn("ambiguous during startup classification", stdout.getvalue())
+
+    def test_aborted_with_conflicting_staging_and_incoming_refuses_recovery(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_aborted_manifest_txn_fixture(
                 td,
@@ -4699,10 +12828,245 @@ class TestTxnPrimitives(unittest.TestCase):
             manifest = self.m._load_dataset_manifest(fixture["output_root"])
             entry = manifest["archives"][fixture["archive_id"]]
 
-            self.assertEqual(
-                "retryable",
-                self.m._classify_manifest_archive_state(entry, fixture["output_root"]),
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+
+    def test_aborted_with_conflicting_staging_and_incoming_reports_not_safely_recoverable_on_strict_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_aborted_manifest_txn_fixture(
+                td,
+                manifest_state="pending",
             )
+            staging_extracted = fixture["txn"]["paths"]["staging_extracted"]
+            incoming_dir = fixture["txn"]["paths"]["incoming_dir"]
+            os.makedirs(staging_extracted, exist_ok=True)
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(
+                os.path.join(staging_extracted, "staging.txt"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write("staging")
+            with open(
+                os.path.join(incoming_dir, "incoming.txt"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write("incoming")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertNotIn(
+                "ambiguous during startup classification",
+                stdout.getvalue(),
+            )
+
+    def test_aborted_durability_failed_without_payload_durable_does_not_recover_as_placed(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_aborted_manifest_txn_fixture(
+                td,
+                manifest_state="pending",
+            )
+            txn = fixture["txn"]
+            placement_dst = os.path.join(fixture["archive"]["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(placement_dst), exist_ok=True)
+            with open(placement_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["error"] = {
+                "type": "DURABILITY_FAILED",
+                "message": "payload durability marker missing",
+                "at": self.m._now_iso(),
+            }
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
+                self.m._recoverable_txn_state_from_aborted(txn)
+
+    def test_source_finalized_fail_move_plan_written_refuses_terminal_classification_and_recovery(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            fixture["args"].fail_policy = "move"
+            fixture["args"].fail_to = os.path.join(td, "failed")
+            self._set_manifest_command_fingerprint(fixture["output_root"], fixture["args"])
+            failure_dst = self._failure_move_dst(txn, fixture["args"].fail_to)
+            txn["state"] = self.m.TXN_STATE_SOURCE_FINALIZED
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": failure_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:closed_success_source_finalization_outcome_mismatch"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:closed_success_source_finalization_outcome_mismatch"
+            ):
+                self.m._startup_raise_explicit_refuse_if_needed(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:closed_success_source_finalization_outcome_mismatch"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:closed_success_source_finalization_outcome_mismatch"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:closed_success_source_finalization_outcome_mismatch"
+            ):
+                self.m._classify_existing_work_base(manifest, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:closed_success_source_finalization_outcome_mismatch"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+    def test_cleaned_fail_move_finalize_done_refuses_terminal_classification_and_gc(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            fixture["args"].fail_policy = "move"
+            fixture["args"].fail_to = os.path.join(td, "failed")
+            self._set_manifest_command_fingerprint(fixture["output_root"], fixture["args"])
+            failure_dst = self._failure_move_dst(txn, fixture["args"].fail_to)
+            os.makedirs(os.path.dirname(failure_dst), exist_ok=True)
+            if os.path.exists(txn["archive_path"]):
+                os.replace(txn["archive_path"], failure_dst)
+            txn["state"] = self.m.TXN_STATE_CLEANED
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": txn["archive_path"],
+                        "dst": failure_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "FINALIZE_DONE",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+            self._age_txn_journal(txn)
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:closed_success_source_finalization_outcome_mismatch"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:closed_success_source_finalization_outcome_mismatch"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:closed_success_source_finalization_outcome_mismatch"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:closed_success_source_finalization_outcome_mismatch"
+            ):
+                self.m._classify_existing_work_base(manifest, fixture["output_root"])
+
+            self.m._garbage_collect(
+                fixture["output_dir"],
+                output_base=fixture["output_root"],
+                keep_journal_days=7,
+            )
+            self.assertTrue(os.path.exists(txn["paths"]["journal_dir"]))
 
     def test_aborted_with_resumable_wal_is_recoverable(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4735,12 +13099,12 @@ class TestTxnPrimitives(unittest.TestCase):
             manifest = self.m._load_dataset_manifest(fixture["output_root"])
             entry = manifest["archives"][fixture["archive_id"]]
 
-            self.assertEqual(
-                "recoverable",
-                self.m._classify_manifest_archive_state(entry, fixture["output_root"]),
-            )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
 
-    def test_aborted_without_assets_is_retryable(self):
+    def test_aborted_without_assets_refuses_recovery(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_aborted_manifest_txn_fixture(
                 td,
@@ -4749,10 +13113,10 @@ class TestTxnPrimitives(unittest.TestCase):
             manifest = self.m._load_dataset_manifest(fixture["output_root"])
             entry = manifest["archives"][fixture["archive_id"]]
 
-            self.assertEqual(
-                "retryable",
-                self.m._classify_manifest_archive_state(entry, fixture["output_root"]),
-            )
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
 
     def test_resume_reclassifies_aborted_instead_of_skipping(self):
         class DummyLock:
@@ -4892,7 +13256,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 snapshot_every=1,
                 durability_enabled=False,
             )
-            success_txn["state"] = self.m.TXN_STATE_CLEANED
+            success_txn["state"] = self.m.TXN_STATE_PLACED
             self.m._txn_snapshot(success_txn)
 
             success_processor = types.SimpleNamespace(
@@ -5153,6 +13517,1523 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertLess(max(payload_file_indices), min(payload_dir_indices))
             self.assertLess(max(payload_dir_indices), delete_index)
 
+    def test_payload_durability_barrier_fsyncs_entire_placed_tree(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_delete_barrier_txn_fixture(td)
+            txn = fixture["txn"]
+            txn["resolved_policy"] = "only-file-content-direct"
+            txn["policy_frozen"] = True
+            self.m._persist_placement_v2_and_enter_placing(
+                txn,
+                conflict_mode="fail",
+                degrade_cross_volume=False,
+            )
+            self.m._execute_plan_written_placement_v2(
+                txn,
+                wal_fsync_every=1,
+                degrade_cross_volume=False,
+            )
+
+            fsynced_files = []
+            fsynced_dirs = []
+
+            def fake_fsync_file(path, debug=False):
+                fsynced_files.append(os.path.abspath(path))
+                return True
+
+            def fake_fsync_dir(path, debug=False):
+                fsynced_dirs.append(os.path.abspath(path))
+                return True
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", side_effect=fake_fsync_file),
+                mock.patch.object(self.m, "_fsync_dir", side_effect=fake_fsync_dir),
+            ):
+                self.m._durability_barrier(
+                    txn,
+                    fsync_files="auto",
+                    success_policy="delete",
+                )
+
+            expected_payload_files = [
+                os.path.abspath(path) for path in fixture["expected_payload_files"]
+            ]
+            expected_payload_dirs = [
+                os.path.abspath(path) for path in fixture["expected_payload_dirs"]
+            ]
+            self.assertCountEqual(
+                expected_payload_files,
+                [path for path in fsynced_files if path in expected_payload_files],
+            )
+            self.assertEqual(
+                expected_payload_dirs,
+                [path for path in fsynced_dirs if path in expected_payload_dirs],
+            )
+
+    def test_non_source_mutating_success_skips_durable_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "alpha.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"archive")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                decompress_policy="only-file-content-direct",
+                success_policy="asis",
+                no_durability=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": os.path.join(output_root, "placed"),
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=os.path.join(output_root, "placed"),
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            file_content_root = os.path.join(txn["paths"]["incoming_dir"], "tree")
+            os.makedirs(file_content_root, exist_ok=True)
+            with open(os.path.join(file_content_root, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+            self.m._txn_snapshot(txn)
+
+            with mock.patch.object(
+                self.m,
+                "_durability_barrier",
+                side_effect=AssertionError("non-source-mutating success must skip durability barrier"),
+            ):
+                self.m._place_and_finalize_txn(txn, args=args)
+
+            self.assertEqual(self.m.TXN_STATE_DONE, txn["state"])
+            self.assertIsNone(txn.get("payload_durable"))
+
+    def test_durable_with_nonterminal_source_finalization_recovers_and_replays(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="move",
+            )
+            txn = fixture["txn"]
+            archive_path = os.path.abspath(fixture["archive_path"])
+            placement_src = os.path.join(txn["paths"]["incoming_dir"], "tree")
+            placement_dst = os.path.join(txn["output_dir"], "tree")
+            os.makedirs(placement_dst, exist_ok=True)
+            with open(os.path.join(placement_dst, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            shutil.rmtree(placement_src)
+            final_dst = os.path.join(
+                fixture["args"].success_to,
+                txn["txn_id"],
+                os.path.basename(archive_path),
+            )
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "dir",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": archive_path,
+                        "dst": final_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+
+            real_atomic_rename = self.m._atomic_rename
+
+            def crash_after_source_move(src, dst, *, degrade_cross_volume=False, debug=False):
+                result = real_atomic_rename(
+                    src,
+                    dst,
+                    degrade_cross_volume=degrade_cross_volume,
+                    debug=debug,
+                )
+                if os.path.abspath(src) == archive_path:
+                    raise SystemExit("crash-after-source-finalization-rename")
+                return result
+
+            with (
+                mock.patch.object(
+                    self.m, "_atomic_rename", side_effect=crash_after_source_move
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(final_dst))
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "_validate_strict_resume_startup", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "durable source finalization recovery must not re-extract"
+                    ),
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(processor, [], args=fixture["args"])
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][fixture["archive_id"]]
+            self.assertEqual([archive_path], processor.successful_archives)
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual("success:move", resumed_entry["final_disposition"])
+
+    def test_source_move_copy_replays_after_src_removed_before_parent_fsync(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            archive_path = os.path.abspath(fixture["archive_path"])
+            dst = os.path.join(
+                fixture["args"].success_to,
+                txn["txn_id"],
+                os.path.basename(archive_path),
+            )
+            tmp_dst = self.m._source_finalization_tmp_dst(txn, dst, 1)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            os.remove(archive_path)
+
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": archive_path,
+                        "dst": dst,
+                        "tmp_dst": tmp_dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "phase": "DST_PROMOTED",
+                    }
+                ],
+            }
+
+            fsynced_dirs = []
+
+            def track_fsync_dir(path, debug=False):
+                fsynced_dirs.append(os.path.abspath(path))
+                return True
+
+            with mock.patch.object(self.m, "_fsync_dir", side_effect=track_fsync_dir):
+                self.m._replay_source_finalization_op(
+                    txn, txn["source_finalization_v2"]["ops"][0]
+                )
+
+            self.assertTrue(os.path.exists(dst))
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertEqual(
+                "FINALIZE_DONE", txn["source_finalization_v2"]["ops"][0]["phase"]
+            )
+            self.assertIn(os.path.abspath(os.path.dirname(archive_path)), fsynced_dirs)
+
+    def test_source_delete_rename_replays_after_trash_deleted_before_parent_fsync(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="delete")
+            txn = fixture["txn"]
+            archive_path = os.path.abspath(fixture["archive_path"])
+            trash_dst = os.path.join(txn["paths"]["trash_dir"], os.path.basename(archive_path))
+            os.makedirs(os.path.dirname(trash_dst), exist_ok=True)
+            os.replace(archive_path, trash_dst)
+            os.remove(trash_dst)
+
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_delete",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_DELETE",
+                        "src": archive_path,
+                        "dst": trash_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "DST_PROMOTED",
+                    }
+                ],
+            }
+
+            fsynced_dirs = []
+
+            def track_fsync_dir(path, debug=False):
+                fsynced_dirs.append(os.path.abspath(path))
+                return True
+
+            with mock.patch.object(self.m, "_fsync_dir", side_effect=track_fsync_dir):
+                self.m._replay_source_finalization_op(
+                    txn, txn["source_finalization_v2"]["ops"][0]
+                )
+
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(trash_dst))
+            self.assertEqual(
+                "FINALIZE_DONE", txn["source_finalization_v2"]["ops"][0]["phase"]
+            )
+            self.assertIn(os.path.abspath(os.path.dirname(trash_dst)), fsynced_dirs)
+
+    def test_source_delete_copy_removes_source_before_trash_cleanup(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="delete")
+            txn = fixture["txn"]
+            archive_path = os.path.abspath(fixture["archive_path"])
+            trash_dst = os.path.join(txn["paths"]["trash_dir"], os.path.basename(archive_path))
+            tmp_dst = self.m._source_finalization_tmp_dst(txn, trash_dst, 1)
+            os.makedirs(os.path.dirname(trash_dst), exist_ok=True)
+            with open(trash_dst, "w", encoding="utf-8") as f:
+                f.write("trash")
+
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_delete",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_DELETE",
+                        "src": archive_path,
+                        "dst": trash_dst,
+                        "tmp_dst": tmp_dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "phase": "DST_PROMOTED",
+                    }
+                ],
+            }
+
+            events = []
+            real_remove_path_or_raise = self.m._remove_path_or_raise
+            real_safe_remove = self.m.safe_remove
+
+            def track_remove(path):
+                events.append(("remove", os.path.abspath(path)))
+                return real_remove_path_or_raise(path)
+
+            def track_safe_remove(path, debug=False):
+                events.append(("remove_file", os.path.abspath(path)))
+                return real_safe_remove(path, debug)
+
+            def track_rmtree(path, debug=False):
+                events.append(("rmtree", os.path.abspath(path)))
+                return False
+
+            with (
+                mock.patch.object(
+                    self.m, "_remove_path_or_raise", side_effect=track_remove
+                ),
+                mock.patch.object(self.m, "safe_remove", side_effect=track_safe_remove),
+                mock.patch.object(self.m, "safe_rmtree", side_effect=track_rmtree),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            ):
+                self.m._replay_source_finalization_op(
+                    txn, txn["source_finalization_v2"]["ops"][0]
+                )
+
+            self.assertEqual(
+                [
+                    ("remove", os.path.abspath(archive_path)),
+                    ("remove_file", os.path.abspath(archive_path)),
+                    ("remove_file", os.path.abspath(trash_dst)),
+                ],
+                events,
+            )
+            self.assertEqual(
+                "FINALIZE_DONE", txn["source_finalization_v2"]["ops"][0]["phase"]
+            )
+
+    def test_success_delete_fsyncs_source_and_trash_parents(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="delete")
+            txn = fixture["txn"]
+            archive_path = os.path.abspath(fixture["archive_path"])
+            payload_root = os.path.join(txn["output_dir"], "tree")
+            os.makedirs(payload_root, exist_ok=True)
+            with open(os.path.join(payload_root, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            shutil.rmtree(os.path.join(txn["paths"]["incoming_dir"], "tree"))
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "tree"),
+                        "dst": payload_root,
+                        "backend": "rename",
+                        "entry_kind": "dir",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["state"] = self.m.TXN_STATE_PLACED
+            txn["resolved_policy"] = "only-file-content-direct"
+            txn["policy_frozen"] = True
+
+            fsynced_dirs = []
+
+            def track_fsync_dir(path, debug=False):
+                fsynced_dirs.append(os.path.abspath(path))
+                return True
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", side_effect=track_fsync_dir),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+            source_parent = os.path.abspath(os.path.dirname(archive_path))
+            trash_parent = os.path.abspath(txn["paths"]["trash_dir"])
+            self.assertIn(source_parent, fsynced_dirs)
+            self.assertGreaterEqual(fsynced_dirs.count(trash_parent), 2)
+
+    def test_fail_policy_move_extract_failure_does_not_persist_failure_replay_without_payload(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            fail_to = os.path.join(td, "failed")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "secret.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"secret")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                fail_policy="move",
+                fail_to=fail_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            processor = types.SimpleNamespace(
+                sfx_detector=None,
+                find_correct_password=lambda archive_path, encryption_status=None: None,
+                get_all_volumes=lambda path: [os.path.abspath(path)],
+            )
+
+            with mock.patch.object(
+                self.m, "check_encryption", return_value="encrypted_header"
+            ):
+                result = self.m._extract_phase(
+                    processor,
+                    archive_path,
+                    args=args,
+                    output_base=output_root,
+                )
+
+            txn = result["txn"]
+            self.assertEqual("failed", result["kind"])
+            self.assertEqual(self.m.TXN_STATE_ABORTED, txn["state"])
+            self.assertEqual("EXTRACT_FAILED", txn["error"]["type"])
+            self.assertNotIn("payload_durable", txn)
+            self.assertIsNone(self.m._txn_source_finalization_plan(txn))
+            self.assertIsNone(txn.get("source_finalization_v2"))
+            self.assertTrue(os.path.exists(archive_path))
+
+    def test_fail_policy_move_live_terminal_failure_moves_sources_via_source_finalization_v2(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive_path = fixture["archive"]["archive_path"]
+            archive_id = fixture["archive_id"]
+            fail_to = os.path.join(td, "failed")
+            args = self._make_processing_args(
+                fixture["input_root"],
+                output=fixture["output_root"],
+                fail_policy="move",
+                fail_to=fail_to,
+                success_policy="asis",
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            fixture["args"] = args
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            manifest["command_fingerprint"] = self.m._build_command_fingerprint(args)
+            self.m._save_dataset_manifest(manifest)
+
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=fixture["archive"]["volumes"],
+                output_dir=fixture["archive"]["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            payload_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(payload_dst), exist_ok=True)
+            with open(payload_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": payload_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["state"] = self.m.TXN_STATE_PLACED
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive_path,
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_persisted_success_final_disposition",
+                    side_effect=RuntimeError("boom after placement"),
+                ),
+            ):
+                ok = self.m._finalize_one_txn(
+                    txn,
+                    processor=processor,
+                    args=args,
+                    output_base=fixture["output_root"],
+                )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(entry, fixture["output_root"])
+            expected_fail_dst = os.path.join(
+                fail_to,
+                txn["txn_id"],
+                os.path.basename(archive_path),
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual([], processor.successful_archives)
+            self.assertEqual([os.path.abspath(archive_path)], processor.failed_archives)
+            self.assertEqual(self.m.TXN_STATE_FAILED, saved_txn["state"])
+            self.assertEqual("failure:move", entry["final_disposition"])
+            self.assertEqual("failed", entry["state"])
+            self.assertEqual("fail_move", saved_txn["source_finalization_v2"]["policy_kind"])
+            self.assertEqual(
+                ["FINALIZE_DONE"],
+                [op["phase"] for op in self.m._source_finalization_ops(saved_txn)],
+            )
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(expected_fail_dst))
+
+    def test_fail_policy_move_payload_barrier_failure_reopen_does_not_drift_to_success_asis(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive_path = os.path.abspath(fixture["archive"]["archive_path"])
+            archive_id = fixture["archive_id"]
+            fail_to = os.path.join(td, "failed")
+            args = self._make_processing_args(
+                fixture["input_root"],
+                output=fixture["output_root"],
+                fail_policy="move",
+                fail_to=fail_to,
+                success_policy="asis",
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            fixture["args"] = args
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            manifest["command_fingerprint"] = self.m._build_command_fingerprint(args)
+            self.m._save_dataset_manifest(manifest)
+
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=fixture["archive"]["volumes"],
+                output_dir=fixture["archive"]["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            payload_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(payload_dst), exist_ok=True)
+            with open(payload_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": payload_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["state"] = self.m.TXN_STATE_PLACED
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive_path,
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            expected_fail_dst = self._failure_move_dst(txn, fail_to)
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+
+            def fail_payload_fsync(path, debug=False):
+                if os.path.abspath(path).startswith(os.path.abspath(txn["output_dir"])):
+                    return False
+                return True
+
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_persisted_success_final_disposition",
+                    side_effect=RuntimeError("boom after placement"),
+                ),
+                mock.patch.object(self.m, "_fsync_file", side_effect=fail_payload_fsync),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            ):
+                ok = self.m._finalize_one_txn(
+                    txn,
+                    processor=processor,
+                    args=args,
+                    output_base=fixture["output_root"],
+                )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(entry, fixture["output_root"])
+
+            self.assertFalse(ok)
+            self.assertEqual([], processor.successful_archives)
+            self.assertEqual([archive_path], processor.failed_archives)
+            self.assertEqual(self.m.TXN_STATE_PLACED, saved_txn["state"])
+            self.assertIsNotNone(saved_txn.get("error"))
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertIsNone(entry["finalized_at"])
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(expected_fail_dst))
+
+            reopen_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "reopen must not re-extract fail-move payload durability failure"
+                    ),
+                ),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(reopen_processor, [], args=args)
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(
+                resumed_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual([], reopen_processor.successful_archives)
+            self.assertEqual("failed", resumed_entry["state"])
+            self.assertEqual("failure:move", resumed_entry["final_disposition"])
+            self.assertEqual(self.m.TXN_STATE_FAILED, resumed_txn["state"])
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(expected_fail_dst))
+
+    def test_fail_policy_move_reopen_pending_barrier_failure_stays_recoverable_and_later_completes(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive_path = os.path.abspath(fixture["archive"]["archive_path"])
+            archive_id = fixture["archive_id"]
+            fail_to = os.path.join(td, "failed")
+            args = self._make_processing_args(
+                fixture["input_root"],
+                output=fixture["output_root"],
+                fail_policy="move",
+                fail_to=fail_to,
+                success_policy="asis",
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            fixture["args"] = args
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            manifest["command_fingerprint"] = self.m._build_command_fingerprint(args)
+            self.m._save_dataset_manifest(manifest)
+
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=fixture["archive"]["volumes"],
+                output_dir=fixture["archive"]["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            payload_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(payload_dst), exist_ok=True)
+            with open(payload_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": payload_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["state"] = self.m.TXN_STATE_PLACED
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive_path,
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            expected_fail_dst = self._failure_move_dst(txn, fail_to)
+
+            def fail_payload_fsync(path, debug=False):
+                if os.path.abspath(path).startswith(os.path.abspath(txn["output_dir"])):
+                    return False
+                return True
+
+            initial_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_persisted_success_final_disposition",
+                    side_effect=RuntimeError("boom after placement"),
+                ),
+                mock.patch.object(self.m, "_fsync_file", side_effect=fail_payload_fsync),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            ):
+                ok = self.m._finalize_one_txn(
+                    txn,
+                    processor=initial_processor,
+                    args=args,
+                    output_base=fixture["output_root"],
+                )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(entry, fixture["output_root"])
+
+            self.assertFalse(ok)
+            self.assertEqual([], initial_processor.successful_archives)
+            self.assertEqual([archive_path], initial_processor.failed_archives)
+            self.assertEqual(self.m.TXN_STATE_PLACED, saved_txn["state"])
+            self.assertEqual("failure:move", saved_txn.get("pending_final_disposition"))
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(expected_fail_dst))
+
+            reopen_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "reopen must not re-extract pending failure-move barrier failure"
+                    ),
+                ),
+                mock.patch.object(self.m, "_fsync_file", side_effect=fail_payload_fsync),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(reopen_processor, [], args=args)
+
+            reopened_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            reopened_entry = reopened_manifest["archives"][archive_id]
+            reopened_txn = self.m._load_latest_txn_for_archive(
+                reopened_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual("recoverable", reopened_entry["state"])
+            self.assertEqual("unknown", reopened_entry["final_disposition"])
+            self.assertIsNone(reopened_entry["finalized_at"])
+            self.assertEqual(self.m.TXN_STATE_PLACED, reopened_txn["state"])
+            self.assertNotEqual("RECOVER_FAILED", reopened_txn["error"]["type"])
+            self.assertEqual(
+                "failure:move",
+                reopened_txn.get("pending_final_disposition"),
+            )
+            self.assertIsNone(reopened_txn.get("source_finalization_v2"))
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(expected_fail_dst))
+
+            clean_reopen_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "clean reopen must finish pending failure-move recovery in place"
+                    ),
+                ),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(clean_reopen_processor, [], args=args)
+
+            final_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            final_entry = final_manifest["archives"][archive_id]
+            final_txn = self.m._load_latest_txn_for_archive(
+                final_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual("failed", final_entry["state"])
+            self.assertEqual("failure:move", final_entry["final_disposition"])
+            self.assertEqual(self.m.TXN_STATE_FAILED, final_txn["state"])
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(expected_fail_dst))
+
+    def test_fail_policy_move_late_source_finalization_replay_failure_persists_recoverable_aborted_state(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive_path = os.path.abspath(fixture["archive"]["archive_path"])
+            archive_id = fixture["archive_id"]
+            fail_to = os.path.join(td, "failed")
+            args = self._make_processing_args(
+                fixture["input_root"],
+                output=fixture["output_root"],
+                fail_policy="move",
+                fail_to=fail_to,
+                success_policy="asis",
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            fixture["args"] = args
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            manifest["command_fingerprint"] = self.m._build_command_fingerprint(args)
+            self.m._save_dataset_manifest(manifest)
+
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=fixture["archive"]["volumes"],
+                output_dir=fixture["archive"]["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            payload_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(payload_dst), exist_ok=True)
+            with open(payload_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": payload_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["state"] = self.m.TXN_STATE_PLACED
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive_path,
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            expected_fail_dst = self._failure_move_dst(txn, fail_to)
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            def fail_failure_move_replay(current_txn, op):
+                if (
+                    current_txn.get("state") == self.m.TXN_STATE_DURABLE
+                    and current_txn.get("payload_durable")
+                    and (current_txn.get("source_finalization_v2") or {}).get("policy_kind")
+                    == "fail_move"
+                ):
+                    raise RuntimeError("failure-move-replay-failed-after-durable-window")
+                return self.m._replay_source_finalization_op(current_txn, op)
+
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_persisted_success_final_disposition",
+                    side_effect=RuntimeError("boom after placement"),
+                ),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_replay_source_finalization_op",
+                    side_effect=fail_failure_move_replay,
+                ),
+            ):
+                ok = self.m._finalize_one_txn(
+                    txn,
+                    processor=processor,
+                    args=args,
+                    output_base=fixture["output_root"],
+                )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(entry, fixture["output_root"])
+
+            self.assertFalse(ok)
+            self.assertEqual([], processor.successful_archives)
+            self.assertEqual([archive_path], processor.failed_archives)
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertIsNotNone(saved_txn.get("error"))
+            self.assertIn(
+                "failure-move-replay-failed-after-durable-window",
+                saved_txn["error"]["message"],
+            )
+            self.assertEqual("FAIL_FINALIZE_FAILED", saved_txn["error"]["type"])
+            self.assertTrue(saved_txn.get("payload_durable"))
+            self.assertEqual("fail_move", saved_txn["source_finalization_v2"]["policy_kind"])
+            self.assertEqual(
+                ["PLAN_WRITTEN"],
+                [op["phase"] for op in self.m._source_finalization_ops(saved_txn)],
+            )
+            self.assertEqual(
+                self.m.TXN_STATE_DURABLE,
+                self.m._recoverable_txn_state_from_aborted(saved_txn),
+            )
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertIsNone(entry["finalized_at"])
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(expected_fail_dst))
+
+            reopen_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "reopen must not re-extract fail-move source-plan snapshot failure"
+                    ),
+                ),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(reopen_processor, [], args=args)
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(
+                resumed_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual([], reopen_processor.successful_archives)
+            self.assertEqual("failed", resumed_entry["state"])
+            self.assertEqual("failure:move", resumed_entry["final_disposition"])
+            self.assertEqual(self.m.TXN_STATE_FAILED, resumed_txn["state"])
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(expected_fail_dst))
+
+    def test_traditional_zip_move_uses_same_source_move_protocol(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            processor = self.m.ArchiveProcessor(args)
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+            ):
+                result = self.m._extract_phase(
+                    processor,
+                    archive_path,
+                    args=args,
+                    output_base=output_root,
+                )
+
+            txn = result["txn"]
+            self.assertEqual(
+                "skipped:traditional_zip_moved",
+                self.m._txn_source_finalization_plan(txn)["final_disposition"],
+            )
+            self.assertEqual(
+                "traditional_zip_move", txn["source_finalization_v2"]["policy_kind"]
+            )
+            self.assertEqual("SOURCE_MOVE", txn["source_finalization_v2"]["ops"][0]["kind"])
+            self.assertEqual(
+                "FINALIZE_DONE", txn["source_finalization_v2"]["ops"][0]["phase"]
+            )
+            self.assertFalse(self.m._txn_has_traditional_zip_move_placement(txn))
+            self.assertTrue(
+                self.m._txn_missing_input_matches_finalized_source_move(
+                    txn, archive_path
+                )
+            )
+            self.assertFalse(
+                self.m._txn_missing_input_matches_traditional_zip_placement(
+                    txn, archive_path
+                )
+            )
+
+    def test_build_traditional_zip_move_source_finalization_v2_rejects_cross_volume_without_degrade(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                degrade_cross_volume=False,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_root,
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+
+            with mock.patch.object(self.m, "same_volume", return_value=False):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Cross-volume source move requires --degrade-cross-volume",
+                ):
+                    self.m._build_traditional_zip_move_source_finalization_v2(
+                        txn,
+                        args=args,
+                    )
+
+    def test_build_traditional_zip_move_source_finalization_v2_uses_copy_with_degrade(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                degrade_cross_volume=True,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_root,
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+
+            with mock.patch.object(self.m, "same_volume", return_value=False):
+                source_finalization_v2 = self.m._build_traditional_zip_move_source_finalization_v2(
+                    txn,
+                    args=args,
+                )
+
+            self.assertEqual("traditional_zip_move", source_finalization_v2["policy_kind"])
+            self.assertEqual("copy", source_finalization_v2["ops"][0]["backend"])
+            self.assertIsInstance(source_finalization_v2["ops"][0]["tmp_dst"], str)
+
+    def test_build_success_delete_source_finalization_v2_rejects_cross_volume_without_degrade(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="delete",
+            )
+
+            with mock.patch.object(self.m, "same_volume", return_value=False):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Cross-volume source move requires --degrade-cross-volume",
+                ):
+                    self.m._build_success_delete_source_finalization_v2(
+                        fixture["txn"],
+                        args=fixture["args"],
+                    )
+
+    def test_build_success_delete_source_finalization_v2_uses_copy_with_degrade(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="delete",
+            )
+            fixture["args"].degrade_cross_volume = True
+
+            with mock.patch.object(self.m, "same_volume", return_value=False):
+                source_finalization_v2 = self.m._build_success_delete_source_finalization_v2(
+                    fixture["txn"],
+                    args=fixture["args"],
+                )
+
+            self.assertEqual("success_delete", source_finalization_v2["policy_kind"])
+            self.assertEqual("SOURCE_DELETE", source_finalization_v2["ops"][0]["kind"])
+            self.assertEqual("copy", source_finalization_v2["ops"][0]["backend"])
+            self.assertIsInstance(source_finalization_v2["ops"][0]["tmp_dst"], str)
+
+    def test_cross_volume_traditional_zip_move_aborted_after_source_plan_recovers_as_durable(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                degrade_cross_volume=True,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_root,
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+
+            with mock.patch.object(self.m, "same_volume", return_value=False):
+                payload_root = os.path.join(output_root, "placed-tree")
+                os.makedirs(payload_root, exist_ok=True)
+                with open(
+                    os.path.join(payload_root, "payload.txt"), "w", encoding="utf-8"
+                ) as f:
+                    f.write("payload")
+                txn["placement_v2"] = {
+                    "planner_version": 1,
+                    "output_dir": output_root,
+                    "ops": [
+                        {
+                            "op_id": 1,
+                            "src": os.path.join(txn["paths"]["incoming_dir"], "tree"),
+                            "dst": payload_root,
+                            "backend": "rename",
+                            "entry_kind": "dir",
+                            "discovered_order": 1,
+                            "phase": "MOVE_DONE",
+                        }
+                    ],
+                }
+                txn["state"] = self.m.TXN_STATE_DURABLE
+                txn["payload_durable"] = True
+                self.m._set_source_finalization_plan(
+                    txn,
+                    manifest_state="succeeded",
+                    final_disposition="skipped:traditional_zip_moved",
+                    txn_terminal_state=self.m.TXN_STATE_DONE,
+                    args=args,
+                )
+
+            txn.pop("placement_v2", None)
+
+            self.assertTrue(self.m._validate_source_finalization_v2(txn))
+
+            txn["state"] = self.m.TXN_STATE_ABORTED
+            txn["error"] = {
+                "type": "DURABILITY_FAILED",
+                "message": "journal_dir_fsync_failed:dir:source-plan-snapshot",
+                "at": self.m._now_iso(),
+            }
+
+            self.assertEqual(
+                self.m.TXN_STATE_DURABLE,
+                self.m._recoverable_txn_state_from_aborted(txn),
+            )
+
+    def test_traditional_zip_move_same_output_later_archive_waits_for_earlier_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_a = os.path.join(input_root, "a.zip")
+            archive_b = os.path.join(input_root, "b.zip")
+            for archive_path in (archive_a, archive_b):
+                with open(archive_path, "wb") as f:
+                    f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_a,
+                        "output_dir": output_root,
+                        "volumes": [archive_a],
+                        "requested_policy": args.decompress_policy,
+                    },
+                    {
+                        "archive_path": archive_b,
+                        "output_dir": output_root,
+                        "volumes": [archive_b],
+                        "requested_policy": args.decompress_policy,
+                    },
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            processor = self.m.ArchiveProcessor(args)
+            pending_by_output_dir = {}
+            touched_output_dirs = set()
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+            ):
+                later_result = self.m._traditional_zip_move_scheduler_result(
+                    processor,
+                    archive_b,
+                    args=args,
+                    output_base=output_root,
+                )
+
+                self.m._handle_transactional_result(
+                    later_result,
+                    processor=processor,
+                    args=args,
+                    output_base=output_root,
+                    touched_output_dirs=touched_output_dirs,
+                    pending_by_output_dir=pending_by_output_dir,
+                )
+
+                mid_manifest = self.m._load_dataset_manifest(output_root)
+                later_entry = mid_manifest["archives"][
+                    self.m._dataset_manifest_archive_id(archive_b)
+                ]
+                self.assertEqual("pending", later_entry["state"])
+                self.assertEqual("unknown", later_entry["final_disposition"])
+                self.assertEqual([], processor.successful_archives)
+
+                earlier_result = self.m._traditional_zip_move_scheduler_result(
+                    processor,
+                    archive_a,
+                    args=args,
+                    output_base=output_root,
+                )
+
+                self.m._handle_transactional_result(
+                    earlier_result,
+                    processor=processor,
+                    args=args,
+                    output_base=output_root,
+                    touched_output_dirs=touched_output_dirs,
+                    pending_by_output_dir=pending_by_output_dir,
+                )
+
+            self.assertEqual(
+                [os.path.abspath(archive_a), os.path.abspath(archive_b)],
+                processor.successful_archives,
+            )
+
     def test_delete_rejects_fsync_files_none(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
@@ -5322,6 +15203,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
             self.m._txn_snapshot(txn)
 
             manifest_path = self.m._dataset_manifest_path(output_root)
@@ -5795,39 +15677,25 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual("unknown", manifest_entry["final_disposition"])
             self.assertIsNone(manifest_entry["finalized_at"])
 
-    def test_delete_durability_failure_on_journal_fsync_preserves_source_and_recoverable_state(
-        self,
-    ):
+    def test_delete_durability_barrier_ignores_txn_json_fsync_failure(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_delete_barrier_txn_fixture(td)
-            archive_path = os.path.abspath(fixture["archive_path"])
+            txn_json_path = os.path.abspath(fixture["txn"]["paths"]["txn_json"])
 
-            def fail_on_wal_fsync(path, debug=False):
-                path = os.path.abspath(path)
-                if path == os.path.abspath(fixture["txn"]["paths"]["wal"]):
-                    return False
-                return True
+            def fail_on_txn_json_fsync(path, debug=False):
+                return os.path.abspath(path) != txn_json_path
 
             with mock.patch.object(
-                self.m, "_fsync_file", side_effect=fail_on_wal_fsync
+                self.m, "_fsync_file", side_effect=fail_on_txn_json_fsync
             ):
-                with self.assertRaises(RuntimeError) as ctx:
-                    self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
 
-            self.assertIn("journal_fsync_failed:wal", str(ctx.exception))
-            self.assertTrue(os.path.exists(archive_path))
-            with open(fixture["txn"]["paths"]["txn_json"], "r", encoding="utf-8") as f:
-                saved_txn = json.load(f)
             manifest = self.m._load_dataset_manifest(fixture["output_root"])
             manifest_entry = manifest["archives"][
                 self.m._dataset_manifest_archive_id(fixture["archive_path"])
             ]
-            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
-            self.assertEqual("DURABILITY_FAILED", saved_txn["error"]["type"])
-            self.assertEqual("DURABILITY_FAILED", manifest_entry["error"]["type"])
-            self.assertEqual("recoverable", manifest_entry["state"])
-            self.assertEqual("unknown", manifest_entry["final_disposition"])
-            self.assertIsNone(manifest_entry["finalized_at"])
+            self.assertEqual("succeeded", manifest_entry["state"])
+            self.assertEqual("success:delete", manifest_entry["final_disposition"])
 
     def test_windows_transactional_delete_payload_dir_fsync_failure_blocks_delete(self):
         with tempfile.TemporaryDirectory() as td:
@@ -5881,12 +15749,8 @@ class TestTxnPrimitives(unittest.TestCase):
             archive_path = os.path.abspath(fixture["archive_path"])
             archive_id = self.m._dataset_manifest_archive_id(archive_path)
             expected_open_paths = {
-                os.path.abspath(fixture["txn"]["paths"]["wal"]),
-                os.path.abspath(fixture["txn"]["paths"]["txn_json"]),
-            }
-            expected_open_paths.update(
                 os.path.abspath(path) for path in fixture["expected_payload_files"]
-            )
+            }
             open_calls = []
             helper_opened_fds = []
             helper_closed_fds = []
@@ -5950,7 +15814,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 "success:delete",
                 manifest_entry["final_disposition"],
             )
-            self.assertTrue(expected_open_paths.issubset(opened_paths))
+            self.assertEqual(expected_open_paths, opened_paths)
             self.assertIs(True, barrier_called["value"])
             self.assertCountEqual(helper_opened_fds, helper_closed_fds)
 
@@ -6015,7 +15879,7 @@ class TestTxnPrimitives(unittest.TestCase):
             inspect.signature(self.m._durability_barrier).parameters,
         )
 
-    def test_windows_transactional_delete_keeps_wal_fsync_failure_blocking(self):
+    def test_windows_transactional_delete_ignores_wal_fsync_failure(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_delete_barrier_txn_fixture(td)
             wal_path = os.path.abspath(fixture["txn"]["paths"]["wal"])
@@ -6023,13 +15887,22 @@ class TestTxnPrimitives(unittest.TestCase):
             def fail_on_wal_fsync(path, debug=False):
                 return os.path.abspath(path) != wal_path
 
-            self._assert_windows_transactional_delete_barrier_failure(
-                fixture,
-                fsync_file_side_effect=fail_on_wal_fsync,
-                expected_error_text="journal_fsync_failed:wal",
-            )
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "_fsync_file", side_effect=fail_on_wal_fsync),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
 
-    def test_windows_transactional_delete_keeps_txn_json_fsync_failure_blocking(self):
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            archive_id = self.m._dataset_manifest_archive_id(fixture["archive_path"])
+            manifest_entry = manifest["archives"][archive_id]
+
+            self.assertEqual("succeeded", manifest_entry["state"])
+            self.assertEqual("success:delete", manifest_entry["final_disposition"])
+            self.assertFalse(os.path.exists(fixture["archive_path"]))
+
+    def test_windows_transactional_delete_ignores_txn_json_fsync_failure(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_delete_barrier_txn_fixture(td)
             txn_json_path = os.path.abspath(fixture["txn"]["paths"]["txn_json"])
@@ -6037,11 +15910,18 @@ class TestTxnPrimitives(unittest.TestCase):
             def fail_on_txn_json_fsync(path, debug=False):
                 return os.path.abspath(path) != txn_json_path
 
-            self._assert_windows_transactional_delete_barrier_failure(
-                fixture,
-                fsync_file_side_effect=fail_on_txn_json_fsync,
-                expected_error_text="journal_fsync_failed:txn_json",
-            )
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m, "_fsync_file", side_effect=fail_on_txn_json_fsync),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            archive_id = self.m._dataset_manifest_archive_id(fixture["archive_path"])
+            manifest_entry = manifest["archives"][archive_id]
+            self.assertEqual("succeeded", manifest_entry["state"])
+            self.assertEqual("success:delete", manifest_entry["final_disposition"])
 
     def test_windows_transactional_delete_keeps_payload_file_fsync_failure_blocking(self):
         with tempfile.TemporaryDirectory() as td:
@@ -6080,33 +15960,15 @@ class TestTxnPrimitives(unittest.TestCase):
             manifest = self.m._load_dataset_manifest(fixture["output_root"])
             self.assertEqual("recoverable", manifest["archives"][archive_id]["state"])
 
-            recoverable_archives, retryable_archives, pending_archives = (
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:aborted_recovery_contradiction"
+            ):
                 self.m._build_transactional_archive_plan(
                     manifest,
                     fixture["output_root"],
                 )
-            )
 
-            rebuilt_manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            rebuilt_entry = rebuilt_manifest["archives"][archive_id]
-
-            self.assertEqual(
-                [
-                    {
-                        "archive_path": archive_path,
-                        "output_dir": os.path.abspath(fixture["output_dir"]),
-                    }
-                ],
-                recoverable_archives,
-            )
-            self.assertEqual([], retryable_archives)
-            self.assertEqual([], pending_archives)
-            self.assertEqual("recoverable", rebuilt_entry["state"])
-            self.assertEqual("DURABILITY_FAILED", rebuilt_entry["error"]["type"])
-            self.assertEqual("unknown", rebuilt_entry["final_disposition"])
-            self.assertIsNone(rebuilt_entry["finalized_at"])
-
-    def test_delete_durability_failure_resume_uses_recovery_without_reextract(self):
+    def test_delete_durability_failure_resume_refuses_recovery_without_reextract(self):
         class DummyLock:
             def __init__(self, path, timeout_ms, retry_ms, debug):
                 self.path = path
@@ -6160,27 +16022,23 @@ class TestTxnPrimitives(unittest.TestCase):
                 mock.patch.object(self.m, "_fsync_file", return_value=True),
                 mock.patch.object(self.m, "_fsync_dir", return_value=True),
             ):
-                self.m._run_transactional(processor, [], args=fixture["args"])
+                result = self.m._run_transactional(processor, [], args=fixture["args"])
 
             manifest = self.m._load_dataset_manifest(fixture["output_root"])
             entry = manifest["archives"][archive_id]
 
-            self.assertFalse(os.path.exists(archive_path))
-            self.assertTrue(
-                os.path.exists(os.path.join(fixture["output_dir"], "root.txt"))
-            )
-            self.assertTrue(
-                os.path.exists(
-                    os.path.join(fixture["output_dir"], "a", "b", "payload.txt")
-                )
-            )
+            self.assertFalse(result)
+            self.assertTrue(os.path.exists(archive_path))
             self.assertFalse(os.path.exists(os.path.join(duplicate_root, "root.txt")))
             self.assertFalse(
                 os.path.exists(os.path.join(duplicate_root, "a", "b", "payload.txt"))
             )
-            self.assertEqual("succeeded", entry["state"])
-            self.assertEqual("success:delete", entry["final_disposition"])
-            self.assertIsNone(entry["error"])
+            self.assertEqual([], processor.successful_archives)
+            self.assertEqual([], processor.failed_archives)
+            self.assertEqual([], processor.skipped_archives)
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertEqual("DURABILITY_FAILED", entry["error"]["type"])
 
     def test_delete_durability_failure_resume_keeps_source_when_expected_payload_missing(
         self,
@@ -6276,6 +16134,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 final_disposition="success:delete",
                 txn_terminal_state=self.m.TXN_STATE_DONE,
             )
+            self.m._ensure_source_finalization_v2(txn, args=fixture["args"])
             self.m._txn_snapshot(txn)
 
             with (
@@ -6351,7 +16210,7 @@ class TestTxnPrimitives(unittest.TestCase):
             )
             archive_path = os.path.abspath(fixture["archive_path"])
             archive_id = fixture["archive_id"]
-            real_snapshot = self.m._txn_snapshot
+            real_snapshot = self.m._txn_snapshot_v2
 
             manifest = self.m._load_dataset_manifest(fixture["output_root"])
             with mock.patch.object(self.m.os, "name", "nt"):
@@ -6378,7 +16237,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 mock.patch.object(self.m, "_fsync_file", return_value=True),
                 mock.patch.object(self.m, "_fsync_dir", return_value=True),
                 mock.patch.object(
-                    self.m, "_txn_snapshot", side_effect=crash_after_plan_persisted
+                    self.m, "_txn_snapshot_v2", side_effect=crash_after_plan_persisted
                 ),
                 self.assertRaises(SystemExit),
             ):
@@ -6533,7 +16392,9 @@ class TestTxnPrimitives(unittest.TestCase):
                 os.path.exists(self.m._work_base(fixture["output_root"]))
             )
 
-    def test_terminal_failure_move_manifest_reopens_without_missing_source_drift(self):
+    def test_retryable_failure_move_without_payload_reopens_without_terminalizing(
+        self,
+    ):
         class DummyLock:
             def __init__(self, path, timeout_ms, retry_ms, debug):
                 self.path = path
@@ -6598,7 +16459,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 output_base=output_root,
                 touched_output_dirs=set(),
             )
-            self.assertFalse(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(archive_path))
 
             reopen_processor = types.SimpleNamespace(
                 successful_archives=[], failed_archives=[], skipped_archives=[]
@@ -6610,7 +16471,7 @@ class TestTxnPrimitives(unittest.TestCase):
                     self.m,
                     "_extract_phase",
                     side_effect=AssertionError(
-                        "terminal retained failure move manifest should not re-extract"
+                        "retryable no-placement failure should not silently re-extract on reopen"
                     ),
                 ),
             ):
@@ -6618,14 +16479,17 @@ class TestTxnPrimitives(unittest.TestCase):
 
             manifest = self.m._load_dataset_manifest(output_root)
 
-            self.assertIsNone(result)
+            self.assertFalse(result)
             self.assertEqual([], reopen_processor.successful_archives)
             self.assertEqual([], reopen_processor.failed_archives)
             self.assertEqual([], reopen_processor.skipped_archives)
-            self.assertIsNone(manifest)
-            self.assertFalse(os.path.exists(self.m._work_base(output_root)))
+            self.assertIsNotNone(manifest)
+            entry = manifest["archives"][archive_id]
+            self.assertEqual("retryable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertTrue(os.path.exists(self.m._work_base(output_root)))
 
-    def test_success_delete_closed_terminal_crash_retires_residue_on_new_command(
+    def test_success_delete_manifest_terminal_crash_resumes_on_new_command(
         self,
     ):
         class DummyLock:
@@ -6642,21 +16506,17 @@ class TestTxnPrimitives(unittest.TestCase):
             fixture = self._make_success_finalization_txn_fixture(
                 td, success_policy="delete"
             )
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            with mock.patch.object(self.m.os, "name", "nt"):
-                manifest["command_fingerprint"] = self.m._build_command_fingerprint(
-                    fixture["args"]
-                )
-            self.m._save_dataset_manifest(manifest)
             archive_path = os.path.abspath(fixture["archive_path"])
-            archive_id = fixture["archive_id"]
+            real_update_manifest = self.m._update_dataset_manifest_archive
 
-            real_snapshot = self.m._txn_snapshot
-
-            def crash_after_source_finalized(txn):
-                real_snapshot(txn)
-                if txn.get("state") == self.m.TXN_STATE_SOURCE_FINALIZED:
-                    raise SystemExit("crash-after-source-finalized")
+            def crash_before_terminal_manifest(output_base, archive_path_arg, **kwargs):
+                if (
+                    os.path.abspath(archive_path_arg) == archive_path
+                    and kwargs.get("state") == "succeeded"
+                    and kwargs.get("final_disposition") == "success:delete"
+                ):
+                    raise SystemExit("crash-before-terminal-delete-manifest")
+                return real_update_manifest(output_base, archive_path_arg, **kwargs)
 
             with (
                 mock.patch.object(self.m.os, "name", "nt"),
@@ -6664,16 +16524,34 @@ class TestTxnPrimitives(unittest.TestCase):
                 mock.patch.object(self.m, "_fsync_file", return_value=True),
                 mock.patch.object(self.m, "_fsync_dir", return_value=True),
                 mock.patch.object(
-                    self.m, "_txn_snapshot", side_effect=crash_after_source_finalized
+                    self.m,
+                    "_update_dataset_manifest_archive",
+                    side_effect=crash_before_terminal_manifest,
                 ),
                 self.assertRaises(SystemExit),
             ):
                 self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
 
-            self.assertFalse(os.path.exists(archive_path))
             crashed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            crashed_entry = crashed_manifest["archives"][archive_id]
+            crashed_entry = crashed_manifest["archives"][fixture["archive_id"]]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                crashed_entry,
+                fixture["output_root"],
+            )
             self.assertNotEqual("succeeded", crashed_entry["state"])
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertEqual(self.m.TXN_STATE_SOURCE_FINALIZED, saved_txn["state"])
+            self.assertTrue(self.m._txn_source_finalization_completed(saved_txn))
+            self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
+            self.assertFalse(self.m._txn_is_closed_terminal_outcome(saved_txn))
+            self.assertEqual(
+                "resume_required",
+                self.m._reconciled_archive_classification(
+                    crashed_entry,
+                    saved_txn,
+                ),
+            )
+            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
 
             processor = types.SimpleNamespace(
                 successful_archives=[], failed_archives=[], skipped_archives=[]
@@ -6696,13 +16574,21 @@ class TestTxnPrimitives(unittest.TestCase):
                 result = self.m._run_transactional(processor, [], args=fixture["args"])
 
             resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][fixture["archive_id"]]
+            resumed_txn = self.m._load_latest_txn_for_archive(
+                resumed_entry,
+                fixture["output_root"],
+            )
 
             self.assertIsNone(result)
-            self.assertEqual([], processor.successful_archives)
+            self.assertEqual([archive_path], processor.successful_archives)
             self.assertEqual([], processor.failed_archives)
             self.assertEqual([], processor.skipped_archives)
-            self.assertIsNone(resumed_manifest)
-            self.assertFalse(
+            self.assertIsNotNone(resumed_manifest)
+            self.assertEqual(self.m.TXN_STATE_DONE, resumed_txn["state"])
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual("success:delete", resumed_entry["final_disposition"])
+            self.assertTrue(
                 os.path.exists(self.m._work_base(fixture["output_root"]))
             )
 
@@ -7331,11 +17217,8 @@ class TestTxnPrimitives(unittest.TestCase):
             plan_checkpoint_calls = {"count": 0}
 
             def fail_planned_destination_checkpoint(txn, include_parent=False):
-                placement = txn.get("placement") or {}
-                finalized_moves = placement.get("finalized_source_moves") or []
-                if finalized_moves and not any(
-                    record.get("durable") for record in finalized_moves
-                ):
+                source_ops = self.m._source_finalization_ops(txn)
+                if source_ops and all(op.get("phase") == "PLAN_WRITTEN" for op in source_ops):
                     plan_checkpoint_calls["count"] += 1
                     if plan_checkpoint_calls["count"] == 1:
                         raise RuntimeError(
@@ -7376,8 +17259,11 @@ class TestTxnPrimitives(unittest.TestCase):
                 os.path.abspath(planned_dst),
                 self.m._planned_finalized_source_move(saved_txn, archive_path),
             )
+            self.assertEqual(
+                ["PLAN_WRITTEN"],
+                [op["phase"] for op in self.m._source_finalization_ops(saved_txn)],
+            )
             self.assertTrue(self.m._txn_has_incomplete_source_finalization(saved_txn))
-            self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
             self.assertEqual("recoverable", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
@@ -7392,6 +17278,7 @@ class TestTxnPrimitives(unittest.TestCase):
             args = fixture["args"]
             args.success_policy = "move"
             args.success_to = os.path.join(td, "success")
+            self._set_manifest_command_fingerprint(fixture["output_root"], args)
             txn = self.m._txn_create(
                 archive_path=archive["archive_path"],
                 volumes=archive["volumes"],
@@ -7408,6 +17295,27 @@ class TestTxnPrimitives(unittest.TestCase):
                 final_disposition="success:move",
                 txn_terminal_state=self.m.TXN_STATE_DONE,
             )
+            placement_src = os.path.join(txn["paths"]["incoming_dir"], "payload.txt")
+            placement_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(placement_dst), exist_ok=True)
+            with open(placement_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": placement_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
             txn["state"] = self.m.TXN_STATE_SOURCE_FINALIZED
             self.m._plan_finalized_source_destination(
                 txn,
@@ -7420,12 +17328,108 @@ class TestTxnPrimitives(unittest.TestCase):
             )
             self.m._txn_snapshot(txn)
 
-            with mock.patch.object(
-                self.m, "_finalize_sources_success", return_value=None
-            ) as finalize_mock:
-                self.m._resume_source_finalization_if_needed(txn, args=args)
+            replayed_ops = []
+            real_replay = self.m._replay_source_finalization_op
 
-            self.assertTrue(finalize_mock.called)
+            def record_replay(current_txn, op):
+                replayed_ops.append(op["op_id"])
+                return real_replay(current_txn, op)
+
+            with mock.patch.object(
+                self.m,
+                "_replay_source_finalization_op",
+                side_effect=record_replay,
+            ):
+                resumed = self.m._resume_source_finalization_if_needed(txn, args=args)
+
+            self.assertTrue(resumed)
+            self.assertEqual([1], replayed_ops)
+            self.assertEqual(self.m.TXN_STATE_DONE, txn["state"])
+
+    def test_success_delete_collision_plan_validates_and_recovers(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="delete")
+            txn = fixture["txn"]
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+
+            payload_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(payload_dst), exist_ok=True)
+            with open(payload_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            collision_dst = os.path.join(
+                txn["paths"]["trash_dir"], os.path.basename(archive_path)
+            )
+            os.makedirs(os.path.dirname(collision_dst), exist_ok=True)
+            with open(collision_dst, "w", encoding="utf-8") as f:
+                f.write("collision")
+
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": payload_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+            self.m._set_source_finalization_plan(
+                txn,
+                manifest_state="succeeded",
+                final_disposition="success:delete",
+                txn_terminal_state=self.m.TXN_STATE_DONE,
+                args=fixture["args"],
+            )
+            self.assertTrue(self.m._validate_source_finalization_v2(txn))
+            planned_dst = txn["source_finalization_v2"]["ops"][0]["dst"]
+            self.assertNotEqual(collision_dst, planned_dst)
+            self.assertIn(f"_{txn['txn_id'][:8]}_", os.path.basename(planned_dst))
+
+            txn["state"] = self.m.TXN_STATE_ABORTED
+            txn["error"] = {
+                "type": "ABORTED",
+                "message": "crash after planning success delete",
+                "at": self.m._now_iso(),
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(entry, fixture["output_root"])
+
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(planned_dst))
+            self.assertFalse(os.path.exists(txn["paths"]["trash_dir"]))
+            self.assertEqual(self.m.TXN_STATE_DONE, saved_txn["state"])
+            self.assertEqual(
+                ["FINALIZE_DONE"],
+                [op["phase"] for op in self.m._source_finalization_ops(saved_txn)],
+            )
+            self.assertEqual("succeeded", entry["state"])
+            self.assertEqual("success:delete", entry["final_disposition"])
 
     def test_success_move_aborted_after_rename_replays_destination_durability(self):
         with tempfile.TemporaryDirectory() as td:
@@ -7509,9 +17513,7 @@ class TestTxnPrimitives(unittest.TestCase):
             marker_checkpoint_calls = {"count": 0}
 
             def fail_durable_marker_checkpoint(txn, include_parent=False):
-                placement = txn.get("placement") or {}
-                finalized_moves = placement.get("finalized_source_moves") or []
-                if any(record.get("durable") for record in finalized_moves):
+                if txn.get("state") == self.m.TXN_STATE_PLACED and txn.get("payload_durable"):
                     marker_checkpoint_calls["count"] += 1
                     if marker_checkpoint_calls["count"] == 1:
                         raise marker_failure
@@ -7544,20 +17546,17 @@ class TestTxnPrimitives(unittest.TestCase):
                 fixture["output_root"],
             )
 
-            self.assertFalse(os.path.exists(archive_path))
-            self.assertTrue(os.path.exists(moved_dst))
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(moved_dst))
             self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
             self.assertEqual("DURABILITY_FAILED", saved_txn["error"]["type"])
+            self.assertTrue(saved_txn.get("payload_durable"))
+            self.assertIsNone(saved_txn.get("source_finalization_v2"))
             self.assertEqual(
-                "success:move",
-                self.m._txn_source_finalization_plan(saved_txn)["final_disposition"],
+                self.m.TXN_STATE_ABORTED,
+                saved_txn["state"],
             )
-            self.assertEqual(
-                os.path.abspath(moved_dst),
-                self.m._planned_finalized_source_move(saved_txn, archive_path),
-            )
-            self.assertTrue(self.m._txn_has_incomplete_source_finalization(saved_txn))
-            self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
+            self.assertFalse(self.m._txn_has_recovery_responsibility(saved_txn))
             self.assertEqual("recoverable", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
@@ -7586,9 +17585,7 @@ class TestTxnPrimitives(unittest.TestCase):
             marker_checkpoint_calls = {"count": 0}
 
             def fail_durable_marker_checkpoint(txn, include_parent=False):
-                placement = txn.get("placement") or {}
-                finalized_moves = placement.get("finalized_source_moves") or []
-                if any(record.get("durable") for record in finalized_moves):
+                if txn.get("state") == self.m.TXN_STATE_PLACED and txn.get("payload_durable"):
                     marker_checkpoint_calls["count"] += 1
                     if marker_checkpoint_calls["count"] == 1:
                         raise RuntimeError("journal_dir_fsync_failed:dir:durable-marker")
@@ -7635,12 +17632,390 @@ class TestTxnPrimitives(unittest.TestCase):
                 self.m._run_transactional(processor, [], args=fixture["args"])
 
             resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+
+            self.assertIsNotNone(resumed_manifest)
+            self.assertEqual([], processor.successful_archives)
+            self.assertEqual([], processor.failed_archives)
+            self.assertEqual([], processor.skipped_archives)
+            self.assertEqual(
+                "recoverable",
+                resumed_manifest["archives"][archive_id]["state"],
+            )
+            self.assertTrue(os.path.exists(self.m._work_base(fixture["output_root"])))
+
+    def test_success_move_crash_after_persisted_durable_snapshot_strict_resume_replays_source_finalization(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td, success_policy="move"
+            )
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+            real_snapshot = self.m._txn_snapshot_v2
+            crashed = {"done": False}
+
+            def crash_after_persisted_durable_snapshot(txn):
+                result = real_snapshot(txn)
+                if txn.get("state") == self.m.TXN_STATE_DURABLE and not crashed["done"]:
+                    crashed["done"] = True
+                    raise SystemExit("crash-after-persisted-durable-snapshot")
+                return result
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=crash_after_persisted_durable_snapshot,
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(entry, fixture["output_root"])
+
+            self.assertEqual(self.m.TXN_STATE_DURABLE, saved_txn["state"])
+            self.assertEqual("success_move", saved_txn["source_finalization_v2"]["policy_kind"])
+            self.assertTrue(self.m._validate_source_finalization_v2(saved_txn))
+            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "resume must replay source finalization without re-extracting"
+                    ),
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(processor, [], args=fixture["args"])
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
             resumed_entry = resumed_manifest["archives"][archive_id]
 
             self.assertEqual([archive_path], processor.successful_archives)
             self.assertEqual([], processor.failed_archives)
+            self.assertEqual([], processor.skipped_archives)
             self.assertEqual("succeeded", resumed_entry["state"])
             self.assertEqual("success:move", resumed_entry["final_disposition"])
+
+    def test_traditional_zip_move_crash_after_persisted_durable_snapshot_strict_resume_replays_source_finalization(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            processor = self.m.ArchiveProcessor(args)
+            real_snapshot = self.m._txn_snapshot_v2
+            crashed = {"done": False}
+
+            def crash_after_persisted_durable_snapshot(txn):
+                result = real_snapshot(txn)
+                if txn.get("state") == self.m.TXN_STATE_DURABLE and not crashed["done"]:
+                    crashed["done"] = True
+                    raise SystemExit("crash-after-traditional-persisted-durable-snapshot")
+                return result
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=crash_after_persisted_durable_snapshot,
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                self.m._extract_phase(
+                    processor,
+                    archive_path,
+                    args=args,
+                    output_base=output_root,
+                )
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(entry, output_root)
+
+            self.assertEqual(self.m.TXN_STATE_DURABLE, saved_txn["state"])
+            self.assertEqual(
+                "traditional_zip_move",
+                saved_txn["source_finalization_v2"]["policy_kind"],
+            )
+            self.assertTrue(self.m._validate_source_finalization_v2(saved_txn))
+            self.assertTrue(self.m._validate_strict_resume_startup(args))
+
+            resume_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "resume must replay traditional ZIP source finalization without re-extracting"
+                    ),
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(resume_processor, [], args=args)
+
+            resumed_manifest = self.m._load_dataset_manifest(output_root)
+            resumed_entry = resumed_manifest["archives"][archive_id]
+
+            self.assertEqual([os.path.abspath(archive_path)], resume_processor.successful_archives)
+            self.assertEqual([], resume_processor.failed_archives)
+            self.assertEqual([], resume_processor.skipped_archives)
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual(
+                "skipped:traditional_zip_moved",
+                resumed_entry["final_disposition"],
+            )
+
+    def test_traditional_zip_move_does_not_persist_init_with_source_finalization_v2(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            processor = self.m.ArchiveProcessor(args)
+            real_snapshot = self.m._txn_snapshot_v2
+            captured = []
+
+            def observe_snapshot(txn):
+                source_finalization_v2 = txn.get("source_finalization_v2")
+                if source_finalization_v2 is not None:
+                    captured.append(
+                        {
+                            "state": txn.get("state"),
+                            "payload_durable": bool(txn.get("payload_durable")),
+                            "phases": [
+                                op.get("phase")
+                                for op in (source_finalization_v2.get("ops") or [])
+                            ],
+                        }
+                    )
+                return real_snapshot(txn)
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=observe_snapshot,
+                ),
+            ):
+                result = self.m._extract_phase(
+                    processor,
+                    archive_path,
+                    args=args,
+                    output_base=output_root,
+                )
+
+            self.assertEqual("txn", result["kind"])
+            self.assertTrue(captured)
+            self.assertNotIn(
+                {
+                    "state": self.m.TXN_STATE_INIT,
+                    "payload_durable": False,
+                    "phases": ["PLAN_WRITTEN"],
+                },
+                captured,
+            )
+
+    def test_done_with_old_traditional_zip_move_placement_metadata_refuses_recovery_before_mutation(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            os.makedirs(trad_to)
+
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            moved_dst = os.path.join(trad_to, os.path.basename(archive_path))
+            os.replace(archive_path, moved_dst)
+
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_root,
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
+            txn["resolved_policy"] = "traditional_zip_move"
+            txn["policy_frozen"] = True
+            txn["payload_durable"] = True
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "traditional_zip_move",
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": archive_path,
+                        "dst": moved_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 0,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive_path,
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][archive_id]
+
+            with self.assertRaisesRegex(RuntimeError, "refuse_recovery:invalid_placement_v2"):
+                self.m._txn_is_closed_terminal_outcome(txn)
+            with self.assertRaisesRegex(RuntimeError, "refuse_recovery:invalid_placement_v2"):
+                self.m._classify_manifest_archive_state(entry, output_root)
+            with self.assertRaisesRegex(RuntimeError, "refuse_recovery:invalid_placement_v2"):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    output_root,
+                    persist=False,
+                )
+
+            original_mtime = os.path.getmtime(moved_dst)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(args)
+
+            self.assertFalse(result)
+            self.assertEqual(original_mtime, os.path.getmtime(moved_dst))
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
 
     def test_success_delete_resume_cleans_stranded_trash_before_terminalizing(self):
         class DummyLock:
@@ -7666,12 +18041,13 @@ class TestTxnPrimitives(unittest.TestCase):
             archive_path = os.path.abspath(fixture["archive_path"])
             archive_id = fixture["archive_id"]
             trash_dir = fixture["txn"]["paths"]["trash_dir"]
-            real_safe_rmtree = self.m.safe_rmtree
+            trash_dst = os.path.join(trash_dir, os.path.basename(archive_path))
+            real_safe_remove = self.m.safe_remove
 
             def crash_before_trash_cleanup(path, debug=False):
-                if os.path.abspath(path) == os.path.abspath(trash_dir):
+                if os.path.abspath(path) == os.path.abspath(trash_dst):
                     raise SystemExit("crash-before-trash-cleanup")
-                return real_safe_rmtree(path, debug)
+                return real_safe_remove(path, debug)
 
             with (
                 mock.patch.object(self.m.os, "name", "nt"),
@@ -7679,7 +18055,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 mock.patch.object(self.m, "_fsync_file", return_value=True),
                 mock.patch.object(self.m, "_fsync_dir", return_value=True),
                 mock.patch.object(
-                    self.m, "safe_rmtree", side_effect=crash_before_trash_cleanup
+                    self.m, "safe_remove", side_effect=crash_before_trash_cleanup
                 ),
                 self.assertRaises(SystemExit),
             ):
@@ -7744,11 +18120,8 @@ class TestTxnPrimitives(unittest.TestCase):
             plan_checkpoint_calls = {"count": 0}
 
             def fail_planned_destination_checkpoint(txn, include_parent=False):
-                placement = txn.get("placement") or {}
-                finalized_moves = placement.get("finalized_source_moves") or []
-                if finalized_moves and not any(
-                    record.get("durable") for record in finalized_moves
-                ):
+                source_ops = self.m._source_finalization_ops(txn)
+                if source_ops and all(op.get("phase") == "PLAN_WRITTEN" for op in source_ops):
                     plan_checkpoint_calls["count"] += 1
                     if plan_checkpoint_calls["count"] == 1:
                         raise RuntimeError(
@@ -7789,8 +18162,8 @@ class TestTxnPrimitives(unittest.TestCase):
                 self.m._txn_source_finalization_plan(saved_txn)["final_disposition"],
             )
             self.assertEqual(
-                os.path.abspath(planned_dst),
-                self.m._planned_finalized_source_move(saved_txn, archive_path),
+                ["PLAN_WRITTEN"],
+                [op["phase"] for op in self.m._source_finalization_ops(saved_txn)],
             )
             self.assertTrue(self.m._txn_has_incomplete_source_finalization(saved_txn))
             self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
@@ -7873,9 +18246,7 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual("succeeded", entry["state"])
             self.assertEqual("success:delete", entry["final_disposition"])
 
-    def test_success_delete_trash_cleanup_marker_snapshot_failure_does_not_terminalize_failure(
-        self,
-    ):
+    def test_success_delete_cleanup_failure_stays_recoverable(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_success_finalization_txn_fixture(
                 td,
@@ -7884,41 +18255,25 @@ class TestTxnPrimitives(unittest.TestCase):
             archive_path = os.path.abspath(fixture["archive_path"])
             archive_id = fixture["archive_id"]
             trash_dir = fixture["txn"]["paths"]["trash_dir"]
-            real_safe_rmtree = self.m.safe_rmtree
-            real_txn_snapshot = self.m._txn_snapshot
-            snapshot_failure = RuntimeError("delete-trash-cleanup-marker-snapshot-failed")
-            marker_snapshot_calls = {"count": 0}
+            trash_dst = os.path.join(trash_dir, os.path.basename(archive_path))
+            real_safe_remove = self.m.safe_remove
 
-            def false_for_trash_dir(path, debug=False):
-                if os.path.abspath(path) == os.path.abspath(trash_dir):
+            def false_for_trash_dst(path, debug=False):
+                if os.path.abspath(path) == os.path.abspath(trash_dst):
                     return False
-                return real_safe_rmtree(path, debug)
-
-            def fail_delete_cleanup_marker_snapshot(txn):
-                placement = txn.get("placement") or {}
-                if placement.get("delete_trash_cleanup_failed"):
-                    marker_snapshot_calls["count"] += 1
-                    if marker_snapshot_calls["count"] == 1:
-                        raise snapshot_failure
-                return real_txn_snapshot(txn)
+                return real_safe_remove(path, debug)
 
             with (
-                contextlib.redirect_stdout(io.StringIO()),
                 mock.patch.object(self.m, "_fsync_file", return_value=True),
                 mock.patch.object(self.m, "_fsync_dir", return_value=True),
                 mock.patch.object(
                     self.m,
-                    "safe_rmtree",
-                    side_effect=false_for_trash_dir,
-                ),
-                mock.patch.object(
-                    self.m,
-                    "_txn_snapshot",
-                    side_effect=fail_delete_cleanup_marker_snapshot,
+                    "safe_remove",
+                    side_effect=false_for_trash_dst,
                 ),
                 self.assertRaisesRegex(
                     RuntimeError,
-                    "delete-trash-cleanup-marker-snapshot-failed",
+                    "source_delete_cleanup_failed:",
                 ),
             ):
                 self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
@@ -7932,31 +18287,94 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertFalse(os.path.exists(archive_path))
             self.assertTrue(os.path.exists(trash_dir))
-            self.assertEqual(self.m.TXN_STATE_DURABLE, saved_txn["state"])
-            self.assertIsNone(saved_txn.get("error"))
-            self.assertFalse(
-                (saved_txn.get("placement") or {}).get("delete_trash_cleanup_failed")
-            )
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual("FAIL_FINALIZE_FAILED", saved_txn["error"]["type"])
             self.assertTrue(self.m._txn_has_incomplete_source_finalization(saved_txn))
             self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
-            self.assertEqual("pending", entry["state"])
+            self.assertEqual("retryable", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
-            self.assertIsNone(entry.get("error"))
+            self.assertEqual("FAIL_FINALIZE_FAILED", entry["error"]["type"])
 
-    def test_extract_failure_move_closed_terminal_crash_retires_residue_on_new_command(
-        self,
-    ):
-        class DummyLock:
-            def __init__(self, path, timeout_ms, retry_ms, debug):
-                self.path = path
+    def test_success_move_copy_fsync_failure_stays_recoverable(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+            payload_root = os.path.join(txn["output_dir"], "tree")
+            os.makedirs(payload_root, exist_ok=True)
+            with open(os.path.join(payload_root, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            shutil.rmtree(os.path.join(txn["paths"]["incoming_dir"], "tree"))
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "tree"),
+                        "dst": payload_root,
+                        "backend": "rename",
+                        "entry_kind": "dir",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            txn["payload_durable"] = True
+            success_dst = os.path.join(
+                fixture["args"].success_to,
+                txn["txn_id"],
+                os.path.basename(archive_path),
+            )
+            tmp_dst = self.m._source_finalization_tmp_dst(txn, success_dst, 1)
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "success_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": archive_path,
+                        "dst": success_dst,
+                        "tmp_dst": tmp_dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
 
-            def __enter__(self):
-                return self
+            real_copy_path_for_placement = self.m._copy_path_for_placement
 
-            def __exit__(self, exc_type, exc, tb):
-                return False
+            def copy_then_fail(src, dst, *, entry_kind):
+                real_copy_path_for_placement(src, dst, entry_kind=entry_kind)
+                raise RuntimeError(f"placement_copy_fsync_failed:file:{dst}")
 
+            with (
+                mock.patch.object(self.m, "same_volume", return_value=False),
+                mock.patch.object(
+                    self.m,
+                    "_copy_path_for_placement",
+                    side_effect=copy_then_fail,
+                ),
+                self.assertRaisesRegex(RuntimeError, "placement_copy_fsync_failed:file:"),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(entry, fixture["output_root"])
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual("DURABILITY_FAILED", saved_txn["error"]["type"])
+            self.assertTrue(self.m._txn_has_incomplete_source_finalization(saved_txn))
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+
+    def test_extract_failure_move_stays_retryable_without_payload_placement(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -7984,72 +18402,63 @@ class TestTxnPrimitives(unittest.TestCase):
                 discovered_archives=discovered,
                 command_fingerprint=self.m._build_command_fingerprint(args),
             )
-            archive_id = self.m._dataset_manifest_archive_id(archive_path)
-
             processor = types.SimpleNamespace(
                 sfx_detector=None,
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
 
-            real_update_manifest = self.m._update_dataset_manifest_archive
-
-            def crash_before_terminal_manifest(output_base, archive_path_arg, **kwargs):
-                if (
-                    os.path.abspath(archive_path_arg) == archive_path
-                    and kwargs.get("state") == "failed"
-                    and kwargs.get("final_disposition") == "failure:move"
-                ):
-                    raise SystemExit("crash-before-terminal-failure-manifest")
-                return real_update_manifest(output_base, archive_path_arg, **kwargs)
-
             with (
                 mock.patch.object(self.m, "_validate_environment_for_output_dir"),
                 mock.patch.object(self.m, "try_extract", return_value=False),
-                mock.patch.object(
-                    self.m,
-                    "_update_dataset_manifest_archive",
-                    side_effect=crash_before_terminal_manifest,
-                ),
-                self.assertRaises(SystemExit),
             ):
-                self.m._extract_phase(
+                result = self.m._extract_phase(
                     processor,
                     archive_path,
                     args=args,
                     output_base=output_root,
                 )
 
-            self.assertFalse(os.path.exists(archive_path))
-            crashed_manifest = self.m._load_dataset_manifest(output_root)
-            crashed_entry = crashed_manifest["archives"][archive_id]
-            self.assertNotEqual("failed", crashed_entry["state"])
+            self.assertEqual("failed", result["kind"])
+            self.assertEqual(self.m.TXN_STATE_ABORTED, result["txn"]["state"])
+            self.assertFalse(result["failure_finalization_completed"])
+            self.assertIsNone(result["txn"].get("source_finalization_v2"))
+            self.assertNotIn("payload_durable", result["txn"])
 
-            failed_processor = types.SimpleNamespace(
+            result_processor = types.SimpleNamespace(
                 successful_archives=[], failed_archives=[], skipped_archives=[]
             )
-            with (
-                mock.patch.object(self.m, "FileLock", DummyLock),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "resume should not re-extract after failure source move finalized"
-                    ),
-                ),
-                mock.patch.object(self.m, "_garbage_collect"),
-            ):
-                result = self.m._run_transactional(failed_processor, [], args=args)
+            self.m._handle_transactional_result(
+                result,
+                processor=result_processor,
+                args=args,
+                output_base=output_root,
+                touched_output_dirs=set(),
+            )
 
-            resumed_manifest = self.m._load_dataset_manifest(output_root)
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][self.m._dataset_manifest_archive_id(archive_path)]
+            saved_txn = self.m._load_latest_txn_for_archive(entry, output_root)
 
-            self.assertIsNone(result)
-            self.assertEqual([], failed_processor.successful_archives)
-            self.assertEqual([], failed_processor.failed_archives)
-            self.assertEqual([], failed_processor.skipped_archives)
-            self.assertIsNone(resumed_manifest)
-            self.assertFalse(os.path.exists(self.m._work_base(output_root)))
+            self.assertEqual([archive_path], result_processor.failed_archives)
+            self.assertEqual("retryable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertIsNone(entry["finalized_at"])
+            self.assertEqual("EXTRACT_FAILED", entry["error"]["type"])
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual("EXTRACT_FAILED", saved_txn["error"]["type"])
+            self.assertTrue(os.path.exists(archive_path))
 
-    def test_extract_failure_move_crash_after_rename_retires_terminal_residue_on_new_command(
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                startup_ok = self.m._validate_strict_resume_startup(args)
+
+            self.assertFalse(startup_ok)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+
+    def test_extract_failure_move_rename_hook_does_not_run_without_payload(
         self,
     ):
         class DummyLock:
@@ -8095,64 +18504,105 @@ class TestTxnPrimitives(unittest.TestCase):
                 sfx_detector=None,
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
+            rename_calls = []
+
             real_atomic_rename = self.m._atomic_rename
 
-            def crash_after_failure_move(
-                src, dst, *, degrade_cross_volume=False, debug=False
-            ):
-                result = real_atomic_rename(
+            def track_rename(src, dst, *, degrade_cross_volume=False, debug=False):
+                rename_calls.append((os.path.abspath(src), os.path.abspath(dst)))
+                return real_atomic_rename(
                     src,
                     dst,
                     degrade_cross_volume=degrade_cross_volume,
                     debug=debug,
                 )
-                if os.path.abspath(src) == archive_path:
-                    raise SystemExit("crash-after-failure-move-rename")
-                return result
 
             with (
                 mock.patch.object(self.m, "_validate_environment_for_output_dir"),
                 mock.patch.object(self.m, "try_extract", return_value=False),
                 mock.patch.object(
-                    self.m, "_atomic_rename", side_effect=crash_after_failure_move
+                    self.m,
+                    "_atomic_rename",
+                    side_effect=track_rename,
                 ),
-                self.assertRaises(SystemExit),
             ):
-                self.m._extract_phase(
+                result = self.m._extract_phase(
                     processor,
                     archive_path,
                     args=args,
                     output_base=output_root,
                 )
 
-            self.assertFalse(os.path.exists(archive_path))
-
-            failed_processor = types.SimpleNamespace(
-                successful_archives=[], failed_archives=[], skipped_archives=[]
+            planned_dst = os.path.join(
+                fail_to,
+                result["txn"]["txn_id"],
+                os.path.basename(archive_path),
             )
+            self.assertEqual([], rename_calls)
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(planned_dst))
+
+    def test_no_password_move_does_not_plan_failure_replay_without_payload(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            fail_to = os.path.join(td, "failed")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["secret.zip"],
+            )
+            archive_path = os.path.abspath(discovered[0]["archive_path"])
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            password_file = os.path.join(td, "passwords.txt")
+            with open(password_file, "w", encoding="utf-8") as f:
+                f.write("guess\n")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                password_file=password_file,
+                fail_policy="move",
+                fail_to=fail_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+
+            processor = types.SimpleNamespace(
+                sfx_detector=None,
+                find_correct_password=lambda archive_path, encryption_status=None: None,
+                get_all_volumes=lambda path: [os.path.abspath(path)],
+            )
+
             with (
-                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "_validate_environment_for_output_dir"),
                 mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "resume should not re-extract after failure move rename"
-                    ),
+                    self.m, "check_encryption", return_value="encrypted_header"
                 ),
-                mock.patch.object(self.m, "_garbage_collect"),
             ):
-                result = self.m._run_transactional(failed_processor, [], args=args)
+                result = self.m._extract_phase(
+                    processor,
+                    archive_path,
+                    args=args,
+                    output_base=output_root,
+                )
 
-            resumed_manifest = self.m._load_dataset_manifest(output_root)
+            self.assertEqual("failed", result["kind"])
+            self.assertEqual(self.m.TXN_STATE_ABORTED, result["txn"]["state"])
+            self.assertIsNone(result["txn"].get("source_finalization_v2"))
+            self.assertNotIn("payload_durable", result["txn"])
+            self.assertFalse(result["failure_finalization_completed"])
 
-            self.assertIsNone(result)
-            self.assertEqual([], failed_processor.successful_archives)
-            self.assertEqual([], failed_processor.failed_archives)
-            self.assertEqual([], failed_processor.skipped_archives)
-            self.assertIsNone(resumed_manifest)
-            self.assertFalse(os.path.exists(self.m._work_base(output_root)))
-
-    def test_no_password_move_crash_after_source_finalization_resumes_to_terminal_failed(
+    def test_no_password_move_rename_hook_does_not_run_without_payload(
         self,
     ):
         class DummyLock:
@@ -8204,125 +18654,18 @@ class TestTxnPrimitives(unittest.TestCase):
                 find_correct_password=lambda archive_path, encryption_status=None: None,
                 get_all_volumes=lambda path: [os.path.abspath(path)],
             )
+            rename_calls = []
 
-            real_finalize_failure = self.m._finalize_sources_failure
-
-            def crash_after_failure_finalize(volumes, *, args, txn=None):
-                real_finalize_failure(volumes, args=args, txn=txn)
-                raise SystemExit("crash-after-failure-finalize")
-
-            with (
-                mock.patch.object(self.m, "_validate_environment_for_output_dir"),
-                mock.patch.object(
-                    self.m, "check_encryption", return_value="encrypted_header"
-                ),
-                mock.patch.object(
-                    self.m,
-                    "_finalize_sources_failure",
-                    side_effect=crash_after_failure_finalize,
-                ),
-                self.assertRaises(SystemExit),
-            ):
-                self.m._extract_phase(
-                    processor,
-                    archive_path,
-                    args=args,
-                    output_base=output_root,
-                )
-
-            self.assertFalse(os.path.exists(archive_path))
-
-            failed_processor = types.SimpleNamespace(
-                successful_archives=[], failed_archives=[], skipped_archives=[]
-            )
-            with (
-                mock.patch.object(self.m, "FileLock", DummyLock),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "resume should not re-enter password probing after fail move finalized"
-                    ),
-                ),
-                mock.patch.object(self.m, "_garbage_collect"),
-            ):
-                self.m._run_transactional(failed_processor, [], args=args)
-
-            resumed_manifest = self.m._load_dataset_manifest(output_root)
-            resumed_entry = resumed_manifest["archives"][archive_id]
-
-            self.assertEqual([], failed_processor.successful_archives)
-            self.assertEqual([archive_path], failed_processor.failed_archives)
-            self.assertEqual("failed", resumed_entry["state"])
-            self.assertEqual("failure:move", resumed_entry["final_disposition"])
-            self.assertEqual("NO_PASSWORD", resumed_entry["error"]["type"])
-
-    def test_no_password_move_crash_after_rename_before_destination_persistence_resumes(
-        self,
-    ):
-        class DummyLock:
-            def __init__(self, path, timeout_ms, retry_ms, debug):
-                self.path = path
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-        with tempfile.TemporaryDirectory() as td:
-            input_root = os.path.join(td, "input")
-            output_root = os.path.join(td, "output")
-            fail_to = os.path.join(td, "failed")
-            os.makedirs(input_root)
-            os.makedirs(output_root)
-
-            discovered = self._make_discovered_archives(
-                input_root,
-                output_root,
-                ["secret.zip"],
-            )
-            archive_path = os.path.abspath(discovered[0]["archive_path"])
-            archive_id = self.m._dataset_manifest_archive_id(archive_path)
-            password_file = os.path.join(td, "passwords.txt")
-            with open(password_file, "w", encoding="utf-8") as f:
-                f.write("guess\n")
-
-            args = self._make_processing_args(
-                input_root,
-                output=output_root,
-                password_file=password_file,
-                fail_policy="move",
-                fail_to=fail_to,
-                success_clean_journal=False,
-                fail_clean_journal=False,
-            )
-            self.m._create_dataset_manifest(
-                input_root=input_root,
-                output_root=output_root,
-                discovered_archives=discovered,
-                command_fingerprint=self.m._build_command_fingerprint(args),
-            )
-
-            processor = types.SimpleNamespace(
-                sfx_detector=None,
-                find_correct_password=lambda archive_path, encryption_status=None: None,
-                get_all_volumes=lambda path: [os.path.abspath(path)],
-            )
             real_atomic_rename = self.m._atomic_rename
 
-            def crash_after_no_password_move(
-                src, dst, *, degrade_cross_volume=False, debug=False
-            ):
-                result = real_atomic_rename(
+            def track_rename(src, dst, *, degrade_cross_volume=False, debug=False):
+                rename_calls.append((os.path.abspath(src), os.path.abspath(dst)))
+                return real_atomic_rename(
                     src,
                     dst,
                     degrade_cross_volume=degrade_cross_volume,
                     debug=debug,
                 )
-                if os.path.abspath(src) == archive_path:
-                    raise SystemExit("crash-after-no-password-move-rename")
-                return result
 
             with (
                 mock.patch.object(self.m, "_validate_environment_for_output_dir"),
@@ -8330,45 +18673,28 @@ class TestTxnPrimitives(unittest.TestCase):
                     self.m, "check_encryption", return_value="encrypted_header"
                 ),
                 mock.patch.object(
-                    self.m, "_atomic_rename", side_effect=crash_after_no_password_move
+                    self.m,
+                    "_atomic_rename",
+                    side_effect=track_rename,
                 ),
-                self.assertRaises(SystemExit),
             ):
-                self.m._extract_phase(
+                result = self.m._extract_phase(
                     processor,
                     archive_path,
                     args=args,
                     output_base=output_root,
                 )
 
-            self.assertFalse(os.path.exists(archive_path))
-
-            failed_processor = types.SimpleNamespace(
-                successful_archives=[], failed_archives=[], skipped_archives=[]
+            planned_dst = os.path.join(
+                fail_to,
+                result["txn"]["txn_id"],
+                os.path.basename(archive_path),
             )
-            with (
-                mock.patch.object(self.m, "FileLock", DummyLock),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "resume should not rerun password probing after move rename"
-                    ),
-                ),
-                mock.patch.object(self.m, "_garbage_collect"),
-            ):
-                self.m._run_transactional(failed_processor, [], args=args)
+            self.assertEqual([], rename_calls)
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(planned_dst))
 
-            resumed_manifest = self.m._load_dataset_manifest(output_root)
-            resumed_entry = resumed_manifest["archives"][archive_id]
-
-            self.assertEqual([], failed_processor.successful_archives)
-            self.assertEqual([archive_path], failed_processor.failed_archives)
-            self.assertEqual("failed", resumed_entry["state"])
-            self.assertEqual("failure:move", resumed_entry["final_disposition"])
-            self.assertEqual("NO_PASSWORD", resumed_entry["error"]["type"])
-
-    def test_traditional_zip_move_closed_terminal_crash_retires_residue_on_new_command(
+    def test_traditional_zip_move_manifest_terminal_crash_resumes_on_new_command(
         self,
     ):
         class DummyLock:
@@ -8458,6 +18784,19 @@ class TestTxnPrimitives(unittest.TestCase):
                 )
 
             self.assertFalse(os.path.exists(archive_path))
+            crashed_manifest = self.m._load_dataset_manifest(output_root)
+            crashed_entry = crashed_manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(crashed_entry, output_root)
+
+            self.assertEqual(self.m.TXN_STATE_SOURCE_FINALIZED, saved_txn["state"])
+            self.assertTrue(self.m._txn_source_finalization_completed(saved_txn))
+            self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
+            self.assertFalse(self.m._txn_is_closed_terminal_outcome(saved_txn))
+            self.assertEqual(
+                "resume_required",
+                self.m._reconciled_archive_classification(crashed_entry, saved_txn),
+            )
+            self.assertTrue(self.m._validate_strict_resume_startup(args))
 
             resume_processor = types.SimpleNamespace(
                 successful_archives=[], failed_archives=[], skipped_archives=[]
@@ -8476,15 +18815,23 @@ class TestTxnPrimitives(unittest.TestCase):
                 result = self.m._run_transactional(resume_processor, [], args=args)
 
             resumed_manifest = self.m._load_dataset_manifest(output_root)
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(resumed_entry, output_root)
 
             self.assertIsNone(result)
-            self.assertEqual([], resume_processor.successful_archives)
+            self.assertEqual([os.path.abspath(archive_path)], resume_processor.successful_archives)
             self.assertEqual([], resume_processor.failed_archives)
             self.assertEqual([], resume_processor.skipped_archives)
-            self.assertIsNone(resumed_manifest)
-            self.assertFalse(os.path.exists(self.m._work_base(output_root)))
+            self.assertIsNotNone(resumed_manifest)
+            self.assertEqual(self.m.TXN_STATE_DONE, resumed_txn["state"])
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual(
+                "skipped:traditional_zip_moved",
+                resumed_entry["final_disposition"],
+            )
+            self.assertTrue(os.path.exists(self.m._work_base(output_root)))
 
-    def test_traditional_zip_move_crash_after_rename_before_destination_persistence_resumes(
+    def test_traditional_zip_move_crash_after_rename_before_destination_persistence_replays_to_terminal_success(
         self,
     ):
         class DummyLock:
@@ -8578,20 +18925,25 @@ class TestTxnPrimitives(unittest.TestCase):
                 ),
                 mock.patch.object(self.m, "_garbage_collect"),
             ):
-                self.m._run_transactional(resume_processor, [], args=args)
+                self.assertFalse(
+                    self.m._run_transactional(resume_processor, [], args=args)
+                )
 
             resumed_manifest = self.m._load_dataset_manifest(output_root)
             resumed_entry = resumed_manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(resumed_entry, output_root)
 
             self.assertEqual([], resume_processor.failed_archives)
             self.assertEqual(
                 [os.path.abspath(archive_path)], resume_processor.successful_archives
             )
+            self.assertEqual([], resume_processor.skipped_archives)
+            self.assertEqual(self.m.TXN_STATE_DONE, saved_txn["state"])
+            self.assertFalse(self.m._txn_has_incomplete_source_finalization(saved_txn))
             self.assertEqual("succeeded", resumed_entry["state"])
             self.assertEqual(
                 "skipped:traditional_zip_moved", resumed_entry["final_disposition"]
             )
-            self.assertIsNone(resumed_entry["error"])
 
     def test_extract_phase_traditional_zip_move_returns_kind_txn_on_success(self):
         with tempfile.TemporaryDirectory() as td:
@@ -8659,19 +19011,449 @@ class TestTxnPrimitives(unittest.TestCase):
             txn = self.m._load_latest_txn_for_archive(entry, output_root)
             staging_root = os.path.join(txn["paths"]["work_root"], "staging", txn["txn_id"])
             incoming_root = os.path.join(txn["paths"]["work_root"], "incoming", txn["txn_id"])
+            moved_dst = os.path.join(trad_to, os.path.basename(archive_path))
 
             self.assertEqual(
                 [os.path.abspath(archive_path)], observed_processor.successful_archives
             )
             self.assertEqual("succeeded", entry["state"])
             self.assertEqual("skipped:traditional_zip_moved", entry["final_disposition"])
+            self.assertEqual(self.m.TXN_STATE_DONE, txn["state"])
+            self.assertTrue(txn.get("payload_durable"))
+            self.assertIsNone(txn.get("placement_v2"))
+            self.assertEqual(
+                moved_dst,
+                txn["source_finalization_v2"]["ops"][0]["dst"],
+            )
+            self.assertEqual(
+                os.path.abspath(archive_path),
+                txn["source_finalization_v2"]["ops"][0]["src"],
+            )
+            self.assertTrue(os.path.isfile(moved_dst))
+            self.assertFalse(os.path.exists(archive_path))
             self.assertTrue(self.m._txn_is_closed_terminal_outcome(txn))
             self.assertFalse(os.path.exists(staging_root))
             self.assertFalse(os.path.exists(incoming_root))
             self.assertTrue(os.path.exists(txn["paths"]["journal_dir"]))
             self.assertEqual({output_root}, touched_output_dirs)
 
-    def test_fail_move_fsync_failure_after_rename_keeps_manifest_retryable(self):
+    def test_extract_phase_traditional_zip_move_rejects_cross_volume_without_degrade(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                degrade_cross_volume=False,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            processor = self.m.ArchiveProcessor(args)
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+                mock.patch.object(self.m, "same_volume", return_value=False),
+            ):
+                result = self.m._extract_phase(
+                    processor,
+                    archive_path,
+                    args=args,
+                    output_base=output_root,
+                )
+
+            self.assertEqual("txn_failed", result["kind"])
+            self.assertEqual(self.m.TXN_STATE_ABORTED, result["txn"]["state"])
+            self.assertEqual("PLACE_FAILED", result["txn"]["error"]["type"])
+            self.assertIsNone(result["txn"].get("source_finalization_v2"))
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(os.path.join(trad_to, os.path.basename(archive_path))))
+
+            observed_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            self.m._handle_transactional_result(
+                result,
+                processor=observed_processor,
+                args=args,
+                output_base=output_root,
+                touched_output_dirs=set(),
+            )
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][archive_id]
+
+            self.assertEqual([os.path.abspath(archive_path)], observed_processor.failed_archives)
+            self.assertEqual("retryable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertIsNone(entry["finalized_at"])
+            self.assertEqual("PLACE_FAILED", entry["error"]["type"])
+
+    def test_traditional_zip_move_does_not_persist_placed_move_done_before_source_move(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            processor = self.m.ArchiveProcessor(args)
+            captured_before_move = []
+            real_snapshot = self.m._txn_snapshot_v2
+
+            def observe_snapshot(txn):
+                source_finalization_v2 = txn.get("source_finalization_v2") or {}
+                ops = source_finalization_v2.get("ops") or []
+                if ops and os.path.exists(archive_path):
+                    captured_before_move.append(
+                        {
+                            "state": txn.get("state"),
+                            "phases": [op.get("phase") for op in ops],
+                            "dst_exists": [os.path.exists(op.get("dst")) for op in ops],
+                            "src_exists": [os.path.exists(op.get("src")) for op in ops],
+                        }
+                    )
+                return real_snapshot(txn)
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+                mock.patch.object(self.m, "_txn_snapshot_v2", side_effect=observe_snapshot),
+            ):
+                result = self.m._extract_phase(
+                    processor,
+                    archive_path,
+                    args=args,
+                    output_base=output_root,
+                )
+
+            self.assertEqual("txn", result["kind"])
+            self.assertTrue(captured_before_move)
+            self.assertIn(
+                {
+                    "state": self.m.TXN_STATE_DURABLE,
+                    "phases": ["PLAN_WRITTEN"],
+                    "dst_exists": [False],
+                    "src_exists": [True],
+                },
+                captured_before_move,
+            )
+            self.assertNotIn(
+                {
+                    "state": self.m.TXN_STATE_PLACED,
+                    "phases": ["MOVE_DONE"],
+                    "dst_exists": [False],
+                    "src_exists": [True],
+                },
+                captured_before_move,
+            )
+
+    def test_traditional_zip_move_crash_after_plan_written_before_payload_placement_replays_to_terminal_success(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            processor = self.m.ArchiveProcessor(args)
+            crashed = {"done": False}
+            real_replay_source_finalization_op = self.m._replay_source_finalization_op
+
+            def crash_before_first_source_move(txn, op):
+                if not crashed["done"]:
+                    crashed["done"] = True
+                    raise SystemExit("crash-before-traditional-zip-source-move")
+                return real_replay_source_finalization_op(txn, op)
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_replay_source_finalization_op",
+                    side_effect=crash_before_first_source_move,
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                self.m._extract_phase(
+                    processor,
+                    archive_path,
+                    args=args,
+                    output_base=output_root,
+                )
+
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertFalse(
+                os.path.exists(os.path.join(trad_to, os.path.basename(archive_path)))
+            )
+
+            resume_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "resume should replay persisted traditional ZIP source finalization instead of rerunning extraction"
+                    ),
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.assertFalse(
+                    self.m._run_transactional(resume_processor, [], args=args)
+                )
+
+            resumed_manifest = self.m._load_dataset_manifest(output_root)
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(resumed_entry, output_root)
+
+            self.assertEqual([], resume_processor.failed_archives)
+            self.assertEqual(
+                [os.path.abspath(archive_path)], resume_processor.successful_archives
+            )
+            self.assertEqual([], resume_processor.skipped_archives)
+            self.assertEqual(self.m.TXN_STATE_DONE, saved_txn["state"])
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual(
+                "skipped:traditional_zip_moved", resumed_entry["final_disposition"]
+            )
+            self.assertTrue(
+                os.path.exists(os.path.join(trad_to, os.path.basename(archive_path)))
+            )
+            self.assertFalse(os.path.exists(archive_path))
+
+    def test_traditional_zip_move_ordinary_pre_durability_exception_stays_recoverable(self):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            trad_to = os.path.join(td, "traditional")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "legacy.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                traditional_zip_policy="move",
+                traditional_zip_to=trad_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            processor = self.m.ArchiveProcessor(args)
+
+            with (
+                mock.patch.object(self.m, "is_zip_format", return_value=True),
+                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_replay_source_finalization_op",
+                    side_effect=RuntimeError("ordinary-source-finalization-boom"),
+                ),
+            ):
+                result = self.m._extract_phase(
+                    processor,
+                    archive_path,
+                    args=args,
+                    output_base=output_root,
+                )
+
+            self.assertEqual("txn_failed", result["kind"])
+            self.assertEqual(self.m.TXN_STATE_ABORTED, result["txn"]["state"])
+            self.assertEqual("FAIL_FINALIZE_FAILED", result["txn"]["error"]["type"])
+
+            observed_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            self.m._handle_transactional_result(
+                result,
+                processor=observed_processor,
+                args=args,
+                output_base=output_root,
+                touched_output_dirs=set(),
+            )
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(entry, output_root)
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual("retryable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertIsNone(entry["finalized_at"])
+            self.assertEqual("FAIL_FINALIZE_FAILED", entry["error"]["type"])
+            self.assertEqual(
+                self.m.TXN_STATE_DURABLE,
+                self.m._recoverable_txn_state_from_aborted(saved_txn),
+            )
+            self.assertEqual(
+                "traditional_zip_move",
+                saved_txn["source_finalization_v2"]["policy_kind"],
+            )
+
+            plan_manifest = self.m._load_dataset_manifest(output_root)
+            recoverable_archives, retryable_archives, pending_archives = (
+                self.m._build_transactional_archive_plan(
+                    plan_manifest, output_root, persist=False
+                )
+            )
+            self.assertEqual(
+                [
+                    {
+                        "archive_path": os.path.abspath(archive_path),
+                        "output_dir": output_root,
+                    }
+                ],
+                recoverable_archives,
+            )
+            self.assertEqual([], retryable_archives)
+            self.assertEqual([], pending_archives)
+
+            resume_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.assertFalse(self.m._run_transactional(resume_processor, [], args=args))
+
+            resumed_manifest = self.m._load_dataset_manifest(output_root)
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(resumed_entry, output_root)
+
+            self.assertEqual([], resume_processor.failed_archives)
+            self.assertEqual(
+                [os.path.abspath(archive_path)], resume_processor.successful_archives
+            )
+            self.assertEqual([], resume_processor.skipped_archives)
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual(
+                "skipped:traditional_zip_moved", resumed_entry["final_disposition"]
+            )
+            self.assertEqual(self.m.TXN_STATE_DONE, resumed_txn["state"])
+            self.assertTrue(
+                os.path.exists(os.path.join(trad_to, os.path.basename(archive_path)))
+            )
+            self.assertFalse(os.path.exists(archive_path))
+
+    def test_extract_failure_fail_move_fsync_hook_is_unreachable(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -8712,14 +19494,59 @@ class TestTxnPrimitives(unittest.TestCase):
                     processor, archive_path, args=args, output_base=output_root
                 )
 
-            self.assertEqual("txn_failed", result["kind"])
+            self.assertEqual("failed", result["kind"])
             self.assertEqual(self.m.TXN_STATE_ABORTED, result["txn"]["state"])
-            self.assertEqual("FAIL_FINALIZE_FAILED", result["txn"]["error"]["type"])
             manifest = self.m._load_dataset_manifest(output_root)
             entry = manifest["archives"][archive_id]
-            self.assertEqual("retryable", entry["state"])
+            self.assertEqual("extracting", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
+
+    def test_extract_failure_fail_move_does_not_plan_source_move_without_payload(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            fail_to = os.path.join(td, "failed")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            archive_path = os.path.join(input_root, "alpha.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"zip")
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                fail_policy="move",
+                fail_to=fail_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=[
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": output_root,
+                        "volumes": [archive_path],
+                        "requested_policy": args.decompress_policy,
+                    }
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            processor = self.m.ArchiveProcessor(args)
+            with (
+                mock.patch.object(self.m, "try_extract", return_value=False),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            ):
+                result = self.m._extract_phase(
+                    processor, archive_path, args=args, output_base=output_root
+                )
+
+            self.assertEqual("failed", result["kind"])
+            self.assertEqual(self.m.TXN_STATE_ABORTED, result["txn"]["state"])
+            self.assertNotIn("payload_durable", result["txn"])
+            self.assertIsNone(result["txn"].get("source_finalization_v2"))
 
     def test_extract_phase_traditional_zip_move_post_txn_failure_returns_txn_failed(
         self,
@@ -8821,10 +19648,10 @@ class TestTxnPrimitives(unittest.TestCase):
             )
             archive_id = self.m._dataset_manifest_archive_id(archive_path)
             processor = self.m.ArchiveProcessor(args)
-            real_txn_snapshot = self.m._txn_snapshot
+            real_txn_snapshot = self.m._txn_snapshot_v2
 
             def fail_source_finalized_snapshot(txn):
-                if txn.get("state") == self.m.TXN_STATE_SOURCE_FINALIZED:
+                if txn.get("state") == self.m.TXN_STATE_DONE:
                     raise RuntimeError("source-finalized-snapshot-failed")
                 return real_txn_snapshot(txn)
 
@@ -8833,7 +19660,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 mock.patch.object(self.m, "is_traditional_zip", return_value=True),
                 mock.patch.object(
                     self.m,
-                    "_txn_snapshot",
+                    "_txn_snapshot_v2",
                     side_effect=fail_source_finalized_snapshot,
                 ),
             ):
@@ -8860,8 +19687,12 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertIsNone(entry["finalized_at"])
             self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
             self.assertEqual("FAIL_FINALIZE_FAILED", saved_txn["error"]["type"])
-            self.assertTrue(saved_txn["placement"]["finalized_source_moves"][0]["durable"])
-            self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
+            self.assertTrue(saved_txn.get("payload_durable"))
+            self.assertEqual(
+                "skipped:traditional_zip_moved",
+                self.m._txn_source_finalization_plan(saved_txn)["final_disposition"],
+            )
+            self.assertTrue(self.m._txn_source_finalization_completed(saved_txn))
             self.assertFalse(self.m._txn_is_closed_terminal_outcome(saved_txn))
 
     def test_extract_phase_traditional_zip_move_pre_txn_failure_returns_exact_failed_handoff(
@@ -9041,19 +19872,9 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertTrue(os.path.exists(expected_dst))
             self.assertFalse(os.path.exists(txn_id_dst))
 
-    def test_fail_move_fsync_failure_reopen_resumes_from_persisted_destination_without_rerunning_move_or_extract(
+    def test_fail_move_fsync_failure_with_persisted_payload_recovers_as_durable(
         self,
     ):
-        class DummyLock:
-            def __init__(self, path, timeout_ms, retry_ms, debug):
-                self.path = path
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -9085,65 +19906,121 @@ class TestTxnPrimitives(unittest.TestCase):
                 command_fingerprint=self.m._build_command_fingerprint(args),
             )
             archive_id = self.m._dataset_manifest_archive_id(archive_path)
-            processor = self.m.ArchiveProcessor(args)
-
-            with (
-                mock.patch.object(self.m, "try_extract", return_value=False),
-                mock.patch.object(
-                    self.m,
-                    "_fsync_file",
-                    side_effect=lambda path, debug=False: not path.endswith(".zip"),
-                ),
-            ):
-                result = self.m._extract_phase(
-                    processor, archive_path, args=args, output_base=output_root
-                )
-
-            moved_dst = result["txn"]["placement"]["finalized_source_moves"][0]["dst"]
+            moved_dst = os.path.join(fail_to, "failed-alpha", os.path.basename(archive_path))
+            payload_root = os.path.join(output_root, "placed-tree")
+            os.makedirs(payload_root, exist_ok=True)
+            with open(os.path.join(payload_root, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_root,
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            moved_dst = self._failure_move_dst(txn, fail_to)
+            os.makedirs(os.path.dirname(moved_dst), exist_ok=True)
+            with open(moved_dst, "wb") as f:
+                f.write(b"zip")
+            os.remove(archive_path)
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": output_root,
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "tree"),
+                        "dst": payload_root,
+                        "backend": "rename",
+                        "entry_kind": "dir",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+            txn["state"] = self.m.TXN_STATE_ABORTED
+            txn["error"] = {
+                "type": "DURABILITY_FAILED",
+                "message": f"source_move_fsync_failed:file:{moved_dst}",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": archive_path,
+                        "dst": moved_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "SRC_REMOVED",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive_path,
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
             self.assertTrue(os.path.exists(moved_dst))
             self.assertFalse(os.path.exists(archive_path))
 
             plan_manifest = self.m._load_dataset_manifest(output_root)
-            recoverable_archives, retryable_archives, pending_archives = (
-                self.m._build_transactional_archive_plan(plan_manifest, output_root)
+            entry = plan_manifest["archives"][archive_id]
+
+            self.assertEqual(
+                self.m.TXN_STATE_DURABLE,
+                self.m._recoverable_txn_state_from_aborted(txn),
             )
             self.assertEqual(
-                [{"archive_path": os.path.abspath(archive_path), "output_dir": output_root}],
-                recoverable_archives,
+                "recoverable",
+                self.m._classify_manifest_archive_state(entry, output_root),
+            )
+            recoverable_archives, retryable_archives, pending_archives = (
+                self.m._build_transactional_archive_plan(
+                    plan_manifest,
+                    output_root,
+                    persist=False,
+                )
             )
             self.assertEqual([], retryable_archives)
             self.assertEqual([], pending_archives)
-
-            resume_processor = types.SimpleNamespace(
-                successful_archives=[], failed_archives=[], skipped_archives=[]
+            self.assertEqual(
+                [
+                    {
+                        "archive_path": os.path.abspath(archive_path),
+                        "output_dir": os.path.abspath(output_root),
+                    }
+                ],
+                recoverable_archives,
             )
-            with (
-                mock.patch.object(self.m, "FileLock", DummyLock),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "reopen must not re-extract fail-move fsync failure txn"
-                    ),
-                ),
-                mock.patch.object(
-                    self.m,
-                    "_atomic_rename",
-                    side_effect=AssertionError(
-                        "reopen must not rerun fail-move source rename"
-                    ),
-                ),
-                mock.patch.object(self.m, "_garbage_collect"),
-            ):
-                self.m._run_transactional(resume_processor, [], args=args)
+            self.assertEqual(
+                "resume_required",
+                self.m._classify_existing_work_base(plan_manifest, output_root),
+            )
+            self.assertFalse(
+                self.m._work_root_cleanup_eligible(
+                    txn["paths"]["work_root"],
+                    output_root,
+                )
+            )
 
-            resumed_manifest = self.m._load_dataset_manifest(output_root)
-            resumed_entry = resumed_manifest["archives"][archive_id]
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(args)
 
-            self.assertEqual([], resume_processor.successful_archives)
-            self.assertEqual([os.path.abspath(archive_path)], resume_processor.failed_archives)
-            self.assertEqual("failed", resumed_entry["state"])
-            self.assertEqual("failure:move", resumed_entry["final_disposition"])
+            self.assertTrue(result)
             self.assertTrue(os.path.exists(moved_dst))
             self.assertFalse(os.path.exists(archive_path))
 
@@ -9288,38 +20165,57 @@ class TestTxnPrimitives(unittest.TestCase):
                 command_fingerprint=self.m._build_command_fingerprint(args),
             )
             archive_id = self.m._dataset_manifest_archive_id(archive_path)
-            processor = self.m.ArchiveProcessor(args)
-
-            with (
-                mock.patch.object(self.m, "is_zip_format", return_value=True),
-                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
-                mock.patch.object(
-                    self.m,
-                    "_fsync_file",
-                    side_effect=lambda path, debug=False: not path.endswith(".zip"),
-                ),
-            ):
-                result = self.m._extract_phase(
-                    processor, archive_path, args=args, output_base=output_root
-                )
-                self.m._handle_transactional_result(
-                    result,
-                    processor=types.SimpleNamespace(
-                        successful_archives=[], failed_archives=[], skipped_archives=[]
-                    ),
-                    args=args,
-                    output_base=output_root,
-                    touched_output_dirs=set(),
-                )
-
-            moved_dst = result["manifest_error"]
-            self.assertIsNotNone(moved_dst)
-
-            latest_manifest = self.m._load_dataset_manifest(output_root)
-            latest_txn = self.m._load_latest_txn_for_archive(
-                latest_manifest["archives"][archive_id], output_root
+            persisted_dst = os.path.join(trad_to, os.path.basename(archive_path))
+            payload_root = os.path.join(output_root, "placed-tree")
+            os.makedirs(os.path.dirname(persisted_dst), exist_ok=True)
+            os.makedirs(payload_root, exist_ok=True)
+            with open(os.path.join(payload_root, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            with open(persisted_dst, "wb") as f:
+                f.write(b"legacy")
+            os.remove(archive_path)
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_root,
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
             )
-            persisted_dst = latest_txn["placement"]["finalized_source_moves"][0]["dst"]
+            txn["payload_durable"] = True
+            txn["state"] = self.m.TXN_STATE_ABORTED
+            txn["error"] = {
+                "type": "DURABILITY_FAILED",
+                "message": f"source_move_fsync_failed:file:{persisted_dst}",
+                "at": self.m._now_iso(),
+            }
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "traditional_zip_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": archive_path,
+                        "dst": persisted_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "SRC_REMOVED",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive_path,
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
             self.assertTrue(os.path.exists(persisted_dst))
             self.assertFalse(os.path.exists(archive_path))
 
@@ -9509,42 +20405,67 @@ class TestTxnPrimitives(unittest.TestCase):
                 command_fingerprint=self.m._build_command_fingerprint(args),
             )
             archive_id = self.m._dataset_manifest_archive_id(archive_path)
-            processor = self.m.ArchiveProcessor(args)
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_root,
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            moved_dst = os.path.join(trad_to, os.path.basename(archive_path))
+            payload_root = os.path.join(output_root, "placed-tree")
+            os.makedirs(payload_root, exist_ok=True)
+            with open(os.path.join(payload_root, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": output_root,
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "tree"),
+                        "dst": payload_root,
+                        "backend": "rename",
+                        "entry_kind": "dir",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            txn["payload_durable"] = True
+            self.m._set_source_finalization_plan(
+                txn,
+                manifest_state="succeeded",
+                final_disposition="skipped:traditional_zip_moved",
+                txn_terminal_state=self.m.TXN_STATE_DONE,
+            )
+            self.m._plan_finalized_source_destination(txn, archive_path, moved_dst)
+            txn.pop("placement_v2", None)
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive_path,
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
 
-            with (
-                mock.patch.object(self.m, "is_zip_format", return_value=True),
-                mock.patch.object(self.m, "is_traditional_zip", return_value=True),
-                mock.patch.object(
-                    self.m,
-                    "_fsync_file",
-                    side_effect=lambda path, debug=False: not path.endswith(".zip"),
-                ),
-            ):
-                result = self.m._extract_phase(
-                    processor, archive_path, args=args, output_base=output_root
-                )
-                self.m._handle_transactional_result(
-                    result,
-                    processor=types.SimpleNamespace(
-                        successful_archives=[], failed_archives=[], skipped_archives=[]
-                    ),
-                    args=args,
-                    output_base=output_root,
-                    touched_output_dirs=set(),
-                )
+            real_fsync_journal_checkpoint = self.m._fsync_journal_checkpoint
 
-            initial_manifest = self.m._load_dataset_manifest(output_root)
-            initial_entry = initial_manifest["archives"][archive_id]
-            initial_txn = self.m._load_latest_txn_for_archive(initial_entry, output_root)
-            self.assertEqual(self.m.TXN_STATE_ABORTED, initial_txn["state"])
-            self.assertEqual("FAIL_FINALIZE_FAILED", initial_txn["error"]["type"])
-
-            real_txn_snapshot = self.m._txn_snapshot
-
-            def fail_recovery_source_finalized_snapshot(txn):
-                if txn.get("state") == self.m.TXN_STATE_SOURCE_FINALIZED:
-                    raise RuntimeError("source-finalized-snapshot-failed-on-recovery")
-                return real_txn_snapshot(txn)
+            def fail_recovery_source_finalized_snapshot(txn, include_parent=False):
+                if [op.get("phase") for op in self.m._source_finalization_ops(txn)] == [
+                    "SRC_REMOVED"
+                ]:
+                    raise RuntimeError(
+                        "journal_dir_fsync_failed:dir:source-finalized-snapshot-failed-on-recovery"
+                    )
+                return real_fsync_journal_checkpoint(txn, include_parent=include_parent)
 
             resume_processor = types.SimpleNamespace(
                 successful_archives=[], failed_archives=[], skipped_archives=[]
@@ -9560,7 +20481,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 ),
                 mock.patch.object(
                     self.m,
-                    "_txn_snapshot",
+                    "_fsync_journal_checkpoint",
                     side_effect=fail_recovery_source_finalized_snapshot,
                 ),
                 mock.patch.object(self.m, "_garbage_collect"),
@@ -9577,8 +20498,12 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual([], resume_processor.successful_archives)
             self.assertEqual([os.path.abspath(archive_path)], resume_processor.failed_archives)
             self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
-            self.assertEqual("FAIL_FINALIZE_FAILED", saved_txn["error"]["type"])
-            self.assertTrue(saved_txn["placement"]["finalized_source_moves"][0]["durable"])
+            self.assertEqual("DURABILITY_FAILED", saved_txn["error"]["type"])
+            self.assertTrue(saved_txn.get("payload_durable"))
+            self.assertEqual(
+                os.path.abspath(moved_dst),
+                self.m._planned_finalized_source_move(saved_txn, archive_path),
+            )
             self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
             self.assertFalse(self.m._txn_is_closed_terminal_outcome(saved_txn))
             self.assertEqual("recoverable", resumed_entry["state"])
@@ -9944,6 +20869,158 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(output_root, "a.txt")))
             self.assertTrue(os.path.exists(os.path.join(output_root, "b.txt")))
 
+    def test_partial_placement_exception_persists_aborted_and_recovers(self):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            archive_path = os.path.join(input_root, "alpha.zip")
+            with open(archive_path, "wb") as f:
+                f.write(b"alpha")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                threads=1,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            processor = self._make_transactional_processor_stub()
+
+            def create_two_file_extract(
+                archive_path,
+                password,
+                staging_dir,
+                zip_decode,
+                enable_rar,
+                sfx_detector,
+                detect_elf_sfx=False,
+            ):
+                with open(os.path.join(staging_dir, "a.txt"), "w", encoding="utf-8") as f:
+                    f.write("a")
+                with open(os.path.join(staging_dir, "b.txt"), "w", encoding="utf-8") as f:
+                    f.write("b")
+                return True
+
+            real_atomic_rename = self.m._atomic_rename
+            move_events = []
+
+            def fail_on_second_move(src, dst, *, degrade_cross_volume=False, debug=False):
+                if os.path.basename(dst) == "b.txt":
+                    raise RuntimeError("boom during placing")
+                result = real_atomic_rename(
+                    src,
+                    dst,
+                    degrade_cross_volume=degrade_cross_volume,
+                    debug=debug,
+                )
+                move_events.append((os.path.basename(src), os.path.basename(dst)))
+                return result
+
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "_validate_environment_for_output_dir"),
+                mock.patch.object(
+                    self.m,
+                    "try_extract",
+                    side_effect=create_two_file_extract,
+                ),
+                mock.patch.object(
+                    self.m,
+                    "_atomic_rename",
+                    side_effect=fail_on_second_move,
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(processor, [archive_path], args=args)
+
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(entry, output_root)
+
+            self.assertEqual([], processor.successful_archives)
+            self.assertEqual([os.path.abspath(archive_path)], processor.failed_archives)
+            self.assertEqual("active", manifest["status"])
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertIsNone(entry["finalized_at"])
+            self.assertEqual(saved_txn["txn_id"], entry["last_txn_id"])
+            self.assertEqual("PLACE_FAILED", entry["error"]["type"])
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual("PLACE_FAILED", saved_txn["error"]["type"])
+            self.assertEqual(
+                self.m.TXN_STATE_PLACING,
+                self.m._recoverable_txn_state_from_aborted(saved_txn),
+            )
+            placement_move_events = [
+                event for event in move_events if event[0] in ("a.txt", "b.txt")
+            ]
+            self.assertEqual([("a.txt", "a.txt")], placement_move_events)
+            self.assertEqual(
+                {"a.txt": "MOVE_DONE", "b.txt": "PLAN_WRITTEN"},
+                {
+                    os.path.basename(op["dst"]): op["phase"]
+                    for op in saved_txn["placement_v2"]["ops"]
+                },
+            )
+            self.assertTrue(os.path.exists(os.path.join(output_root, "a.txt")))
+            self.assertFalse(os.path.exists(os.path.join(output_root, "b.txt")))
+            self.assertTrue(
+                os.path.exists(os.path.join(saved_txn["paths"]["incoming_dir"], "b.txt"))
+            )
+            if os.path.exists(saved_txn["paths"]["wal"]):
+                os.remove(saved_txn["paths"]["wal"])
+            journal_txn_path = saved_txn["paths"]["txn_json"]
+            with open(journal_txn_path, "r", encoding="utf-8") as f:
+                persisted_txn = json.load(f)
+            persisted_txn.setdefault("placement", {}).pop("move_plan_snapshot", None)
+            persisted_txn.setdefault("placement", {}).pop("move_done_ids_snapshot", None)
+            self.m.atomic_write_json(journal_txn_path, persisted_txn)
+
+            resumed_processor = self._make_transactional_processor_stub()
+
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "resume should recover the existing txn without re-extracting"
+                    ),
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(resumed_processor, [archive_path], args=args)
+
+            resumed_manifest = self.m._load_dataset_manifest(output_root)
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(resumed_entry, output_root)
+
+            self.assertEqual(
+                [os.path.abspath(archive_path)], resumed_processor.successful_archives
+            )
+            self.assertEqual([], resumed_processor.failed_archives)
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual("success:asis", resumed_entry["final_disposition"])
+            self.assertIsNone(resumed_entry["error"])
+            self.assertEqual(saved_txn["txn_id"], resumed_entry["last_txn_id"])
+            self.assertEqual(self.m.TXN_STATE_DONE, resumed_txn["state"])
+            self.assertTrue(os.path.exists(os.path.join(output_root, "a.txt")))
+            self.assertTrue(os.path.exists(os.path.join(output_root, "b.txt")))
+
     def test_delete_barrier_failure_preserves_source_and_nonterminal_manifest_state(
         self,
     ):
@@ -10040,9 +21117,9 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
             self.assertEqual(saved_txn["txn_id"], entry["last_txn_id"])
-            self.assertEqual("DURABILITY_FAILED", entry["error"]["type"])
+            self.assertEqual("PLACE_FAILED", entry["error"]["type"])
             self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
-            self.assertEqual("DURABILITY_FAILED", saved_txn["error"]["type"])
+            self.assertEqual("PLACE_FAILED", saved_txn["error"]["type"])
             self.assertTrue(os.path.exists(saved_txn["paths"]["wal"]))
             self.assertTrue(
                 os.path.exists(
@@ -10112,10 +21189,10 @@ class TestTxnPrimitives(unittest.TestCase):
 
             output = stdout.getvalue()
             self.assertEqual(1, exit_code)
-            self.assertIn("Recover failed", output)
-            self.assertIn("payload_missing:file:", output)
-            self.assertIn("Failed to process: 1", output)
-            self.assertIn(archive_path, output)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                output,
+            )
             fix_archive_ext.assert_not_called()
 
     def test_main_resume_counts_successful_same_txn_recovery_in_summary(self):
@@ -10170,10 +21247,11 @@ class TestTxnPrimitives(unittest.TestCase):
                 exit_code = self.m.main()
 
             output = stdout.getvalue()
-            self.assertEqual(0, exit_code)
-            self.assertIn("Successfully processed: 1", output)
-            self.assertIn("Failed to process: 0", output)
-            self.assertNotIn("Recover failed", output)
+            self.assertEqual(1, exit_code)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                output,
+            )
             fix_archive_ext.assert_not_called()
 
     def test_fsync_dir_returns_false_when_win32_directory_flush_is_unavailable(self):
@@ -10528,7 +21606,7 @@ class TestTxnPrimitives(unittest.TestCase):
             for path in expected_empty_dirs:
                 self.assertIn(path, fsynced_dirs)
 
-    def test_gc_deletes_done_journal(self):
+    def test_gc_keeps_manifest_selected_done_journal_while_manifest_exists(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(td)
             txn = self.m._txn_create(
@@ -10542,6 +21620,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
             self.m._txn_snapshot(txn)
             self.m._update_dataset_manifest_archive(
                 fixture["output_root"],
@@ -10560,9 +21639,9 @@ class TestTxnPrimitives(unittest.TestCase):
                 keep_journal_days=7,
             )
 
-            self.assertFalse(os.path.exists(txn["paths"]["journal_dir"]))
+            self.assertTrue(os.path.exists(txn["paths"]["journal_dir"]))
 
-    def test_gc_deletes_manifest_confirmed_failed_journal(self):
+    def test_gc_keeps_manifest_selected_failed_journal_while_manifest_exists(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(td)
             txn = self.m._txn_create(
@@ -10593,9 +21672,83 @@ class TestTxnPrimitives(unittest.TestCase):
                 keep_journal_days=7,
             )
 
-            self.assertFalse(os.path.exists(txn["paths"]["journal_dir"]))
+            self.assertTrue(os.path.exists(txn["paths"]["journal_dir"]))
 
-    def test_gc_keeps_failed_journal_with_incomplete_failure_move_finalization(self):
+    def test_gc_keeps_selected_terminal_journal_needed_for_same_output_active_classification(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["a.zip", "b.zip"],
+            )
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                decompress_policy="direct",
+                threads=1,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+
+            first_archive = discovered[0]
+            second_archive = discovered[1]
+            selected_txn = self.m._txn_create(
+                archive_path=first_archive["archive_path"],
+                volumes=first_archive["volumes"],
+                output_dir=first_archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            selected_txn["state"] = self.m.TXN_STATE_DONE
+            selected_txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(selected_txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                first_archive["archive_path"],
+                state="succeeded",
+                last_txn_id=selected_txn["txn_id"],
+                final_disposition="success:asis",
+                error=None,
+                finalized_at=self.m._now_iso(),
+            )
+            self._age_txn_journal(selected_txn)
+
+            self.m._garbage_collect(
+                first_archive["output_dir"],
+                output_base=output_root,
+                keep_journal_days=7,
+            )
+
+            self.assertTrue(os.path.exists(selected_txn["paths"]["journal_dir"]))
+            manifest = self.m._load_dataset_manifest(output_root)
+            self.assertEqual("active", manifest["status"])
+            self.assertTrue(
+                self.m._same_output_archive_is_next_expected(
+                    second_archive["archive_path"],
+                    second_archive["output_dir"],
+                    output_root,
+                )
+            )
+
+    def test_terminal_failed_manifest_retires_workdir_instead_of_gc_deleting_selected_journal(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(td)
             txn = self.m._txn_create(
@@ -10608,15 +21761,76 @@ class TestTxnPrimitives(unittest.TestCase):
                 snapshot_every=1,
                 durability_enabled=False,
             )
+            self.m._txn_fail(txn, "PLACE_FAILED", "boom")
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive"]["archive_path"],
+                state="failed",
+                last_txn_id=txn["txn_id"],
+                final_disposition="failure:asis",
+                error=txn["error"],
+                finalized_at=self.m._now_iso(),
+            )
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            manifest["status"] = "failed"
+            self.m._save_dataset_manifest(manifest)
+            self._age_txn_journal(txn)
+
+            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+            self.assertFalse(os.path.exists(self.m._work_base(fixture["output_root"])))
+
+    def test_gc_keeps_aborted_journal_with_failure_move_replay_metadata(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            txn = self.m._txn_create(
+                archive_path=fixture["archive"]["archive_path"],
+                volumes=fixture["archive"]["volumes"],
+                output_dir=fixture["archive"]["output_dir"],
+                output_base=fixture["output_root"],
+                policy=fixture["args"].decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            fixture["args"].fail_policy = "move"
+            fixture["args"].fail_to = os.path.join(td, "failed-dest")
+            self._set_manifest_command_fingerprint(fixture["output_root"], fixture["args"])
             self.m._set_source_finalization_plan(
                 txn,
                 manifest_state="failed",
                 final_disposition="failure:move",
                 txn_terminal_state=self.m.TXN_STATE_FAILED,
             )
-            txn["state"] = self.m.TXN_STATE_FAILED
+            self.m._plan_finalized_source_destination(
+                txn,
+                fixture["archive"]["archive_path"],
+                self._failure_move_dst(txn, fixture["args"].fail_to),
+            )
+            payload_root = os.path.join(fixture["archive"]["output_dir"], "placed-tree")
+            os.makedirs(payload_root, exist_ok=True)
+            with open(os.path.join(payload_root, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": fixture["archive"]["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "tree"),
+                        "dst": payload_root,
+                        "backend": "rename",
+                        "entry_kind": "dir",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+            txn["state"] = self.m.TXN_STATE_ABORTED
             txn["error"] = {
-                "type": "PLACE_FAILED",
+                "type": "FAIL_FINALIZE_FAILED",
                 "message": "boom",
                 "at": self.m._now_iso(),
             }
@@ -10624,11 +21838,11 @@ class TestTxnPrimitives(unittest.TestCase):
             self.m._update_dataset_manifest_archive(
                 fixture["output_root"],
                 fixture["archive"]["archive_path"],
-                state="failed",
+                state="retryable",
                 last_txn_id=txn["txn_id"],
-                final_disposition="failure:move",
+                final_disposition="unknown",
                 error=txn["error"],
-                finalized_at=self.m._now_iso(),
+                finalized_at=None,
             )
             self._age_txn_journal(txn)
 
@@ -10643,7 +21857,7 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertTrue(os.path.exists(txn["paths"]["journal_dir"]))
 
-    def test_gc_deletes_historical_cleaned_journal_after_ttl(self):
+    def test_gc_keeps_cleaned_journal_without_required_source_finalization_metadata(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(td)
             txn = self.m._txn_create(
@@ -10670,7 +21884,10 @@ class TestTxnPrimitives(unittest.TestCase):
             self._age_txn_journal(txn)
 
             self.assertFalse(self.m._txn_has_recovery_responsibility(txn))
-            self.assertTrue(self.m._txn_is_closed_terminal_outcome(txn))
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:missing_source_finalization_v2"
+            ):
+                self.m._txn_is_closed_terminal_outcome(txn)
 
             self.m._garbage_collect(
                 fixture["archive"]["output_dir"],
@@ -10678,7 +21895,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 keep_journal_days=7,
             )
 
-            self.assertFalse(os.path.exists(txn["paths"]["journal_dir"]))
+            self.assertTrue(os.path.exists(txn["paths"]["journal_dir"]))
 
     def test_gc_keeps_active_aborted_journal(self):
         for manifest_state in ("recoverable", "retryable"):
@@ -10727,6 +21944,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             terminal_txn["state"] = self.m.TXN_STATE_DONE
+            terminal_txn["terminal_final_disposition"] = "success:asis"
             self.m._txn_snapshot(terminal_txn)
             self.m._update_dataset_manifest_archive(
                 fixture["output_root"],
@@ -10767,6 +21985,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
             self.m._txn_snapshot(txn)
             self._age_txn_journal(txn)
 
@@ -10779,6 +21998,40 @@ class TestTxnPrimitives(unittest.TestCase):
             )
 
             self.assertFalse(os.path.exists(txn["paths"]["journal_dir"]))
+
+    def test_gc_keeps_legacy_txn_without_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_root = os.path.join(td, "output")
+            output_dir = os.path.join(output_root, "placed")
+            archive_path = os.path.join(td, "alpha.zip")
+            os.makedirs(output_root)
+            with open(archive_path, "wb") as f:
+                f.write(b"archive")
+
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_dir,
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_DONE
+            txn.pop("schema_version", None)
+            self.m._txn_snapshot(txn)
+            self._age_txn_journal(txn)
+
+            self.assertIsNone(self.m._load_dataset_manifest(output_root))
+
+            self.m._garbage_collect(
+                output_dir,
+                output_base=output_root,
+                keep_journal_days=7,
+            )
+
+            self.assertTrue(os.path.exists(txn["paths"]["journal_dir"]))
 
     def test_cleanup_workdir_removes_staging_incoming_and_trash_but_keeps_journal(
         self,
@@ -10862,7 +22115,7 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertTrue(os.path.exists(txn["paths"]["journal_dir"]))
 
-    def test_manifest_failure_stays_retryable_when_failure_finalize_fails(self):
+    def test_manifest_failure_move_without_payload_stays_retryable(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -10898,11 +22151,6 @@ class TestTxnPrimitives(unittest.TestCase):
             with (
                 mock.patch.object(self.m, "_validate_environment_for_output_dir"),
                 mock.patch.object(self.m, "try_extract", return_value=False),
-                mock.patch.object(
-                    self.m,
-                    "_finalize_sources_failure",
-                    side_effect=RuntimeError("fail policy move failed"),
-                ),
             ):
                 result = self.m._extract_phase(
                     processor,
@@ -10931,9 +22179,10 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual("retryable", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
-            self.assertEqual("FAIL_FINALIZE_FAILED", entry["error"]["type"])
+            self.assertEqual("EXTRACT_FAILED", entry["error"]["type"])
             self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
-            self.assertEqual("FAIL_FINALIZE_FAILED", saved_txn["error"]["type"])
+            self.assertEqual("EXTRACT_FAILED", saved_txn["error"]["type"])
+            self.assertTrue(os.path.exists(archive_path))
 
     def test_run_transactional_dry_run_does_not_create_manifest_or_workdir(self):
         with tempfile.TemporaryDirectory() as td:
@@ -11047,7 +22296,9 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual([], processor.successful_archives)
             self.assertEqual([], processor.failed_archives)
 
-    def test_extract_failure_asis_terminalizes_txn_for_gc(self):
+    def test_extract_failure_asis_keeps_selected_terminal_journal_while_manifest_exists(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -11111,9 +22362,11 @@ class TestTxnPrimitives(unittest.TestCase):
                 output_base=output_root,
                 keep_journal_days=7,
             )
-            self.assertFalse(os.path.exists(result["txn"]["paths"]["journal_dir"]))
+            self.assertTrue(os.path.exists(result["txn"]["paths"]["journal_dir"]))
 
-    def test_no_password_asis_terminalizes_txn_for_gc(self):
+    def test_no_password_asis_keeps_selected_terminal_journal_while_manifest_exists(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -11185,9 +22438,145 @@ class TestTxnPrimitives(unittest.TestCase):
                 output_base=output_root,
                 keep_journal_days=7,
             )
-            self.assertFalse(os.path.exists(result["txn"]["paths"]["journal_dir"]))
+            self.assertTrue(os.path.exists(result["txn"]["paths"]["journal_dir"]))
 
-    def test_extract_failure_move_terminalizes_txn_for_gc(self):
+    def test_no_password_asis_returns_terminal_failed_result(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["secret.zip"],
+            )
+            archive_path = discovered[0]["archive_path"]
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            password_file = os.path.join(td, "passwords.txt")
+            with open(password_file, "w", encoding="utf-8") as f:
+                f.write("guess\n")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                password_file=password_file,
+                fail_policy="asis",
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+
+            processor = types.SimpleNamespace(
+                sfx_detector=None,
+                find_correct_password=lambda archive_path, encryption_status=None: None,
+                get_all_volumes=lambda path: [os.path.abspath(path)],
+            )
+
+            with (
+                mock.patch.object(self.m, "_validate_environment_for_output_dir"),
+                mock.patch.object(
+                    self.m, "check_encryption", return_value="encrypted_header"
+                ),
+            ):
+                result = self.m._extract_phase(
+                    processor,
+                    archive_path,
+                    args=args,
+                    output_base=output_root,
+                )
+
+            self.assertEqual("failed", result["kind"])
+            self.assertTrue(result["failure_finalization_completed"])
+            self.assertEqual(self.m.TXN_STATE_FAILED, result["txn"]["state"])
+
+            result_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            self.m._handle_transactional_result(
+                result,
+                processor=result_processor,
+                args=args,
+                output_base=output_root,
+                touched_output_dirs=set(),
+            )
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][archive_id]
+            self.assertEqual("failed", entry["state"])
+            self.assertEqual("failure:asis", entry["final_disposition"])
+            self.assertEqual("NO_PASSWORD", entry["error"]["type"])
+
+    def test_extract_failure_asis_returns_terminal_failed_result(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["alpha.zip"],
+            )
+            archive_path = discovered[0]["archive_path"]
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                fail_policy="asis",
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+
+            processor = self.m.ArchiveProcessor(args)
+
+            with (
+                mock.patch.object(self.m, "_validate_environment_for_output_dir"),
+                mock.patch.object(self.m, "try_extract", return_value=False),
+            ):
+                result = self.m._extract_phase(
+                    processor,
+                    archive_path,
+                    args=args,
+                    output_base=output_root,
+                )
+
+            self.assertEqual("txn_failed", result["kind"])
+            self.assertEqual(self.m.TXN_STATE_FAILED, result["txn"]["state"])
+
+            result_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            self.m._handle_transactional_result(
+                result,
+                processor=result_processor,
+                args=args,
+                output_base=output_root,
+                touched_output_dirs=set(),
+            )
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][archive_id]
+            self.assertEqual("failed", entry["state"])
+            self.assertEqual("failure:asis", entry["final_disposition"])
+            self.assertEqual("EXTRACT_FAILED", entry["error"]["type"])
+
+    def test_extract_failure_move_does_not_reach_failure_move_terminal_manifest_without_payload(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -11246,16 +22635,32 @@ class TestTxnPrimitives(unittest.TestCase):
             with open(result["txn"]["paths"]["txn_json"], "r", encoding="utf-8") as f:
                 saved_txn = json.load(f)
 
-            self.assertEqual(self.m.TXN_STATE_FAILED, saved_txn["state"])
+            planned_dst = os.path.join(
+                fail_to,
+                result["txn"]["txn_id"],
+                os.path.basename(archive_path),
+            )
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertIsNone(saved_txn.get("terminal_final_disposition"))
+            self.assertIsNone(saved_txn.get("source_finalization_v2"))
+            self.assertNotIn("payload_durable", saved_txn)
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(planned_dst))
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][self.m._dataset_manifest_archive_id(archive_path)]
+            self.assertEqual("retryable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
             self._age_txn_journal(result["txn"])
             self.m._garbage_collect(
                 discovered[0]["output_dir"],
                 output_base=output_root,
                 keep_journal_days=7,
             )
-            self.assertFalse(os.path.exists(result["txn"]["paths"]["journal_dir"]))
+            self.assertTrue(os.path.exists(result["txn"]["paths"]["journal_dir"]))
 
-    def test_no_password_move_terminalizes_txn_for_gc(self):
+    def test_no_password_move_does_not_reach_failure_move_terminal_manifest_without_payload(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -11322,16 +22727,217 @@ class TestTxnPrimitives(unittest.TestCase):
             with open(result["txn"]["paths"]["txn_json"], "r", encoding="utf-8") as f:
                 saved_txn = json.load(f)
 
-            self.assertEqual(self.m.TXN_STATE_FAILED, saved_txn["state"])
+            planned_dst = os.path.join(
+                fail_to,
+                result["txn"]["txn_id"],
+                os.path.basename(archive_path),
+            )
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertIsNone(saved_txn.get("terminal_final_disposition"))
+            self.assertIsNone(saved_txn.get("source_finalization_v2"))
+            self.assertNotIn("payload_durable", saved_txn)
+            self.assertTrue(os.path.exists(archive_path))
+            self.assertFalse(os.path.exists(planned_dst))
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][self.m._dataset_manifest_archive_id(archive_path)]
+            self.assertEqual("retryable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
             self._age_txn_journal(result["txn"])
             self.m._garbage_collect(
                 discovered[0]["output_dir"],
                 output_base=output_root,
                 keep_journal_days=7,
             )
-            self.assertFalse(os.path.exists(result["txn"]["paths"]["journal_dir"]))
+            self.assertTrue(os.path.exists(result["txn"]["paths"]["journal_dir"]))
 
-    def test_no_password_failure_stays_retryable_when_failure_finalize_fails(self):
+    def test_source_finalization_runtime_error_stays_replayable_aborted(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            txn = fixture["txn"]
+            archive_id = fixture["archive_id"]
+            payload_root = os.path.join(txn["output_dir"], "tree")
+            os.makedirs(payload_root, exist_ok=True)
+            with open(os.path.join(payload_root, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            shutil.rmtree(os.path.join(txn["paths"]["incoming_dir"], "tree"))
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "tree"),
+                        "dst": payload_root,
+                        "backend": "rename",
+                        "entry_kind": "dir",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            txn["payload_durable"] = True
+            txn["source_finalization_v2"] = self.m._build_success_move_source_finalization_v2(
+                txn, args=fixture["args"]
+            )
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_replay_source_finalization_op",
+                    side_effect=RuntimeError("plain finalize boom"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "plain finalize boom"),
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(entry, fixture["output_root"])
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertTrue(saved_txn.get("payload_durable"))
+            self.assertEqual(
+                "PLAN_WRITTEN",
+                saved_txn["source_finalization_v2"]["ops"][0]["phase"],
+            )
+
+    def test_handler_replay_failure_with_payload_placement_persists_aborted_for_resume(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            fail_to = os.path.join(td, "failed")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["alpha.zip"],
+            )
+            archive_path = discovered[0]["archive_path"]
+            archive_id = self.m._dataset_manifest_archive_id(archive_path)
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                fail_policy="move",
+                fail_to=fail_to,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=[archive_path],
+                output_dir=output_root,
+                output_base=output_root,
+                policy=args.decompress_policy,
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            payload_dst = os.path.join(output_root, "payload.txt")
+            os.makedirs(os.path.dirname(payload_dst), exist_ok=True)
+            with open(payload_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": output_root,
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": payload_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+            self.m._set_source_finalization_plan(
+                txn,
+                manifest_state="failed",
+                final_disposition="failure:move",
+                txn_terminal_state=self.m.TXN_STATE_FAILED,
+                args=args,
+            )
+            txn["state"] = self.m.TXN_STATE_ABORTED
+            txn["error"] = {
+                "type": "FAIL_FINALIZE_FAILED",
+                "message": "plain fail move replay boom",
+                "at": self.m._now_iso(),
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                archive_path,
+                state="retryable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=txn["error"],
+                finalized_at=None,
+            )
+            result = {
+                "kind": "failed",
+                "archive_path": archive_path,
+                "txn": txn,
+                "manifest_error": txn["error"],
+                "failure_finalization_completed": False,
+            }
+
+            result_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with mock.patch.object(
+                self.m,
+                "_replay_source_finalization_op",
+                side_effect=RuntimeError("plain fail move replay boom"),
+            ):
+                self.m._handle_transactional_result(
+                    result,
+                    processor=result_processor,
+                    args=args,
+                    output_base=output_root,
+                    touched_output_dirs=set(),
+                )
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(entry, output_root)
+
+            self.assertEqual([archive_path], result_processor.failed_archives)
+            self.assertEqual("retryable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
+            self.assertIsNone(entry["finalized_at"])
+            self.assertEqual("FAIL_FINALIZE_FAILED", entry["error"]["type"])
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual("FAIL_FINALIZE_FAILED", saved_txn["error"]["type"])
+            self.assertTrue(saved_txn.get("payload_durable"))
+            self.assertEqual(
+                ["PLAN_WRITTEN"],
+                [op["phase"] for op in saved_txn["source_finalization_v2"]["ops"]],
+            )
+            self.assertEqual(
+                self.m.TXN_STATE_DURABLE,
+                self.m._recoverable_txn_state_from_aborted(saved_txn),
+            )
+            self.assertTrue(self.m._validate_strict_resume_startup(args))
+
+    def test_no_password_failure_move_result_stays_retryable_without_payload(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -11375,11 +22981,6 @@ class TestTxnPrimitives(unittest.TestCase):
                 mock.patch.object(
                     self.m, "check_encryption", return_value="encrypted_header"
                 ),
-                mock.patch.object(
-                    self.m,
-                    "_finalize_sources_failure",
-                    side_effect=RuntimeError("fail policy move failed"),
-                ),
             ):
                 result = self.m._extract_phase(
                     processor,
@@ -11407,7 +23008,7 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual("retryable", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
-            self.assertEqual("FAIL_FINALIZE_FAILED", entry["error"]["type"])
+            self.assertEqual("NO_PASSWORD", entry["error"]["type"])
 
     def test_replay_wal(self):
         with tempfile.TemporaryDirectory() as td:
@@ -11630,7 +23231,7 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
 
-    def test_fail_move_fsync_failure_after_parent_dir_flush_keeps_manifest_retryable_on_windows(self):
+    def test_extract_failure_fail_move_fsync_hook_is_unreachable_on_windows(self):
         class FakeKernel32:
             def CreateFileW(self, path, desired_access, share_mode, security, creation, flags, template):
                 return 123
@@ -11697,12 +23298,11 @@ class TestTxnPrimitives(unittest.TestCase):
                     processor, archive_path, args=args, output_base=output_root
                 )
 
-            self.assertEqual("txn_failed", result["kind"])
+            self.assertEqual("failed", result["kind"])
             self.assertEqual(self.m.TXN_STATE_ABORTED, result["txn"]["state"])
-            self.assertEqual("FAIL_FINALIZE_FAILED", result["txn"]["error"]["type"])
             manifest = self.m._load_dataset_manifest(output_root)
             entry = manifest["archives"][archive_id]
-            self.assertEqual("retryable", entry["state"])
+            self.assertEqual("extracting", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
 
@@ -11786,14 +23386,14 @@ class TestTxnPrimitives(unittest.TestCase):
                 )
 
             self.assertEqual("txn_failed", result["kind"])
-            self.assertEqual("FAIL_FINALIZE_FAILED", result["txn"]["error"]["type"])
+            self.assertEqual("DURABILITY_FAILED", result["txn"]["error"]["type"])
             manifest = self.m._load_dataset_manifest(output_root)
             entry = manifest["archives"][archive_id]
             self.assertEqual("retryable", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
 
-    def test_missing_wal_with_zero_plan_snapshots_allows_startup_resume_for_placing_txn(self):
+    def test_missing_wal_with_zero_plan_snapshots_rejects_startup_for_placing_txn(self):
         with tempfile.TemporaryDirectory() as td:
             input_root = os.path.join(td, "input")
             output_root = os.path.join(td, "output")
@@ -11865,7 +23465,7 @@ class TestTxnPrimitives(unittest.TestCase):
             if os.path.exists(txn["paths"]["wal"]):
                 os.remove(txn["paths"]["wal"])
 
-            self.assertTrue(self.m._validate_strict_resume_startup(args))
+            self.assertFalse(self.m._validate_strict_resume_startup(args))
 
     def test_empty_wal_with_zero_plan_snapshots_make_startup_ambiguous_for_placing_txn(self):
         with tempfile.TemporaryDirectory() as td:
@@ -12043,7 +23643,7 @@ class TestTxnPrimitives(unittest.TestCase):
 
         self.assertFalse(self.m._txn_has_snapshot_resume_state(txn))
 
-    def test_replayable_wal_allows_startup_resume_for_placing_txn(self):
+    def test_replayable_wal_without_placement_v2_rejects_startup_for_placing_txn(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(
                 td, manifest_state="recoverable"
@@ -12081,7 +23681,7 @@ class TestTxnPrimitives(unittest.TestCase):
                     + "\n"
                 )
 
-            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
 
     def test_corrupt_wal_makes_startup_ambiguous_for_placing_txn(self):
         with tempfile.TemporaryDirectory() as td:
@@ -12113,23 +23713,394 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
 
-    def test_missing_wal_with_snapshots_resumes_placing_without_reextract(self):
-        class DummyLock:
-            def __init__(self, path, timeout_ms, retry_ms, debug):
-                self.path = path
+    def test_incoming_committed_with_plan_written_recovers_as_placing(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            src = os.path.join(incoming_dir, "payload.txt")
+            dst = os.path.join(txn["output_dir"], "payload.txt")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("payload")
 
-            def __enter__(self):
-                return self
+            txn["resolved_policy"] = "direct"
+            txn["policy_frozen"] = True
+            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": src,
+                        "dst": dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
 
-            def __exit__(self, exc_type, exc, tb):
-                return False
+            with mock.patch.object(
+                self.m,
+                "_persist_placement_v2_and_enter_placing",
+                wraps=self.m._persist_placement_v2_and_enter_placing,
+            ) as persist_plan:
+                self.assertEqual(
+                    self.m.TXN_STATE_PLACING,
+                    self.m._classify_recoverable_txn_state(txn),
+                )
+                with mock.patch.object(
+                    self.m,
+                    "_execute_plan_written_placement_v2",
+                    side_effect=RuntimeError("stop_after_state_transition"),
+                ), mock.patch.object(self.m, "_mark_txn_failure_terminal"):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "stop_after_state_transition"
+                    ):
+                        self.m._place_and_finalize_txn(
+                            txn,
+                            args=fixture["args"],
+                            recovery=True,
+                        )
 
+            self.assertEqual(0, persist_plan.call_count)
+            self.assertEqual(self.m.TXN_STATE_ABORTED, txn["state"])
+            self.assertEqual("RECOVER_FAILED", txn["error"]["type"])
+            self.assertEqual(
+                [
+                    {
+                        "op_id": 1,
+                        "src": src,
+                        "dst": dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+                txn["placement_v2"]["ops"],
+            )
+
+    def test_incoming_committed_with_plan_written_started_residue_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            src_a = os.path.join(incoming_dir, "a.txt")
+            src_b = os.path.join(incoming_dir, "b.txt")
+            with open(src_a, "w", encoding="utf-8") as f:
+                f.write("a")
+            with open(src_b, "w", encoding="utf-8") as f:
+                f.write("b")
+
+            dst_a = os.path.join(txn["output_dir"], "a.txt")
+            dst_b = os.path.join(txn["output_dir"], "b.txt")
+
+            txn["resolved_policy"] = "direct"
+            txn["policy_frozen"] = True
+            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": src_a,
+                        "dst": dst_a,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    },
+                    {
+                        "op_id": 2,
+                        "src": src_b,
+                        "dst": dst_b,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    },
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            os.rename(src_a, dst_a)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertNotIn(
+                "ambiguous during startup classification",
+                stdout.getvalue(),
+            )
+
+    def test_incoming_committed_with_plan_written_started_residue_refuses_manifest_classification(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            src_a = os.path.join(incoming_dir, "a.txt")
+            src_b = os.path.join(incoming_dir, "b.txt")
+            with open(src_a, "w", encoding="utf-8") as f:
+                f.write("a")
+            with open(src_b, "w", encoding="utf-8") as f:
+                f.write("b")
+
+            dst_a = os.path.join(txn["output_dir"], "a.txt")
+            dst_b = os.path.join(txn["output_dir"], "b.txt")
+
+            txn["resolved_policy"] = "direct"
+            txn["policy_frozen"] = True
+            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": src_a,
+                        "dst": dst_a,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    },
+                    {
+                        "op_id": 2,
+                        "src": src_b,
+                        "dst": dst_b,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    },
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            os.rename(src_a, dst_a)
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:incoming_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+
+    def test_incoming_committed_with_plan_written_started_residue_refuses_archive_plan(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            src_a = os.path.join(incoming_dir, "a.txt")
+            src_b = os.path.join(incoming_dir, "b.txt")
+            with open(src_a, "w", encoding="utf-8") as f:
+                f.write("a")
+            with open(src_b, "w", encoding="utf-8") as f:
+                f.write("b")
+
+            dst_a = os.path.join(txn["output_dir"], "a.txt")
+            dst_b = os.path.join(txn["output_dir"], "b.txt")
+
+            txn["resolved_policy"] = "direct"
+            txn["policy_frozen"] = True
+            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": src_a,
+                        "dst": dst_a,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    },
+                    {
+                        "op_id": 2,
+                        "src": src_b,
+                        "dst": dst_b,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    },
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            os.rename(src_a, dst_a)
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:incoming_recovery_contradiction"
+            ):
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+
+    def test_placing_snapshot_always_has_replayable_placement_v2(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(os.path.join(incoming_dir, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+
+            snapshots = []
+            original_snapshot = self.m._txn_snapshot_v2
+
+            def record_snapshot(current_txn):
+                snapshots.append(
+                    {
+                        "state": current_txn.get("state"),
+                        "placement_v2": json.loads(
+                            json.dumps(current_txn.get("placement_v2"))
+                        ),
+                    }
+                )
+                return original_snapshot(current_txn)
+
+            with mock.patch.object(self.m, "_txn_snapshot_v2", side_effect=record_snapshot), mock.patch.object(
+                self.m,
+                "_execute_plan_written_placement_v2",
+                side_effect=RuntimeError("stop_after_planning"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop_after_planning"):
+                    self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=False)
+
+            placing_snapshots = [s for s in snapshots if s["state"] == self.m.TXN_STATE_PLACING]
+            self.assertTrue(placing_snapshots)
+            for snapshot in placing_snapshots:
+                self.assertIsInstance(snapshot["placement_v2"], dict)
+                self.assertEqual(1, snapshot["placement_v2"].get("planner_version"))
+                self.assertEqual(txn["output_dir"], snapshot["placement_v2"].get("output_dir"))
+                self.assertTrue(snapshot["placement_v2"].get("ops"))
+                self.assertTrue(
+                    all(
+                        op.get("phase") == "PLAN_WRITTEN"
+                        for op in snapshot["placement_v2"]["ops"]
+                    )
+                )
+
+    def test_missing_wal_with_snapshots_rejects_startup_for_placing_without_placement_v2(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(
                 td, manifest_state="recoverable"
             )
             archive = fixture["archive"]
-            archive_id = self.m._dataset_manifest_archive_id(archive["archive_path"])
             txn = self.m._txn_create(
                 archive_path=archive["archive_path"],
                 volumes=archive["volumes"],
@@ -12162,34 +24133,344 @@ class TestTxnPrimitives(unittest.TestCase):
             if os.path.exists(txn["paths"]["wal"]):
                 os.remove(txn["paths"]["wal"])
 
-            processor = types.SimpleNamespace(
-                successful_archives=[], failed_archives=[], skipped_archives=[]
-            )
-            with (
-                mock.patch.object(self.m, "FileLock", DummyLock),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "snapshot resume must not re-extract"
-                    ),
-                ),
-                mock.patch.object(self.m, "_garbage_collect"),
-            ):
-                self.m._run_transactional(processor, [], args=fixture["args"])
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
 
-            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            resumed_entry = resumed_manifest["archives"][archive_id]
+    def test_placement_copy_replays_from_plan_written(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            src = os.path.join(incoming_dir, "payload.txt")
+            dst = os.path.join(txn["output_dir"], "payload.txt")
+            tmp_dst = self.m._placement_copy_tmp_dst(txn, dst, 1)
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            txn["state"] = self.m.TXN_STATE_PLACING
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": src,
+                        "dst": dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "tmp_dst": tmp_dst,
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+
+            real_os_rename = self.m.os.rename
+
+            def rename_with_exdev_on_src_to_dst(move_src, move_dst):
+                if os.path.abspath(move_src) == os.path.abspath(src) and os.path.abspath(
+                    move_dst
+                ) == os.path.abspath(dst):
+                    raise OSError(errno.EXDEV, "cross-device link")
+                return real_os_rename(move_src, move_dst)
+
+            with mock.patch.object(
+                self.m.os, "rename", side_effect=rename_with_exdev_on_src_to_dst
+            ), mock.patch.object(
+                self.m.shutil,
+                "move",
+                side_effect=AssertionError("opaque placement copy fallback used"),
+            ):
+                self.m._resume_partial_placement_from_v2(
+                    txn,
+                    wal_fsync_every=1,
+                    degrade_cross_volume=True,
+                )
+
+            self.assertFalse(os.path.exists(src))
+            self.assertFalse(os.path.exists(tmp_dst))
+            self.assertTrue(os.path.exists(dst))
+            self.assertEqual(
+                "MOVE_DONE", txn["placement_v2"]["ops"][0]["phase"]
+            )
+
+    def test_placement_copy_replays_from_copy_staged(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            src = os.path.join(incoming_dir, "payload.txt")
+            dst = os.path.join(txn["output_dir"], "payload.txt")
+            tmp_dst = self.m._placement_copy_tmp_dst(txn, dst, 1)
+            os.makedirs(os.path.dirname(tmp_dst), exist_ok=True)
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("payload")
+            with open(tmp_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            txn["state"] = self.m.TXN_STATE_PLACING
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": src,
+                        "dst": dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "tmp_dst": tmp_dst,
+                        "discovered_order": 1,
+                        "phase": "COPY_STAGED",
+                    }
+                ],
+            }
+
+            real_os_rename = self.m.os.rename
+
+            def rename_with_exdev_on_src_to_dst(move_src, move_dst):
+                if os.path.abspath(move_src) == os.path.abspath(src) and os.path.abspath(
+                    move_dst
+                ) == os.path.abspath(dst):
+                    raise OSError(errno.EXDEV, "cross-device link")
+                return real_os_rename(move_src, move_dst)
+
+            with mock.patch.object(
+                self.m.os, "rename", side_effect=rename_with_exdev_on_src_to_dst
+            ), mock.patch.object(
+                self.m.shutil,
+                "move",
+                side_effect=AssertionError("opaque placement copy fallback used"),
+            ):
+                self.m._resume_partial_placement_from_v2(
+                    txn,
+                    wal_fsync_every=1,
+                    degrade_cross_volume=True,
+                )
+
+            self.assertFalse(os.path.exists(src))
+            self.assertFalse(os.path.exists(tmp_dst))
+            self.assertTrue(os.path.exists(dst))
+            self.assertEqual(
+                "MOVE_DONE", txn["placement_v2"]["ops"][0]["phase"]
+            )
+
+    def test_placement_copy_replays_from_copy_staged_with_dst_present(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            src = os.path.join(incoming_dir, "payload.txt")
+            dst = os.path.join(txn["output_dir"], "payload.txt")
+            tmp_dst = self.m._placement_copy_tmp_dst(txn, dst, 1)
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("payload")
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            txn["state"] = self.m.TXN_STATE_PLACING
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": src,
+                        "dst": dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "tmp_dst": tmp_dst,
+                        "discovered_order": 1,
+                        "phase": "COPY_STAGED",
+                    }
+                ],
+            }
+
+            fsynced_dirs = []
+
+            def track_fsync_dir(path, debug=False):
+                fsynced_dirs.append(os.path.abspath(path))
+                return True
+
+            with mock.patch.object(self.m, "_fsync_dir", side_effect=track_fsync_dir):
+                self.assertEqual(
+                    self.m.TXN_STATE_PLACING,
+                    self.m._classify_recoverable_txn_state(txn),
+                )
+                self.m._resume_partial_placement_from_v2(
+                    txn,
+                    wal_fsync_every=1,
+                    degrade_cross_volume=True,
+                )
 
             self.assertTrue(os.path.exists(dst))
-            self.assertFalse(os.path.exists(src))
+            self.assertTrue(os.path.exists(src) is False)
+            self.assertFalse(os.path.exists(tmp_dst))
             self.assertEqual(
-                [os.path.abspath(archive["archive_path"])],
-                processor.successful_archives,
+                "MOVE_DONE", txn["placement_v2"]["ops"][0]["phase"]
             )
-            self.assertEqual("succeeded", resumed_entry["state"])
-            self.assertEqual("success:asis", resumed_entry["final_disposition"])
-            self.assertIsNone(resumed_entry["error"])
+            self.assertIn(os.path.abspath(os.path.dirname(dst)), fsynced_dirs)
+
+    def test_build_placement_v2_persists_copy_backend_and_tmp_dst(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(os.path.join(incoming_dir, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["resolved_policy"] = "direct"
+            txn["policy_frozen"] = True
+
+            with mock.patch.object(self.m, "same_volume", return_value=False):
+                placement_v2 = self.m._build_placement_v2(
+                    txn,
+                    conflict_mode="fail",
+                    degrade_cross_volume=True,
+                )
+
+            self.assertEqual(1, len(placement_v2["ops"]))
+            op = placement_v2["ops"][0]
+            self.assertEqual("copy", op["backend"])
+            self.assertIsInstance(op.get("tmp_dst"), str)
+            self.assertTrue(op["tmp_dst"].strip())
+            self.assertEqual("PLAN_WRITTEN", op["phase"])
+
+    def test_build_placement_v2_rejects_cross_volume_without_degrade(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            with open(os.path.join(incoming_dir, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["resolved_policy"] = "direct"
+            txn["policy_frozen"] = True
+
+            with mock.patch.object(self.m, "same_volume", return_value=False):
+                with self.assertRaisesRegex(
+                    RuntimeError, "Cross-volume placement requires --degrade-cross-volume"
+                ):
+                    self.m._build_placement_v2(
+                        txn,
+                        conflict_mode="fail",
+                        degrade_cross_volume=False,
+                    )
+
+    def test_placement_copy_replays_from_dst_promoted_after_source_removed_before_fsync(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            incoming_dir = txn["paths"]["incoming_dir"]
+            os.makedirs(incoming_dir, exist_ok=True)
+            src = os.path.join(incoming_dir, "payload.txt")
+            dst = os.path.join(txn["output_dir"], "payload.txt")
+            tmp_dst = self.m._placement_copy_tmp_dst(txn, dst, 1)
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+
+            txn["state"] = self.m.TXN_STATE_PLACING
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": src,
+                        "dst": dst,
+                        "backend": "copy",
+                        "entry_kind": "file",
+                        "tmp_dst": tmp_dst,
+                        "discovered_order": 1,
+                        "phase": "DST_PROMOTED",
+                    }
+                ],
+            }
+
+            fsynced_dirs = []
+
+            def track_fsync_dir(path, debug=False):
+                fsynced_dirs.append(os.path.abspath(path))
+                return True
+
+            with mock.patch.object(self.m, "_fsync_dir", side_effect=track_fsync_dir):
+                self.m._resume_partial_placement_from_v2(
+                    txn,
+                    wal_fsync_every=1,
+                    degrade_cross_volume=True,
+                )
+
+            self.assertFalse(os.path.exists(src))
+            self.assertFalse(os.path.exists(tmp_dst))
+            self.assertTrue(os.path.exists(dst))
+            self.assertEqual(
+                "MOVE_DONE", txn["placement_v2"]["ops"][0]["phase"]
+            )
+            self.assertIn(os.path.abspath(os.path.dirname(src)), fsynced_dirs)
 
     def test_missing_wal_without_snapshots_makes_startup_ambiguous_for_placing(self):
         with tempfile.TemporaryDirectory() as td:
@@ -12241,7 +24522,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 policy="direct",
                 wal_fsync_every=1,
                 snapshot_every=1,
-                durability_enabled=True,
+                durability_enabled=False,
             )
             incoming_dir = txn["paths"]["incoming_dir"]
             os.makedirs(incoming_dir, exist_ok=True)
@@ -12255,32 +24536,36 @@ class TestTxnPrimitives(unittest.TestCase):
             dst_pending = os.path.join(archive["output_dir"], "pending.txt")
             os.makedirs(archive["output_dir"], exist_ok=True)
             os.replace(src_done, dst_done)
+            os.replace(src_pending, dst_pending)
 
             txn["resolved_policy"] = "direct"
             txn["policy_frozen"] = True
-            txn["state"] = self.m.TXN_STATE_FAILED
-            txn["error"] = {
-                "type": "DURABILITY_FAILED",
-                "message": "durability failed after partial snapshot fallback",
-                "at": self.m._now_iso(),
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": src_done,
+                        "dst": dst_done,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    },
+                    {
+                        "op_id": 2,
+                        "src": src_pending,
+                        "dst": dst_pending,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    },
+                ],
             }
-            txn.setdefault("placement", {})["move_plan_snapshot"] = [
-                {"id": 1, "src": src_done, "dst": dst_done},
-                {"id": 2, "src": src_pending, "dst": dst_pending},
-            ]
-            txn["placement"]["move_done_ids_snapshot"] = [1]
-            txn["placement"].pop("touched_payload_files", None)
-            txn["placement"].pop("touched_payload_dirs", None)
+            txn["state"] = self.m.TXN_STATE_PLACED
             self.m._txn_snapshot(txn)
-            self.m._update_dataset_manifest_archive(
-                fixture["output_root"],
-                archive["archive_path"],
-                state="recoverable",
-                last_txn_id=txn["txn_id"],
-                error=txn["error"],
-            )
-            if os.path.exists(txn["paths"]["wal"]):
-                os.remove(txn["paths"]["wal"])
 
             seen_fsync_files = []
 
@@ -12291,13 +24576,17 @@ class TestTxnPrimitives(unittest.TestCase):
             with mock.patch.object(
                 self.m, "_fsync_file", side_effect=tracking_fsync_file
             ):
-                self.m._place_and_finalize_txn(txn, args=args, recovery=True)
+                self.m._durability_barrier(
+                    txn,
+                    fsync_files=args.fsync_files,
+                    success_policy=args.success_policy,
+                )
 
             self.assertIn(os.path.abspath(dst_done), seen_fsync_files)
             self.assertIn(os.path.abspath(dst_pending), seen_fsync_files)
-            self.assertFalse(os.path.exists(archive["archive_path"]))
+            self.assertTrue(txn.get("payload_durable"))
 
-    def test_failed_durability_txn_with_missing_wal_and_snapshots_resumes_without_reextract(self):
+    def test_failed_durability_txn_with_missing_wal_and_snapshots_refuses_recovery(self):
         class DummyLock:
             def __init__(self, path, timeout_ms, retry_ms, debug):
                 self.path = path
@@ -12309,11 +24598,85 @@ class TestTxnPrimitives(unittest.TestCase):
                 return False
 
         with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="delete",
+            )
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+
+            def fail_payload_fsync(path, debug=False):
+                if os.path.abspath(path).startswith(os.path.abspath(fixture["output_dir"])):
+                    return False
+                return True
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", side_effect=fail_payload_fsync),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                self.assertRaisesRegex(RuntimeError, "payload_fsync_failed:file:"),
+            ):
+                self.m._place_and_finalize_txn(fixture["txn"], args=fixture["args"])
+
+            failed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            failed_entry = failed_manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                failed_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_ABORTED, saved_txn["state"])
+            self.assertEqual("DURABILITY_FAILED", saved_txn["error"]["type"])
+            self.assertEqual("recoverable", failed_entry["state"])
+            self.assertEqual("unknown", failed_entry["final_disposition"])
+            self.assertTrue(os.path.exists(archive_path))
+
+            if os.path.exists(saved_txn["paths"]["wal"]):
+                os.remove(saved_txn["paths"]["wal"])
+
+            processor = types.SimpleNamespace(
+                successful_archives=[],
+                failed_archives=[],
+                skipped_archives=[],
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "reopen must not re-extract aborted durability txn"
+                    ),
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+            ):
+                result = self.m._run_transactional(processor, [], args=fixture["args"])
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(
+                resumed_entry,
+                fixture["output_root"],
+            )
+
+            self.assertFalse(result)
+            self.assertEqual([], processor.successful_archives)
+            self.assertEqual([], processor.failed_archives)
+            self.assertEqual([], processor.skipped_archives)
+            self.assertEqual("recoverable", resumed_entry["state"])
+            self.assertEqual("unknown", resumed_entry["final_disposition"])
+            self.assertEqual("DURABILITY_FAILED", resumed_entry["error"]["type"])
+            self.assertEqual(self.m.TXN_STATE_ABORTED, resumed_txn["state"])
+            self.assertTrue(os.path.exists(archive_path))
+
+    def test_init_with_persisted_source_finalization_metadata_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(
-                td, manifest_state="recoverable"
+                td,
+                manifest_state="recoverable",
             )
             archive = fixture["archive"]
-            archive_id = self.m._dataset_manifest_archive_id(archive["archive_path"])
             txn = self.m._txn_create(
                 archive_path=archive["archive_path"],
                 volumes=archive["volumes"],
@@ -12324,21 +24687,61 @@ class TestTxnPrimitives(unittest.TestCase):
                 snapshot_every=1,
                 durability_enabled=False,
             )
-            incoming_dir = txn["paths"]["incoming_dir"]
-            os.makedirs(incoming_dir, exist_ok=True)
-            src = os.path.join(incoming_dir, "payload.txt")
-            with open(src, "w", encoding="utf-8") as f:
-                f.write("payload")
-            dst = os.path.join(archive["output_dir"], "payload.txt")
-            txn.setdefault("placement", {})["move_plan_snapshot"] = [
-                {"id": 1, "src": src, "dst": dst}
-            ]
-            txn.setdefault("placement", {})["move_done_ids_snapshot"] = []
-            txn["state"] = self.m.TXN_STATE_FAILED
-            txn["error"] = {
-                "type": "DURABILITY_FAILED",
-                "message": "durability failed after rename barrier",
-                "at": self.m._now_iso(),
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": os.path.abspath(archive["archive_path"]),
+                        "dst": os.path.join(td, "failed", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:init_recovery_contradiction"
+            ):
+                self.m._classify_recoverable_txn_state(txn)
+
+    def test_init_with_persisted_source_finalization_metadata_refuses_manifest_classification(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": os.path.abspath(archive["archive_path"]),
+                        "dst": os.path.join(td, "failed", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
             }
             self.m._txn_snapshot(txn)
             self.m._update_dataset_manifest_archive(
@@ -12346,38 +24749,656 @@ class TestTxnPrimitives(unittest.TestCase):
                 archive["archive_path"],
                 state="recoverable",
                 last_txn_id=txn["txn_id"],
-                error=txn["error"],
+                error=None,
             )
-            if os.path.exists(txn["paths"]["wal"]):
-                os.remove(txn["paths"]["wal"])
 
-            processor = types.SimpleNamespace(
-                successful_archives=[], failed_archives=[], skipped_archives=[]
-            )
-            with (
-                mock.patch.object(self.m, "FileLock", DummyLock),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "snapshot resume must not re-extract failed placing txn"
-                    ),
-                ),
-                mock.patch.object(self.m, "_garbage_collect"),
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:init_recovery_contradiction"
             ):
-                self.m._run_transactional(processor, [], args=fixture["args"])
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
 
-            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            resumed_entry = resumed_manifest["archives"][archive_id]
-
-            self.assertTrue(os.path.exists(dst))
-            self.assertFalse(os.path.exists(src))
-            self.assertEqual(
-                [os.path.abspath(archive["archive_path"])],
-                processor.successful_archives,
+    def test_init_with_persisted_source_finalization_metadata_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
             )
-            self.assertEqual("succeeded", resumed_entry["state"])
-            self.assertEqual("success:asis", resumed_entry["final_disposition"])
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": os.path.abspath(archive["archive_path"]),
+                        "dst": os.path.join(td, "failed", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_init_with_persisted_source_finalization_metadata_and_valid_staging_refuses_manifest_classification(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": os.path.abspath(archive["archive_path"]),
+                        "dst": os.path.join(td, "failed", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:init_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+
+    def test_init_with_persisted_source_finalization_metadata_and_valid_staging_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": os.path.abspath(archive["archive_path"]),
+                        "dst": os.path.join(td, "failed", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_init_with_persisted_source_finalization_metadata_and_valid_incoming_refuses_manifest_classification(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": os.path.abspath(archive["archive_path"]),
+                        "dst": os.path.join(td, "failed", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self._make_valid_recovered_tree(txn["paths"]["incoming_dir"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:init_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+
+    def test_init_with_persisted_source_finalization_metadata_and_valid_incoming_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["source_finalization_v2"] = {
+                "planner_version": 1,
+                "policy_kind": "fail_move",
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "kind": "SOURCE_MOVE",
+                        "src": os.path.abspath(archive["archive_path"]),
+                        "dst": os.path.join(td, "failed", "alpha.zip"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self._make_valid_recovered_tree(txn["paths"]["incoming_dir"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_init_with_persisted_placement_metadata_and_valid_staging_refuses_manifest_classification(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            placement_src_dir = os.path.join(td, "placement-src")
+            os.makedirs(placement_src_dir, exist_ok=True)
+            placement_src = os.path.join(placement_src_dir, "payload.txt")
+            with open(placement_src, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": os.path.join(archive["output_dir"], "payload.txt"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:init_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+
+    def test_init_with_persisted_placement_metadata_and_valid_staging_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            placement_src_dir = os.path.join(td, "placement-src")
+            os.makedirs(placement_src_dir, exist_ok=True)
+            placement_src = os.path.join(placement_src_dir, "payload.txt")
+            with open(placement_src, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": os.path.join(archive["output_dir"], "payload.txt"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_init_with_persisted_placement_metadata_and_valid_staging_reports_not_safely_recoverable_on_strict_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            placement_src_dir = os.path.join(td, "placement-src")
+            os.makedirs(placement_src_dir, exist_ok=True)
+            placement_src = os.path.join(placement_src_dir, "payload.txt")
+            with open(placement_src, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": os.path.join(archive["output_dir"], "payload.txt"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertNotIn("ambiguous during startup classification", stdout.getvalue())
+
+    def test_init_with_persisted_placement_metadata_and_valid_incoming_refuses_manifest_classification(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            placement_src_dir = os.path.join(td, "placement-src")
+            os.makedirs(placement_src_dir, exist_ok=True)
+            placement_src = os.path.join(placement_src_dir, "payload.txt")
+            with open(placement_src, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": os.path.join(archive["output_dir"], "payload.txt"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self._make_valid_recovered_tree(txn["paths"]["incoming_dir"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:init_recovery_contradiction"
+            ):
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"])
+
+    def test_init_with_persisted_placement_metadata_and_valid_incoming_rejects_strict_resume_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            placement_src_dir = os.path.join(td, "placement-src")
+            os.makedirs(placement_src_dir, exist_ok=True)
+            placement_src = os.path.join(placement_src_dir, "payload.txt")
+            with open(placement_src, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": os.path.join(archive["output_dir"], "payload.txt"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self._make_valid_recovered_tree(txn["paths"]["incoming_dir"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+    def test_init_with_persisted_placement_metadata_and_valid_incoming_reports_not_safely_recoverable_on_strict_startup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            placement_src_dir = os.path.join(td, "placement-src")
+            os.makedirs(placement_src_dir, exist_ok=True)
+            placement_src = os.path.join(placement_src_dir, "payload.txt")
+            with open(placement_src, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": os.path.join(archive["output_dir"], "payload.txt"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self._make_valid_recovered_tree(txn["paths"]["incoming_dir"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertNotIn("ambiguous during startup classification", stdout.getvalue())
+
+    def test_init_with_persisted_placement_metadata_and_valid_incoming_reports_refuse_before_input_drift(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            placement_src_dir = os.path.join(td, "placement-src")
+            os.makedirs(placement_src_dir, exist_ok=True)
+            placement_src = os.path.join(placement_src_dir, "payload.txt")
+            with open(placement_src, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": archive["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": placement_src,
+                        "dst": os.path.join(archive["output_dir"], "payload.txt"),
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "PLAN_WRITTEN",
+                    }
+                ],
+            }
+            self._make_valid_recovered_tree(txn["paths"]["incoming_dir"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            with open(archive["archive_path"], "ab") as f:
+                f.write(b"-drift")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertFalse(result)
+            self.assertIn(
+                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
+                stdout.getvalue(),
+            )
+            self.assertNotIn("recorded size", stdout.getvalue())
 
     def test_failed_durability_txn_with_corrupt_wal_is_startup_ambiguous(self):
         with tempfile.TemporaryDirectory() as td:
@@ -12412,25 +25433,14 @@ class TestTxnPrimitives(unittest.TestCase):
             with open(txn["paths"]["wal"], "w", encoding="utf-8") as f:
                 f.write('{"t":"MOVE_PLAN","id":1,"src":"a"')
 
-            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
 
-    def test_aborted_placing_txn_with_missing_wal_and_snapshots_resumes_without_reextract(self):
-        class DummyLock:
-            def __init__(self, path, timeout_ms, retry_ms, debug):
-                self.path = path
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
+    def test_aborted_incoming_recovery_ignores_legacy_snapshot_resume_state(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(
                 td, manifest_state="recoverable"
             )
             archive = fixture["archive"]
-            archive_id = self.m._dataset_manifest_archive_id(archive["archive_path"])
             txn = self.m._txn_create(
                 archive_path=archive["archive_path"],
                 volumes=archive["volumes"],
@@ -12468,40 +25478,13 @@ class TestTxnPrimitives(unittest.TestCase):
             if os.path.exists(txn["paths"]["wal"]):
                 os.remove(txn["paths"]["wal"])
 
-            processor = types.SimpleNamespace(
-                successful_archives=[], failed_archives=[], skipped_archives=[]
-            )
-            with (
-                mock.patch.object(self.m, "FileLock", DummyLock),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "snapshot resume must not re-extract aborted placing txn"
-                    ),
-                ),
-                mock.patch.object(
-                    self.m,
-                    "_execute_policy_with_wal",
-                    side_effect=AssertionError(
-                        "aborted snapshot resume must not rebuild placing plan"
-                    ),
-                ),
-                mock.patch.object(self.m, "_garbage_collect"),
-            ):
-                self.m._run_transactional(processor, [], args=fixture["args"])
-
-            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            resumed_entry = resumed_manifest["archives"][archive_id]
-
-            self.assertTrue(os.path.exists(dst))
-            self.assertFalse(os.path.exists(src))
             self.assertEqual(
-                [os.path.abspath(archive["archive_path"])],
-                processor.successful_archives,
+                self.m.TXN_STATE_INCOMING_COMMITTED,
+                self.m._recoverable_txn_state_from_aborted(txn),
             )
-            self.assertEqual("succeeded", resumed_entry["state"])
-            self.assertEqual("success:asis", resumed_entry["final_disposition"])
+            self.assertFalse(self.m._txn_requires_wal_resume(txn))
+            self.assertIsNone(self.m._wal_dependent_resume_classification(txn))
+            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
 
     def test_aborted_placing_txn_with_corrupt_wal_is_startup_ambiguous(self):
         with tempfile.TemporaryDirectory() as td:
@@ -12585,7 +25568,9 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertIsNone(self.m._wal_dependent_resume_classification(txn))
             self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
 
-    def test_aborted_placing_txn_without_wal_or_snapshots_is_startup_ambiguous(self):
+    def test_aborted_incoming_recovery_does_not_fall_back_to_legacy_placing_residue(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(
                 td, manifest_state="recoverable"
@@ -12624,11 +25609,13 @@ class TestTxnPrimitives(unittest.TestCase):
             if os.path.exists(txn["paths"]["wal"]):
                 os.remove(txn["paths"]["wal"])
 
-            self.assertIsNone(self.m._recoverable_txn_state_from_aborted(txn))
             self.assertEqual(
-                "ambiguous", self.m._wal_dependent_resume_classification(txn)
+                self.m.TXN_STATE_INCOMING_COMMITTED,
+                self.m._recoverable_txn_state_from_aborted(txn),
             )
-            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+            self.assertFalse(self.m._txn_requires_wal_resume(txn))
+            self.assertIsNone(self.m._wal_dependent_resume_classification(txn))
+            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
 
     def test_aborted_extracted_resume_ignores_stray_partial_snapshot_metadata(self):
         with tempfile.TemporaryDirectory() as td:
@@ -12694,6 +25681,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
             self.m._txn_snapshot(txn)
             self.m._update_dataset_manifest_archive(
                 fixture["output_root"],
@@ -12844,6 +25832,56 @@ class TestTxnPrimitives(unittest.TestCase):
                 saved = json.load(f)
             self.assertNotEqual(saved["state"], self.m.TXN_STATE_DONE)
 
+    def test_init_with_invalid_staging_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            self.m._txn_snapshot(txn)
+            self._make_invalid_recovered_tree(txn["paths"]["staging_extracted"])
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:init_recovery_contradiction"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
+    def test_init_with_invalid_incoming_refuses_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            self.m._txn_snapshot(txn)
+            self._make_invalid_recovered_tree(txn["paths"]["incoming_dir"])
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuse_recovery:init_recovery_contradiction"
+            ):
+                self.m._place_and_finalize_txn(txn, args=fixture["args"], recovery=True)
+
     def test_run_transactional_streams_finalize_in_single_thread(self):
         events = []
 
@@ -12936,6 +25974,18 @@ class TestTxnPrimitives(unittest.TestCase):
         def fake_finalize(txn, *, processor, args, output_base):
             name = os.path.basename(txn["archive_path"])
             events.append(f"finalize:{name}")
+            txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_base,
+                txn["archive_path"],
+                state="succeeded",
+                last_txn_id=txn["txn_id"],
+                final_disposition="success:asis",
+                error=None,
+                finalized_at=self.m._now_iso(),
+            )
             processor.successful_archives.append(txn["archive_path"])
             if name == "a.zip":
                 self.assertTrue(b_started.wait(timeout=1))
@@ -12994,11 +26044,13 @@ class TestTxnPrimitives(unittest.TestCase):
         self.assertLessEqual(tracker["max_outstanding"], args.threads)
         self.assertCountEqual(archives, processor.successful_archives)
 
-    def test_run_transactional_same_output_finalize_order_follows_extract_completion(
+    def test_run_transactional_same_output_finalize_order_follows_discovered_order(
         self,
     ):
         events = []
         b_extract_done = threading.Event()
+        allow_a_finish = threading.Event()
+        runner_errors = []
 
         class CallbackReadyFuture(Future):
             def __init__(self):
@@ -13054,20 +26106,32 @@ class TestTxnPrimitives(unittest.TestCase):
             name = os.path.basename(archive_path)
             events.append(f"extract-start:{name}")
             if name == "a.zip":
-                self.assertTrue(b_extract_done.wait(timeout=1))
+                self.assertTrue(allow_a_finish.wait(timeout=2))
             events.append(f"extract-end:{name}")
             if name == "b.zip":
                 b_extract_done.set()
 
             return self._make_txn_result(
                 archive_path,
-                output_dir=os.path.join(output_base, "shared-out"),
+                output_dir=self.m._compute_output_dir(args, archive_path),
                 output_base=output_base,
             )
 
         def fake_finalize(txn, *, processor, args, output_base):
             name = os.path.basename(txn["archive_path"])
             events.append(f"finalize:{name}")
+            txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_base,
+                txn["archive_path"],
+                state="succeeded",
+                last_txn_id=txn["txn_id"],
+                final_disposition="success:asis",
+                error=None,
+                finalized_at=self.m._now_iso(),
+            )
             processor.successful_archives.append(txn["archive_path"])
 
         class DummyLock:
@@ -13102,6 +26166,12 @@ class TestTxnPrimitives(unittest.TestCase):
                 with open(archive, "wb") as f:
                     f.write(b"test")
 
+            def run_transactional():
+                try:
+                    self.m._run_transactional(processor, archives, args=args)
+                except BaseException as exc:
+                    runner_errors.append(exc)
+
             with (
                 mock.patch.object(self.m, "ThreadPoolExecutor", FakeExecutor),
                 mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
@@ -13112,7 +26182,16 @@ class TestTxnPrimitives(unittest.TestCase):
                     self.m, "_finalize_one_txn", side_effect=fake_finalize
                 ),
             ):
-                self.m._run_transactional(processor, archives, args=args)
+                runner = threading.Thread(target=run_transactional)
+                runner.start()
+                self.assertTrue(b_extract_done.wait(timeout=1))
+                allow_a_finish.set()
+                runner.join(timeout=5)
+
+            if runner.is_alive():
+                self.fail("transactional runner did not finish")
+            if runner_errors:
+                raise runner_errors[0]
 
         self.assertEqual(
             ["extract-end:b.zip", "extract-end:a.zip"],
@@ -13122,11 +26201,501 @@ class TestTxnPrimitives(unittest.TestCase):
             events.index("extract-end:b.zip"), events.index("finalize:b.zip")
         )
         self.assertEqual(
-            ["finalize:b.zip", "finalize:a.zip"],
+            ["finalize:a.zip", "finalize:b.zip"],
             [event for event in events if event.startswith("finalize:")],
         )
         self.assertEqual(
-            ["b.zip", "a.zip"],
+            ["a.zip", "b.zip"],
+            [os.path.basename(path) for path in processor.successful_archives],
+        )
+
+    def test_same_output_planning_waits_for_earlier_discovered_archive(self):
+        events = []
+        b_extract_done = threading.Event()
+        allow_a_finish = threading.Event()
+        b_plan_started = threading.Event()
+        runner_errors = []
+
+        class CallbackReadyFuture(Future):
+            def __init__(self):
+                super().__init__()
+                self.callback_registered = threading.Event()
+
+            def add_done_callback(self, fn):
+                result = super().add_done_callback(fn)
+                self.callback_registered.set()
+                return result
+
+        class FakeExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+                self._threads = []
+                self._slots = threading.Semaphore(max_workers)
+
+            def submit(self, fn, processor, archive_path, *, args, output_base):
+                name = os.path.basename(archive_path)
+                events.append(f"submit:{name}")
+                future = CallbackReadyFuture()
+
+                def runner():
+                    self._slots.acquire()
+                    try:
+                        if not future.callback_registered.wait(timeout=1):
+                            raise AssertionError(
+                                f"callback not registered for {name} before execution"
+                            )
+                        result = fn(
+                            processor, archive_path, args=args, output_base=output_base
+                        )
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                    else:
+                        future.set_result(result)
+                    finally:
+                        self._slots.release()
+
+                thread = threading.Thread(target=runner, name=f"same-output-plan-{name}")
+                thread.start()
+                self._threads.append(thread)
+                return future
+
+            def shutdown(self, wait=True):
+                if not wait:
+                    return None
+                for thread in self._threads:
+                    thread.join(timeout=5)
+                return None
+
+        def fake_extract(processor, archive_path, *, args, output_base):
+            name = os.path.basename(archive_path)
+            events.append(f"extract-start:{name}")
+            if name == "a.zip":
+                self.assertTrue(allow_a_finish.wait(timeout=2))
+            else:
+                b_extract_done.set()
+            events.append(f"extract-end:{name}")
+            return self._make_txn_result(
+                archive_path,
+                output_dir=self.m._compute_output_dir(args, archive_path),
+                output_base=output_base,
+            )
+
+        def fake_finalize(txn, *, processor, args, output_base):
+            name = os.path.basename(txn["archive_path"])
+            events.append(f"plan-start:{name}")
+            if name == "b.zip":
+                b_plan_started.set()
+            txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_base,
+                txn["archive_path"],
+                state="succeeded",
+                last_txn_id=txn["txn_id"],
+                final_disposition="success:asis",
+                error=None,
+                finalized_at=self.m._now_iso(),
+            )
+            processor.successful_archives.append(txn["archive_path"])
+
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                threads=2,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+                conflict_mode="fail",
+            )
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            archives = [
+                os.path.join(td, "a.zip"),
+                os.path.join(td, "b.zip"),
+            ]
+            for archive in archives:
+                with open(archive, "wb") as f:
+                    f.write(b"test")
+
+            def run_transactional():
+                try:
+                    self.m._run_transactional(processor, archives, args=args)
+                except BaseException as exc:
+                    runner_errors.append(exc)
+
+            with (
+                mock.patch.object(self.m, "ThreadPoolExecutor", FakeExecutor),
+                mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
+                mock.patch.object(self.m, "_recover_all_outputs"),
+                mock.patch.object(self.m, "_garbage_collect"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m, "_finalize_one_txn", side_effect=fake_finalize
+                ),
+            ):
+                runner = threading.Thread(target=run_transactional, name="txn-runner")
+                runner.start()
+                self.assertTrue(b_extract_done.wait(timeout=1))
+                self.assertFalse(
+                    b_plan_started.wait(timeout=1),
+                    "later same-output archive should stay buffered until earlier discovered archive is ready",
+                )
+                allow_a_finish.set()
+                runner.join(timeout=5)
+
+            if runner.is_alive():
+                self.fail("transactional runner did not finish")
+            if runner_errors:
+                raise runner_errors[0]
+
+        self.assertEqual(
+            ["plan-start:a.zip", "plan-start:b.zip"],
+            [event for event in events if event.startswith("plan-start:")],
+        )
+        self.assertEqual(
+            ["a.zip", "b.zip"],
+            [os.path.basename(path) for path in processor.successful_archives],
+        )
+
+    def test_same_output_conflict_sensitive_result_is_stable_across_extract_timing(self):
+        class CallbackReadyFuture(Future):
+            def __init__(self):
+                super().__init__()
+                self.callback_registered = threading.Event()
+
+            def add_done_callback(self, fn):
+                result = super().add_done_callback(fn)
+                self.callback_registered.set()
+                return result
+
+        class FakeExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+                self._threads = []
+                self._slots = threading.Semaphore(max_workers)
+
+            def submit(self, fn, processor, archive_path, *, args, output_base):
+                future = CallbackReadyFuture()
+
+                def runner():
+                    self._slots.acquire()
+                    try:
+                        if not future.callback_registered.wait(timeout=1):
+                            raise AssertionError("callback not registered before execution")
+                        result = fn(
+                            processor, archive_path, args=args, output_base=output_base
+                        )
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                    else:
+                        future.set_result(result)
+                    finally:
+                        self._slots.release()
+
+                thread = threading.Thread(target=runner)
+                thread.start()
+                self._threads.append(thread)
+                return future
+
+            def shutdown(self, wait=True):
+                if not wait:
+                    return None
+                for thread in self._threads:
+                    thread.join(timeout=5)
+                return None
+
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def run_case(*, delay_archive):
+            extract_done = {
+                "a.zip": threading.Event(),
+                "b.zip": threading.Event(),
+            }
+            assignments = {}
+            finalize_order = []
+            runner_errors = []
+
+            def fake_extract(processor, archive_path, *, args, output_base):
+                name = os.path.basename(archive_path)
+                other = "b.zip" if name == "a.zip" else "a.zip"
+                if name == delay_archive:
+                    self.assertTrue(extract_done[other].wait(timeout=1))
+                extract_done[name].set()
+                return self._make_txn_result(
+                    archive_path,
+                    output_dir=self.m._compute_output_dir(args, archive_path),
+                    output_base=output_base,
+                )
+
+            def fake_finalize(txn, *, processor, args, output_base):
+                name = os.path.basename(txn["archive_path"])
+                finalize_order.append(name)
+                assigned_name = "payload.txt"
+                if assigned_name in assignments.values():
+                    assigned_name = f"payload-{name}"
+                assignments[name] = assigned_name
+                txn["state"] = self.m.TXN_STATE_DONE
+                txn["terminal_final_disposition"] = "success:asis"
+                self.m._txn_snapshot(txn)
+                self.m._update_dataset_manifest_archive(
+                    output_base,
+                    txn["archive_path"],
+                    state="succeeded",
+                    last_txn_id=txn["txn_id"],
+                    final_disposition="success:asis",
+                    error=None,
+                    finalized_at=self.m._now_iso(),
+                )
+                processor.successful_archives.append(txn["archive_path"])
+
+            with tempfile.TemporaryDirectory() as td:
+                args = self._make_processing_args(
+                    td,
+                    threads=2,
+                    output_lock_timeout_ms=1000,
+                    output_lock_retry_ms=10,
+                    keep_journal_days=7,
+                    success_clean_journal=False,
+                    fail_clean_journal=False,
+                    conflict_mode="suffix",
+                )
+                processor = types.SimpleNamespace(
+                    successful_archives=[], failed_archives=[], skipped_archives=[]
+                )
+                archives = [
+                    os.path.join(td, "a.zip"),
+                    os.path.join(td, "b.zip"),
+                ]
+                for archive in archives:
+                    with open(archive, "wb") as f:
+                        f.write(b"test")
+
+                def run_transactional():
+                    try:
+                        self.m._run_transactional(processor, archives, args=args)
+                    except BaseException as exc:
+                        runner_errors.append(exc)
+
+                with (
+                    mock.patch.object(self.m, "ThreadPoolExecutor", FakeExecutor),
+                    mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
+                    mock.patch.object(self.m, "_recover_all_outputs"),
+                    mock.patch.object(self.m, "_garbage_collect"),
+                    mock.patch.object(self.m, "FileLock", DummyLock),
+                    mock.patch.object(
+                        self.m, "_finalize_one_txn", side_effect=fake_finalize
+                    ),
+                ):
+                    runner = threading.Thread(target=run_transactional)
+                    runner.start()
+                    runner.join(timeout=5)
+
+                if runner.is_alive():
+                    self.fail("transactional runner did not finish")
+                if runner_errors:
+                    raise runner_errors[0]
+
+            return assignments, finalize_order
+
+        delayed_a_assignments, delayed_a_order = run_case(delay_archive="a.zip")
+        delayed_b_assignments, delayed_b_order = run_case(delay_archive="b.zip")
+
+        self.assertEqual(
+            {"a.zip": "payload.txt", "b.zip": "payload-b.zip"},
+            delayed_a_assignments,
+        )
+        self.assertEqual(delayed_a_assignments, delayed_b_assignments)
+        self.assertEqual(["a.zip", "b.zip"], delayed_a_order)
+        self.assertEqual(["a.zip", "b.zip"], delayed_b_order)
+
+    def test_different_output_dirs_can_progress_independently(self):
+        events = []
+        b_extract_done = threading.Event()
+        c_extract_done = threading.Event()
+        allow_a_finish = threading.Event()
+        c_plan_started = threading.Event()
+        b_plan_started = threading.Event()
+        runner_errors = []
+
+        class CallbackReadyFuture(Future):
+            def __init__(self):
+                super().__init__()
+                self.callback_registered = threading.Event()
+
+            def add_done_callback(self, fn):
+                result = super().add_done_callback(fn)
+                self.callback_registered.set()
+                return result
+
+        class FakeExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+                self._threads = []
+                self._slots = threading.Semaphore(max_workers)
+
+            def submit(self, fn, processor, archive_path, *, args, output_base):
+                future = CallbackReadyFuture()
+
+                def runner():
+                    self._slots.acquire()
+                    try:
+                        if not future.callback_registered.wait(timeout=1):
+                            raise AssertionError("callback not registered before execution")
+                        result = fn(
+                            processor, archive_path, args=args, output_base=output_base
+                        )
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                    else:
+                        future.set_result(result)
+                    finally:
+                        self._slots.release()
+
+                thread = threading.Thread(target=runner)
+                thread.start()
+                self._threads.append(thread)
+                return future
+
+            def shutdown(self, wait=True):
+                if not wait:
+                    return None
+                for thread in self._threads:
+                    thread.join(timeout=5)
+                return None
+
+        def fake_extract(processor, archive_path, *, args, output_base):
+            name = os.path.basename(archive_path)
+            if name == "a.zip":
+                self.assertTrue(allow_a_finish.wait(timeout=2))
+            elif name == "b.zip":
+                b_extract_done.set()
+            else:
+                c_extract_done.set()
+            events.append(f"extract-end:{name}")
+            return self._make_txn_result(
+                archive_path,
+                output_dir=self.m._compute_output_dir(args, archive_path),
+                output_base=output_base,
+            )
+
+        def fake_finalize(txn, *, processor, args, output_base):
+            name = os.path.basename(txn["archive_path"])
+            events.append(f"plan-start:{name}")
+            if name == "b.zip":
+                b_plan_started.set()
+            if name == "c.zip":
+                c_plan_started.set()
+            txn["state"] = self.m.TXN_STATE_DONE
+            txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_base,
+                txn["archive_path"],
+                state="succeeded",
+                last_txn_id=txn["txn_id"],
+                final_disposition="success:asis",
+                error=None,
+                finalized_at=self.m._now_iso(),
+            )
+            processor.successful_archives.append(txn["archive_path"])
+
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            other_input_dir = os.path.join(td, "other")
+            os.makedirs(other_input_dir)
+            args = self._make_processing_args(
+                td,
+                threads=3,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+                conflict_mode="fail",
+            )
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            archives = [
+                os.path.join(td, "a.zip"),
+                os.path.join(td, "b.zip"),
+                os.path.join(other_input_dir, "c.zip"),
+            ]
+            for archive in archives:
+                with open(archive, "wb") as f:
+                    f.write(b"test")
+
+            def run_transactional():
+                try:
+                    self.m._run_transactional(processor, archives, args=args)
+                except BaseException as exc:
+                    runner_errors.append(exc)
+
+            with (
+                mock.patch.object(self.m, "ThreadPoolExecutor", FakeExecutor),
+                mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
+                mock.patch.object(self.m, "_recover_all_outputs"),
+                mock.patch.object(self.m, "_garbage_collect"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m, "_finalize_one_txn", side_effect=fake_finalize
+                ),
+            ):
+                runner = threading.Thread(target=run_transactional)
+                runner.start()
+                self.assertTrue(b_extract_done.wait(timeout=1))
+                self.assertTrue(c_extract_done.wait(timeout=1))
+                self.assertTrue(
+                    c_plan_started.wait(timeout=1),
+                    "different output dir should not be blocked by same-output scheduler",
+                )
+                self.assertFalse(
+                    b_plan_started.wait(timeout=1),
+                    "same-output later archive should remain blocked until earlier discovered archive advances",
+                )
+                allow_a_finish.set()
+                runner.join(timeout=5)
+
+            if runner.is_alive():
+                self.fail("transactional runner did not finish")
+            if runner_errors:
+                raise runner_errors[0]
+
+        self.assertLess(events.index("plan-start:c.zip"), events.index("plan-start:a.zip"))
+        self.assertLess(events.index("plan-start:a.zip"), events.index("plan-start:b.zip"))
+        self.assertEqual(
+            ["c.zip", "a.zip", "b.zip"],
             [os.path.basename(path) for path in processor.successful_archives],
         )
 
@@ -13347,6 +26916,457 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertEqual([self.m._output_lock_path(output_dir, args.output)], observed)
 
+    def test_recover_all_outputs_same_output_waits_for_earlier_nonterminal_archive(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["a.zip", "b.zip"],
+            )
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                threads=1,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+
+            later_archive = discovered[1]
+            txn = self.m._txn_create(
+                archive_path=later_archive["archive_path"],
+                volumes=later_archive["volumes"],
+                output_dir=later_archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                later_archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            attempted = []
+
+            class DummyLock:
+                def __init__(self, path, timeout_ms, retry_ms, debug):
+                    self.path = path
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            def fake_place_and_finalize_txn(txn, *, args, recovery=False):
+                attempted.append(os.path.basename(txn["archive_path"]))
+
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_place_and_finalize_txn",
+                    side_effect=fake_place_and_finalize_txn,
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._recover_all_outputs(
+                    output_root,
+                    args=args,
+                    recoverable_archives=[
+                        {
+                            "archive_path": later_archive["archive_path"],
+                            "output_dir": later_archive["output_dir"],
+                        }
+                    ],
+                )
+
+            self.assertEqual([], attempted)
+
+    def test_run_transactional_startup_recovery_waits_for_earlier_same_output_archive(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["a.zip", "b.zip"],
+            )
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                threads=1,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+
+            later_archive = discovered[1]
+            txn = self.m._txn_create(
+                archive_path=later_archive["archive_path"],
+                volumes=later_archive["volumes"],
+                output_dir=later_archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                later_archive["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            attempted = []
+
+            class DummyLock:
+                def __init__(self, path, timeout_ms, retry_ms, debug):
+                    self.path = path
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            def fake_place_and_finalize_txn(txn, *, args, recovery=False):
+                attempted.append((os.path.basename(txn["archive_path"]), recovery))
+
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "_run_transactional_extract_phase"),
+                mock.patch.object(
+                    self.m,
+                    "_place_and_finalize_txn",
+                    side_effect=fake_place_and_finalize_txn,
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(processor, [], args=args)
+
+            self.assertEqual([], attempted)
+            self.assertEqual([], processor.successful_archives)
+            self.assertEqual([], processor.failed_archives)
+
+    def test_recover_all_outputs_same_output_waits_for_earlier_source_finalized_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["a.zip", "b.zip"],
+            )
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                threads=1,
+                success_policy="move",
+                success_to=os.path.join(td, "success"),
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+
+            earlier_archive = discovered[0]
+            later_archive = discovered[1]
+            earlier_txn = self.m._txn_create(
+                archive_path=earlier_archive["archive_path"],
+                volumes=earlier_archive["volumes"],
+                output_dir=earlier_archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            file_content_root = os.path.join(earlier_txn["paths"]["incoming_dir"], "tree")
+            nested_dir = os.path.join(file_content_root, "a", "b")
+            os.makedirs(nested_dir, exist_ok=True)
+            with open(os.path.join(file_content_root, "root.txt"), "w", encoding="utf-8") as f:
+                f.write("root")
+            with open(os.path.join(nested_dir, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            earlier_txn["state"] = self.m.TXN_STATE_INCOMING_COMMITTED
+            self.m._txn_snapshot(earlier_txn)
+            self.m._place_and_finalize_txn(earlier_txn, args=args)
+            earlier_txn["state"] = self.m.TXN_STATE_DURABLE
+            self.m._txn_snapshot(earlier_txn)
+
+            real_txn_snapshot = self.m._txn_snapshot_v2
+
+            def fail_terminal_txn_snapshot(txn_arg):
+                if txn_arg.get("state") == self.m.TXN_STATE_DONE:
+                    raise RuntimeError("terminal-txn-snapshot-failed")
+                return real_txn_snapshot(txn_arg)
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=fail_terminal_txn_snapshot,
+                ),
+                self.assertRaisesRegex(RuntimeError, "terminal-txn-snapshot-failed"),
+            ):
+                self.m._complete_source_finalization_plan(earlier_txn)
+
+            earlier_manifest = self.m._load_dataset_manifest(output_root)
+            earlier_entry = earlier_manifest["archives"][
+                self.m._dataset_manifest_archive_id(earlier_archive["archive_path"])
+            ]
+            earlier_txn = self.m._load_latest_txn_for_archive(earlier_entry, output_root)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                earlier_archive["archive_path"],
+                state="succeeded",
+                last_txn_id=earlier_txn["txn_id"],
+                final_disposition="success:move",
+                error=None,
+                finalized_at=self.m._now_iso(),
+            )
+
+            later_txn = self.m._txn_create(
+                archive_path=later_archive["archive_path"],
+                volumes=later_archive["volumes"],
+                output_dir=later_archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            later_txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(later_txn["paths"]["staging_extracted"])
+            self.m._txn_snapshot(later_txn)
+            self.m._update_dataset_manifest_archive(
+                output_root,
+                later_archive["archive_path"],
+                state="recoverable",
+                last_txn_id=later_txn["txn_id"],
+                error=None,
+            )
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            earlier_entry = manifest["archives"][self.m._dataset_manifest_archive_id(earlier_archive["archive_path"])]
+            self.assertEqual(
+                "succeeded",
+                self.m._classify_manifest_archive_state(earlier_entry, output_root),
+            )
+            self.assertEqual(
+                "resume_required",
+                self.m._reconciled_archive_classification(earlier_entry, earlier_txn),
+            )
+            self.assertFalse(
+                self.m._archive_can_advance_same_output_scheduler(earlier_entry, output_root)
+            )
+
+            attempted = []
+
+            class DummyLock:
+                def __init__(self, path, timeout_ms, retry_ms, debug):
+                    self.path = path
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            def fake_place_and_finalize_txn(txn, *, args, recovery=False):
+                attempted.append((os.path.basename(txn["archive_path"]), recovery))
+
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_place_and_finalize_txn",
+                    side_effect=fake_place_and_finalize_txn,
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._recover_all_outputs(
+                    output_root,
+                    args=args,
+                    recoverable_archives=[
+                        {
+                            "archive_path": earlier_archive["archive_path"],
+                            "output_dir": earlier_archive["output_dir"],
+                        },
+                        {
+                            "archive_path": later_archive["archive_path"],
+                            "output_dir": later_archive["output_dir"],
+                        },
+                    ],
+                )
+
+            self.assertEqual(
+                [("a.zip", True)],
+                attempted,
+            )
+
+    def test_recover_output_dir_stops_after_earlier_nonterminal_recovery_exception(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["a.zip", "b.zip"],
+            )
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                threads=1,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+
+            for archive in discovered:
+                txn = self.m._txn_create(
+                    archive_path=archive["archive_path"],
+                    volumes=archive["volumes"],
+                    output_dir=archive["output_dir"],
+                    output_base=output_root,
+                    policy="direct",
+                    wal_fsync_every=1,
+                    snapshot_every=1,
+                    durability_enabled=False,
+                )
+                txn["state"] = self.m.TXN_STATE_EXTRACTED
+                self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
+                self.m._txn_snapshot(txn)
+                self.m._update_dataset_manifest_archive(
+                    output_root,
+                    archive["archive_path"],
+                    state="recoverable",
+                    last_txn_id=txn["txn_id"],
+                    error=None,
+                )
+
+            attempted = []
+
+            def fake_place_and_finalize_txn(txn, *, args, recovery=False):
+                attempted.append((os.path.basename(txn["archive_path"]), recovery))
+                if os.path.basename(txn["archive_path"]) == "a.zip":
+                    self.m._txn_abort(txn, "PLACE_FAILED", "boom")
+                    raise RuntimeError("boom")
+                txn["state"] = self.m.TXN_STATE_DONE
+
+            with mock.patch.object(
+                self.m,
+                "_place_and_finalize_txn",
+                side_effect=fake_place_and_finalize_txn,
+            ):
+                self.m._recover_output_dir(discovered[0]["output_dir"], args=args)
+
+            self.assertEqual([("a.zip", True)], attempted)
+
+    def test_recover_output_dir_skips_legacy_txn_discovery_without_allowed_archives(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn.pop("schema_version", None)
+            self.m._txn_snapshot(txn)
+            observed = []
+
+            def fake_load_latest_txn_by_archive_path(archive_path, output_dir, output_base):
+                observed.append(os.path.abspath(archive_path))
+                return None
+
+            with mock.patch.object(
+                self.m,
+                "_load_latest_txn_by_archive_path",
+                side_effect=fake_load_latest_txn_by_archive_path,
+            ):
+                self.m._recover_output_dir(
+                    archive["output_dir"],
+                    args=fixture["args"],
+                )
+
+            self.assertEqual([os.path.abspath(archive["archive_path"])], observed)
+
+    def test_discover_output_dirs_for_recovery_skips_legacy_txn(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(td)
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            txn.pop("schema_version", None)
+            self.m._txn_snapshot(txn)
+
+            self.assertEqual(
+                [],
+                self.m._discover_output_dirs_for_recovery(fixture["output_root"]),
+            )
+
     def test_run_transactional_finalize_failure_does_not_block_later_txns(self):
         def fake_finalize(txn, *, args, recovery=False):
             if os.path.basename(txn["archive_path"]) == "fail.zip":
@@ -13552,6 +27572,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
             self.m._txn_snapshot(txn)
 
             processor = types.SimpleNamespace(
@@ -13580,7 +27601,7 @@ class TestTxnPrimitives(unittest.TestCase):
             ],
         )
 
-    def test_run_transactional_retries_persisted_init_txn_instead_of_recovering(self):
+    def test_run_transactional_recovers_persisted_init_txn_via_frozen_init_table(self):
         events = []
         observed = {}
 
@@ -13639,27 +27660,42 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             self.assertEqual(self.m.TXN_STATE_INIT, txn["state"])
+            staging_dir = txn["paths"]["staging_extracted"]
+            os.makedirs(staging_dir, exist_ok=True)
+            with open(os.path.join(staging_dir, "payload.txt"), "w", encoding="utf-8") as f:
+                f.write("payload")
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                output_base,
+                crash_archive,
+                state="extracting",
+                last_txn_id=txn["txn_id"],
+                error=None,
+            )
 
             processor = types.SimpleNamespace(
                 successful_archives=[], failed_archives=[], skipped_archives=[]
             )
 
             def fake_extract(processor, archive_path, *, args, output_base):
-                manifest = self.m._load_dataset_manifest(output_base)
-                observed["state_at_extract"] = manifest["archives"][archive_id]["state"]
-                observed["last_txn_id_at_extract"] = manifest["archives"][archive_id][
-                    "last_txn_id"
-                ]
                 events.append(f"extract:{os.path.basename(archive_path)}")
                 return {"kind": "dry_run", "archive_path": archive_path}
+
+            def fake_place_and_finalize(txn, *, args, recovery=False):
+                events.append(
+                    f"recover:{os.path.basename(txn['archive_path'])}:{txn['state']}:{recovery}"
+                )
+                observed["classified_recovered_state"] = self.m._classify_recoverable_txn_state(
+                    txn
+                )
+                manifest = self.m._load_dataset_manifest(output_base)
+                observed["state_during_recovery"] = manifest["archives"][archive_id]["state"]
 
             with (
                 mock.patch.object(
                     self.m,
-                    "_recover_output_dir",
-                    side_effect=AssertionError(
-                        "persisted INIT crash window should not be treated as recoverable"
-                    ),
+                    "_place_and_finalize_txn",
+                    side_effect=fake_place_and_finalize,
                 ),
                 mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
                 mock.patch.object(self.m, "_garbage_collect"),
@@ -13669,13 +27705,110 @@ class TestTxnPrimitives(unittest.TestCase):
 
             manifest = self.m._load_dataset_manifest(output_base)
             entry = manifest["archives"][archive_id]
-            self.assertEqual(["extract:crash-window.zip"], events)
-            self.assertEqual([crash_archive], processor.skipped_archives)
-            self.assertEqual("retryable", observed["state_at_extract"])
-            self.assertEqual(txn["txn_id"], observed["last_txn_id_at_extract"])
-            self.assertEqual("retryable", entry["state"])
-            self.assertEqual("skipped:dry_run", entry["final_disposition"])
+            self.assertEqual(
+                [f"recover:crash-window.zip:{self.m.TXN_STATE_INIT}:True"],
+                events,
+            )
+            self.assertEqual([], processor.skipped_archives)
+            self.assertEqual(
+                self.m.TXN_STATE_EXTRACTED,
+                observed["classified_recovered_state"],
+            )
+            self.assertEqual("recoverable", observed["state_during_recovery"])
+            self.assertEqual("recoverable", entry["state"])
+            self.assertEqual("unknown", entry["final_disposition"])
             self.assertEqual(txn["txn_id"], entry["last_txn_id"])
+
+    def test_pending_init_crash_window_is_retryable_after_startup_validation(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="pending",
+            )
+            archive = fixture["archive"]
+            txn = self.m._txn_create(
+                archive_path=archive["archive_path"],
+                volumes=archive["volumes"],
+                output_dir=archive["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            self.assertEqual(self.m.TXN_STATE_INIT, txn["state"])
+            self.m._txn_snapshot(txn)
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][fixture["archive_id"]]
+
+            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+            self.assertEqual(
+                "retryable",
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"]),
+            )
+
+            recoverable_archives, retryable_archives, pending_archives = (
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                    persist=False,
+                )
+            )
+            self.assertEqual([], recoverable_archives)
+            self.assertEqual([os.path.abspath(archive["archive_path"])], retryable_archives)
+            self.assertEqual([], pending_archives)
+
+    def test_pending_init_crash_window_blocks_same_output_scheduler_without_crashing(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["earlier.zip", "later.zip"],
+            )
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                decompress_policy="direct",
+                threads=2,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+
+            earlier_archive = discovered[0]
+            earlier_txn = self.m._txn_create(
+                archive_path=earlier_archive["archive_path"],
+                volumes=earlier_archive["volumes"],
+                output_dir=earlier_archive["output_dir"],
+                output_base=output_root,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            self.assertEqual(self.m.TXN_STATE_INIT, earlier_txn["state"])
+            self.m._txn_snapshot(earlier_txn)
+
+            manifest = self.m._load_dataset_manifest(output_root)
+            earlier_entry = manifest["archives"][self.m._dataset_manifest_archive_id(earlier_archive["archive_path"])]
+
+            self.assertFalse(
+                self.m._archive_can_advance_same_output_scheduler(
+                    earlier_entry,
+                    output_root,
+                )
+            )
 
     def test_run_transactional_retires_terminal_failed_work_root(self):
         class DummyLock:
@@ -13816,6 +27949,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
             self.m._txn_snapshot(txn)
 
             processor = types.SimpleNamespace(
@@ -13839,7 +27973,7 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertEqual(self.m.TXN_STATE_FAILED, saved["state"])
             self.assertEqual("RECOVER_FAILED", saved["error"]["type"])
 
-    def test_fail_clean_journal_removes_closed_terminal_failure_work_root(self):
+    def test_fail_clean_journal_defers_closed_terminal_failure_work_root_removal_until_work_base_cleanup(self):
         class DummyLock:
             def __init__(self, path, timeout_ms, retry_ms, debug):
                 self.path = path
@@ -13900,22 +28034,37 @@ class TestTxnPrimitives(unittest.TestCase):
                     manifest_terminal=True,
                 )
 
-            self.assertFalse(os.path.exists(work_root))
+            self.assertTrue(os.path.exists(work_root))
 
-    def test_manifest_terminalization_failure_keeps_success_move_txn_terminal(self):
+    def test_manifest_terminalization_failure_keeps_success_move_txn_preterminal(self):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_success_finalization_txn_fixture(
                 td,
                 success_policy="move",
             )
             txn = fixture["txn"]
-            txn["state"] = self.m.TXN_STATE_PLACED
+            self.m._place_and_finalize_txn(txn, args=fixture["args"])
+            self.assertEqual(self.m.TXN_STATE_DONE, txn["state"])
+            txn["state"] = self.m.TXN_STATE_SOURCE_FINALIZED
+            self.m._txn_snapshot(txn)
             self.m._update_dataset_manifest_archive(
                 fixture["output_root"],
                 fixture["archive_path"],
                 state="recoverable",
                 last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
                 error=None,
+                finalized_at=None,
             )
             os.makedirs(fixture["output_dir"], exist_ok=True)
             root_payload = os.path.join(fixture["output_dir"], "root.txt")
@@ -13961,18 +28110,44 @@ class TestTxnPrimitives(unittest.TestCase):
             )
 
             self.assertFalse(os.path.exists(archive_path))
-            self.assertEqual(self.m.TXN_STATE_DONE, saved_txn["state"])
+            self.assertEqual(self.m.TXN_STATE_SOURCE_FINALIZED, saved_txn["state"])
             self.assertIsNone(saved_txn.get("error"))
-            self.assertFalse(self.m._txn_has_recovery_responsibility(saved_txn))
-            self.assertFalse(self.m._txn_has_incomplete_source_finalization(saved_txn))
-            self.assertTrue(self.m._txn_is_closed_terminal_outcome(saved_txn))
+            self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
+            self.assertFalse(self.m._txn_is_closed_terminal_outcome(saved_txn))
             self.assertEqual("recoverable", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
             self.assertIsNone(entry["finalized_at"])
-            self.assertEqual(
-                "succeeded",
-                self.m._reconciled_archive_classification(entry, saved_txn),
+
+            reopen_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
             )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "manifest terminalization retry must not re-extract finalized success"
+                    ),
+                ),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(reopen_processor, [], args=fixture["args"])
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(
+                resumed_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual([], reopen_processor.failed_archives)
+            self.assertEqual([archive_path], reopen_processor.successful_archives)
+            self.assertEqual(self.m.TXN_STATE_DONE, resumed_txn["state"])
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual("success:move", resumed_entry["final_disposition"])
 
     def test_terminal_txn_snapshot_failure_does_not_split_brain_manifest(self):
         with tempfile.TemporaryDirectory() as td:
@@ -13981,26 +28156,9 @@ class TestTxnPrimitives(unittest.TestCase):
                 success_policy="move",
             )
             txn = fixture["txn"]
-            txn["state"] = self.m.TXN_STATE_SOURCE_FINALIZED
-            self.m._set_source_finalization_plan(
-                txn,
-                manifest_state="succeeded",
-                final_disposition="success:move",
-                txn_terminal_state=self.m.TXN_STATE_DONE,
-            )
-            finalized_dst = os.path.join(
-                fixture["args"].success_to,
-                txn["txn_id"],
-                os.path.basename(fixture["archive_path"]),
-            )
-            os.makedirs(os.path.dirname(finalized_dst), exist_ok=True)
-            self.m._plan_finalized_source_destination(
-                txn,
-                fixture["archive_path"],
-                finalized_dst,
-            )
-            if os.path.exists(fixture["archive_path"]):
-                os.replace(fixture["archive_path"], finalized_dst)
+            self.m._place_and_finalize_txn(txn, args=fixture["args"])
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            self.m._txn_snapshot(txn)
 
             archive_id = fixture["archive_id"]
             self.m._update_dataset_manifest_archive(
@@ -14008,21 +28166,23 @@ class TestTxnPrimitives(unittest.TestCase):
                 fixture["archive_path"],
                 state="recoverable",
                 last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
                 error=None,
+                finalized_at=None,
             )
-            real_txn_snapshot = self.m._txn_snapshot
+            real_txn_snapshot = self.m._txn_snapshot_v2
             snapshot_calls = {"count": 0}
 
             def fail_terminal_txn_snapshot(txn_arg):
                 snapshot_calls["count"] += 1
-                if snapshot_calls["count"] == 1 and txn_arg.get("state") == self.m.TXN_STATE_DONE:
+                if txn_arg.get("state") == self.m.TXN_STATE_DONE:
                     raise RuntimeError("terminal-txn-snapshot-failed")
                 return real_txn_snapshot(txn_arg)
 
             with (
                 mock.patch.object(
                     self.m,
-                    "_txn_snapshot",
+                    "_txn_snapshot_v2",
                     side_effect=fail_terminal_txn_snapshot,
                 ),
                 self.assertRaisesRegex(RuntimeError, "terminal-txn-snapshot-failed"),
@@ -14038,9 +28198,543 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertEqual(self.m.TXN_STATE_SOURCE_FINALIZED, saved_txn["state"])
             self.assertNotEqual("FAIL_FINALIZE_FAILED", (saved_txn.get("error") or {}).get("type"))
+            self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
+            self.assertFalse(self.m._txn_is_closed_terminal_outcome(saved_txn))
+            self.assertEqual("succeeded", entry["state"])
+            self.assertEqual("success:move", entry["final_disposition"])
+            self.assertIsNotNone(entry["finalized_at"])
+            self.assertEqual(
+                "resume_required",
+                self.m._reconciled_archive_classification(entry, saved_txn),
+            )
+
+            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+
+            self.m._place_and_finalize_txn(saved_txn, args=fixture["args"], recovery=True)
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(
+                resumed_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_DONE, resumed_txn["state"])
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual("success:move", resumed_entry["final_disposition"])
+
+    def test_completed_failure_move_terminal_snapshot_failure_stays_durable_and_retries_failure_terminalization(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_single_archive_manifest_fixture(
+                td,
+                manifest_state="recoverable",
+            )
+            archive_path = os.path.abspath(fixture["archive"]["archive_path"])
+            archive_id = fixture["archive_id"]
+            fail_to = os.path.join(td, "failed")
+            args = self._make_processing_args(
+                fixture["input_root"],
+                output=fixture["output_root"],
+                fail_policy="move",
+                fail_to=fail_to,
+                success_policy="asis",
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            fixture["args"] = args
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            manifest["command_fingerprint"] = self.m._build_command_fingerprint(args)
+            self.m._save_dataset_manifest(manifest)
+
+            txn = self.m._txn_create(
+                archive_path=archive_path,
+                volumes=fixture["archive"]["volumes"],
+                output_dir=fixture["archive"]["output_dir"],
+                output_base=fixture["output_root"],
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=True,
+            )
+            payload_dst = os.path.join(txn["output_dir"], "payload.txt")
+            os.makedirs(os.path.dirname(payload_dst), exist_ok=True)
+            with open(payload_dst, "w", encoding="utf-8") as f:
+                f.write("payload")
+            txn["placement_v2"] = {
+                "planner_version": 1,
+                "output_dir": txn["output_dir"],
+                "ops": [
+                    {
+                        "op_id": 1,
+                        "src": os.path.join(txn["paths"]["incoming_dir"], "payload.txt"),
+                        "dst": payload_dst,
+                        "backend": "rename",
+                        "entry_kind": "file",
+                        "discovered_order": 1,
+                        "phase": "MOVE_DONE",
+                    }
+                ],
+            }
+            txn["payload_durable"] = True
+            self.m._set_source_finalization_plan(
+                txn,
+                manifest_state="failed",
+                final_disposition="failure:move",
+                txn_terminal_state=self.m.TXN_STATE_FAILED,
+                args=args,
+            )
+            failed_dst = self.m._source_finalization_ops(txn)[0]["dst"]
+            os.makedirs(os.path.dirname(failed_dst), exist_ok=True)
+            os.replace(archive_path, failed_dst)
+            txn["source_finalization_v2"]["ops"][0]["phase"] = "FINALIZE_DONE"
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                archive_path,
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            real_fsync_journal_checkpoint = self.m._fsync_journal_checkpoint
+            failed_once = {"done": False}
+
+            def fail_failed_terminal_snapshot(current_txn, include_parent=False):
+                source_ops = self.m._source_finalization_ops(current_txn)
+                if (
+                    current_txn.get("state") == self.m.TXN_STATE_FAILED
+                    and source_ops
+                    and all(op.get("phase") == "FINALIZE_DONE" for op in source_ops)
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise RuntimeError(
+                        "journal_dir_fsync_failed:dir:failed-finalize-done-snapshot"
+                    )
+                return real_fsync_journal_checkpoint(
+                    current_txn, include_parent=include_parent
+                )
+
+            with (
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_fsync_journal_checkpoint",
+                    side_effect=fail_failed_terminal_snapshot,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "journal_dir_fsync_failed:dir:failed-finalize-done-snapshot",
+                ),
+            ):
+                self.m._place_and_finalize_txn(txn, args=args, recovery=True)
+
+            drift_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            drift_entry = drift_manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                drift_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_DURABLE, saved_txn["state"])
+            self.assertIsNone(saved_txn.get("error"))
+            self.assertEqual(["FINALIZE_DONE"], [op["phase"] for op in saved_txn["source_finalization_v2"]["ops"]])
+            self.assertEqual("recoverable", drift_entry["state"])
+            self.assertEqual("unknown", drift_entry["final_disposition"])
+
+            reopen_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "completed fail-move terminal snapshot retry must not re-extract"
+                    ),
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(reopen_processor, [], args=args)
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(
+                resumed_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual([], reopen_processor.successful_archives)
+            self.assertEqual([archive_path], reopen_processor.failed_archives)
+            self.assertEqual(self.m.TXN_STATE_FAILED, resumed_txn["state"])
+            self.assertEqual("failed", resumed_entry["state"])
+            self.assertEqual("failure:move", resumed_entry["final_disposition"])
+
+    def test_recovery_terminal_txn_snapshot_failure_keeps_success_move_txn_preterminal(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="move",
+            )
+            txn = fixture["txn"]
+            self.m._place_and_finalize_txn(txn, args=fixture["args"])
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            self.m._txn_snapshot(txn)
+
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+            real_txn_snapshot = self.m._txn_snapshot_v2
+
+            def fail_terminal_txn_snapshot(txn_arg):
+                if txn_arg.get("state") == self.m.TXN_STATE_DONE:
+                    raise RuntimeError("terminal-txn-snapshot-failed")
+                return real_txn_snapshot(txn_arg)
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=fail_terminal_txn_snapshot,
+                ),
+                self.assertRaisesRegex(RuntimeError, "terminal-txn-snapshot-failed"),
+            ):
+                self.m._complete_source_finalization_plan(txn)
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_SOURCE_FINALIZED, saved_txn["state"])
+            self.assertEqual("succeeded", entry["state"])
+            self.assertEqual("success:move", entry["final_disposition"])
+            self.assertIsNotNone(entry["finalized_at"])
+
+            failed_archives = set()
+            successful_archives = set()
+            with mock.patch.object(
+                self.m,
+                "_txn_snapshot_v2",
+                side_effect=fail_terminal_txn_snapshot,
+            ):
+                self.m._recover_output_dir(
+                    fixture["output_dir"],
+                    args=fixture["args"],
+                    failed_archives=failed_archives,
+                    successful_archives=successful_archives,
+                )
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(
+                resumed_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(set(), failed_archives)
+            self.assertEqual(set(), successful_archives)
+            self.assertEqual(self.m.TXN_STATE_SOURCE_FINALIZED, resumed_txn["state"])
+            self.assertNotEqual("RECOVER_FAILED", (resumed_txn.get("error") or {}).get("type"))
+            self.assertTrue(self.m._txn_has_recovery_responsibility(resumed_txn))
+            self.assertFalse(self.m._txn_is_closed_terminal_outcome(resumed_txn))
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual("success:move", resumed_entry["final_disposition"])
+            self.assertIsNotNone(resumed_entry["finalized_at"])
+
+    def test_recovery_durable_finalize_done_done_snapshot_failure_stays_recoverable(self):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="move",
+            )
+            txn = fixture["txn"]
+            self.m._place_and_finalize_txn(txn, args=fixture["args"])
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            self.m._txn_snapshot(txn)
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+            real_fsync_journal_checkpoint = self.m._fsync_journal_checkpoint
+            failed_once = {"done": False}
+
+            def fail_recovery_done_snapshot(current_txn, include_parent=False):
+                source_ops = self.m._source_finalization_ops(current_txn)
+                if (
+                    current_txn.get("state") == self.m.TXN_STATE_DONE
+                    and source_ops
+                    and all(op.get("phase") == "FINALIZE_DONE" for op in source_ops)
+                    and not failed_once["done"]
+                ):
+                    failed_once["done"] = True
+                    raise RuntimeError(
+                        "journal_dir_fsync_failed:dir:recovery-terminal-success-done-snapshot"
+                    )
+                return real_fsync_journal_checkpoint(
+                    current_txn, include_parent=include_parent
+                )
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "_fsync_file", return_value=True),
+                mock.patch.object(self.m, "_fsync_dir", return_value=True),
+                mock.patch.object(
+                    self.m,
+                    "_fsync_journal_checkpoint",
+                    side_effect=fail_recovery_done_snapshot,
+                ),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "recovery-time durable finalize-done retry must not re-extract"
+                    ),
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(processor, [], args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+            moved_dst = self._success_move_dst(saved_txn, fixture["args"].success_to)
+
+            self.assertEqual([], processor.successful_archives)
+            self.assertEqual([], processor.failed_archives)
+            self.assertEqual(self.m.TXN_STATE_DURABLE, saved_txn["state"])
+            self.assertIsNone(saved_txn.get("error"))
+            self.assertEqual(["FINALIZE_DONE"], [op["phase"] for op in saved_txn["source_finalization_v2"]["ops"]])
             self.assertEqual("recoverable", entry["state"])
             self.assertEqual("unknown", entry["final_disposition"])
-            self.assertIsNone(entry["finalized_at"])
+            self.assertFalse(self.m._txn_is_closed_terminal_outcome(saved_txn))
+            self.assertTrue(self.m._txn_has_recovery_responsibility(saved_txn))
+            self.assertFalse(os.path.exists(archive_path))
+            self.assertTrue(os.path.exists(moved_dst))
+
+            reopen_processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            with (
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "recovery-time durable finalize-done reopen must not re-extract"
+                    ),
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+            ):
+                self.m._run_transactional(reopen_processor, [], args=fixture["args"])
+
+            resumed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            resumed_entry = resumed_manifest["archives"][archive_id]
+            resumed_txn = self.m._load_latest_txn_for_archive(
+                resumed_entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual([archive_path], reopen_processor.successful_archives)
+            self.assertEqual([], reopen_processor.failed_archives)
+            self.assertEqual(self.m.TXN_STATE_DONE, resumed_txn["state"])
+            self.assertEqual("succeeded", resumed_entry["state"])
+            self.assertEqual("success:move", resumed_entry["final_disposition"])
+
+    def test_resume_rejects_duplicate_same_output_discovered_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            discovered = self._make_discovered_archives(
+                input_root,
+                output_root,
+                ["same-output/a.zip", "same-output/b.zip"],
+            )
+            archives = [archive["archive_path"] for archive in discovered]
+            manifest = self.m._create_dataset_manifest(
+                input_root=input_root,
+                output_root=output_root,
+                discovered_archives=discovered,
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+            archive_ids = [
+                self.m._dataset_manifest_archive_id(archive_path)
+                for archive_path in archives
+            ]
+            entry_a = manifest["archives"][archive_ids[0]]
+            entry_b = manifest["archives"][archive_ids[1]]
+            entry_b["discovered_order"] = entry_a["discovered_order"]
+            self.m._save_dataset_manifest(manifest)
+
+            manifest_path = self.m._dataset_manifest_path(output_root)
+            with open(manifest_path, "rb") as f:
+                manifest_before = f.read()
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            stdout = io.StringIO()
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch.object(
+                    self.m,
+                    "_recover_all_outputs",
+                    side_effect=AssertionError(
+                        "recovery should not start for duplicate discovered_order"
+                    ),
+                ),
+                mock.patch.object(
+                    self.m,
+                    "_extract_phase",
+                    side_effect=AssertionError(
+                        "extract should not start for duplicate discovered_order"
+                    ),
+                ),
+            ):
+                result = self.m._run_transactional(processor, archives, args=args)
+
+            output = stdout.getvalue()
+            self.assertFalse(result)
+            self.assertIn("discovered_order", output)
+            self.assertIn("delete", output.lower())
+            self.assertIn(
+                os.path.join(output_root, ".advdecompress_work"),
+                output,
+            )
+            self.assertEqual([], processor.successful_archives)
+            self.assertEqual([], processor.failed_archives)
+            self.assertEqual([], processor.skipped_archives)
+
+            with open(manifest_path, "rb") as f:
+                self.assertEqual(manifest_before, f.read())
+
+    def test_build_archive_plan_preserves_terminal_manifest_for_source_finalized_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="move",
+            )
+            txn = fixture["txn"]
+            self.m._place_and_finalize_txn(txn, args=fixture["args"])
+            txn["state"] = self.m.TXN_STATE_DURABLE
+            self.m._txn_snapshot(txn)
+
+            archive_path = os.path.abspath(fixture["archive_path"])
+            archive_id = fixture["archive_id"]
+            self.m._update_dataset_manifest_archive(
+                fixture["output_root"],
+                fixture["archive_path"],
+                state="recoverable",
+                last_txn_id=txn["txn_id"],
+                final_disposition="unknown",
+                error=None,
+                finalized_at=None,
+            )
+            real_txn_snapshot = self.m._txn_snapshot_v2
+
+            def fail_terminal_txn_snapshot(txn_arg):
+                if txn_arg.get("state") == self.m.TXN_STATE_DONE:
+                    raise RuntimeError("terminal-txn-snapshot-failed")
+                return real_txn_snapshot(txn_arg)
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_txn_snapshot_v2",
+                    side_effect=fail_terminal_txn_snapshot,
+                ),
+                self.assertRaisesRegex(RuntimeError, "terminal-txn-snapshot-failed"),
+            ):
+                self.m._complete_source_finalization_plan(txn)
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            entry = manifest["archives"][archive_id]
+            saved_txn = self.m._load_latest_txn_for_archive(
+                entry,
+                fixture["output_root"],
+            )
+
+            self.assertEqual(self.m.TXN_STATE_SOURCE_FINALIZED, saved_txn["state"])
+            self.assertEqual(
+                "resume_required",
+                self.m._reconciled_archive_classification(entry, saved_txn),
+            )
+            self.assertEqual(
+                "succeeded",
+                self.m._classify_manifest_archive_state(entry, fixture["output_root"]),
+            )
+
+            recoverable_archives, retryable_archives, pending_archives = (
+                self.m._build_transactional_archive_plan(
+                    manifest,
+                    fixture["output_root"],
+                )
+            )
+
+            refreshed_manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            refreshed_entry = refreshed_manifest["archives"][archive_id]
+
+            self.assertEqual(
+                [{
+                    "archive_path": archive_path,
+                    "output_dir": fixture["output_dir"],
+                }],
+                recoverable_archives,
+            )
+            self.assertEqual([], retryable_archives)
+            self.assertEqual([], pending_archives)
+            self.assertEqual("succeeded", refreshed_entry["state"])
+            self.assertEqual("success:move", refreshed_entry["final_disposition"])
+            self.assertIsNotNone(refreshed_entry["finalized_at"])
 
     def test_cleanup_skips_work_root_with_recoverable_txn(self):
         with tempfile.TemporaryDirectory() as td:
@@ -14138,7 +28832,351 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertTrue(cleanup_result)
             self.assertEqual(["gc", "eligible"], calls)
-            self.assertFalse(os.path.exists(work_root))
+            self.assertTrue(os.path.exists(work_root))
+
+    def test_partial_terminal_cleanup_keeps_selected_evidence_until_work_base_removal_succeeds(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                threads=1,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
+                success_clean_journal=True,
+                fail_clean_journal=False,
+                conflict_mode="fail",
+            )
+            output_base = args.output
+            historical_archive = os.path.join(td, "historical.zip")
+            current_archive = os.path.join(td, "current.zip")
+            for archive_path, payload in (
+                (historical_archive, b"historical"),
+                (current_archive, b"current"),
+            ):
+                with open(archive_path, "wb") as f:
+                    f.write(payload)
+
+            historical_output_dir = os.path.join(output_base, "historical-out")
+            current_output_dir = os.path.join(output_base, "current-out")
+            self.m._create_dataset_manifest(
+                input_root=td,
+                output_root=output_base,
+                discovered_archives=[
+                    {
+                        "archive_path": historical_archive,
+                        "output_dir": historical_output_dir,
+                        "volumes": [historical_archive],
+                        "requested_policy": "direct",
+                    },
+                    {
+                        "archive_path": current_archive,
+                        "output_dir": current_output_dir,
+                        "volumes": [current_archive],
+                        "requested_policy": "direct",
+                    },
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+
+            historical_txn = self.m._txn_create(
+                archive_path=historical_archive,
+                volumes=[historical_archive],
+                output_dir=historical_output_dir,
+                output_base=output_base,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            historical_txn["state"] = self.m.TXN_STATE_DONE
+            historical_txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(historical_txn)
+            self.m._update_dataset_manifest_archive(
+                output_base,
+                historical_archive,
+                state="succeeded",
+                last_txn_id=historical_txn["txn_id"],
+                final_disposition="success:asis",
+                error=None,
+                finalized_at=self.m._now_iso(),
+            )
+
+            historical_work_root = self.m._work_root(historical_output_dir, output_base)
+            current_work_root = self.m._work_root(current_output_dir, output_base)
+            work_base = self.m._work_base(output_base)
+
+            real_safe_rmtree = self.m.safe_rmtree
+            removed_paths = []
+            observed = {}
+
+            def selective_rmtree(path, debug=False):
+                abs_path = os.path.abspath(path)
+                removed_paths.append(abs_path)
+                if abs_path == os.path.abspath(work_base):
+                    return False
+                return real_safe_rmtree(path, debug)
+
+            def fake_extract(processor, archive_path, *, args, output_base):
+                txn = self._make_txn_result(
+                    archive_path,
+                    output_dir=current_output_dir,
+                    output_base=output_base,
+                )["txn"]
+                observed["current_txn"] = txn
+                return {"kind": "txn", "txn": txn}
+
+            def fake_finalize_one_txn(txn, *, processor, args, output_base):
+                txn["state"] = self.m.TXN_STATE_DONE
+                txn["terminal_final_disposition"] = "success:asis"
+                self.m._txn_snapshot(txn)
+                self.m._update_dataset_manifest_archive(
+                    output_base,
+                    txn["archive_path"],
+                    state="succeeded",
+                    last_txn_id=txn["txn_id"],
+                    final_disposition="success:asis",
+                    error=None,
+                    finalized_at=self.m._now_iso(),
+                )
+                processor.successful_archives.append(txn["archive_path"])
+                return True
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+
+            with (
+                mock.patch.object(self.m, "_recover_all_outputs"),
+                mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
+                mock.patch.object(
+                    self.m,
+                    "_finalize_one_txn",
+                    side_effect=fake_finalize_one_txn,
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(self.m, "safe_rmtree", side_effect=selective_rmtree),
+            ):
+                self.m._run_transactional(processor, [current_archive], args=args)
+
+            current_txn = observed["current_txn"]
+            retired_candidates = [
+                path
+                for path in os.listdir(output_base)
+                if path.startswith(".advdecompress_work.retired.")
+            ]
+
+            self.assertFalse(os.path.isdir(work_base))
+            self.assertEqual(1, len(retired_candidates))
+            retired_work_base = os.path.join(output_base, retired_candidates[0])
+            self.assertTrue(os.path.isdir(retired_work_base))
+            self.assertFalse(os.path.isdir(historical_work_root))
+            self.assertFalse(os.path.isdir(current_work_root))
+            self.assertFalse(os.path.exists(historical_txn["paths"]["journal_dir"]))
+            self.assertFalse(os.path.exists(current_txn["paths"]["journal_dir"]))
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(
+                        retired_work_base,
+                        "outputs",
+                        os.path.basename(historical_work_root),
+                        "journal",
+                        historical_txn["txn_id"],
+                    )
+                )
+            )
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(
+                        retired_work_base,
+                        "outputs",
+                        os.path.basename(current_work_root),
+                        "journal",
+                        current_txn["txn_id"],
+                    )
+                )
+            )
+            self.assertEqual([], removed_paths)
+            self.assertNotIn(os.path.abspath(historical_work_root), removed_paths)
+            self.assertNotIn(os.path.abspath(current_work_root), removed_paths)
+            self.assertTrue(self.m._validate_strict_resume_startup(args))
+
+    def test_partial_work_base_cleanup_failure_retires_whole_work_base_before_selected_evidence_is_lost(
+        self,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_processing_args(
+                td,
+                threads=1,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
+                success_clean_journal=True,
+                fail_clean_journal=False,
+                conflict_mode="fail",
+            )
+            output_base = args.output
+            historical_archive = os.path.join(td, "historical.zip")
+            current_archive = os.path.join(td, "current.zip")
+            for archive_path, payload in (
+                (historical_archive, b"historical"),
+                (current_archive, b"current"),
+            ):
+                with open(archive_path, "wb") as f:
+                    f.write(payload)
+
+            historical_output_dir = os.path.join(output_base, "historical-out")
+            current_output_dir = os.path.join(output_base, "current-out")
+            self.m._create_dataset_manifest(
+                input_root=td,
+                output_root=output_base,
+                discovered_archives=[
+                    {
+                        "archive_path": historical_archive,
+                        "output_dir": historical_output_dir,
+                        "volumes": [historical_archive],
+                        "requested_policy": "direct",
+                    },
+                    {
+                        "archive_path": current_archive,
+                        "output_dir": current_output_dir,
+                        "volumes": [current_archive],
+                        "requested_policy": "direct",
+                    },
+                ],
+                command_fingerprint=self.m._build_command_fingerprint(args),
+            )
+
+            historical_txn = self.m._txn_create(
+                archive_path=historical_archive,
+                volumes=[historical_archive],
+                output_dir=historical_output_dir,
+                output_base=output_base,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            historical_txn["state"] = self.m.TXN_STATE_DONE
+            historical_txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(historical_txn)
+            self.m._update_dataset_manifest_archive(
+                output_base,
+                historical_archive,
+                state="succeeded",
+                last_txn_id=historical_txn["txn_id"],
+                final_disposition="success:asis",
+                error=None,
+                finalized_at=self.m._now_iso(),
+            )
+
+            historical_work_root = self.m._work_root(historical_output_dir, output_base)
+            current_work_root = self.m._work_root(current_output_dir, output_base)
+            work_base = self.m._work_base(output_base)
+            observed = {}
+            rename_attempts = []
+            expected_retired_paths = []
+
+            def partial_retirement_then_fail(src, dst, **kwargs):
+                rename_attempts.append((os.path.abspath(src), os.path.abspath(dst)))
+                expected_retired_paths.append(os.path.abspath(dst))
+                shutil.rmtree(historical_txn["paths"]["journal_dir"])
+                raise OSError("simulated retirement failure")
+
+            def fake_extract(processor, archive_path, *, args, output_base):
+                txn = self._make_txn_result(
+                    archive_path,
+                    output_dir=current_output_dir,
+                    output_base=output_base,
+                )["txn"]
+                observed["current_txn"] = txn
+                return {"kind": "txn", "txn": txn}
+
+            def fake_finalize_one_txn(txn, *, processor, args, output_base):
+                txn["state"] = self.m.TXN_STATE_DONE
+                txn["terminal_final_disposition"] = "success:asis"
+                self.m._txn_snapshot(txn)
+                self.m._update_dataset_manifest_archive(
+                    output_base,
+                    txn["archive_path"],
+                    state="succeeded",
+                    last_txn_id=txn["txn_id"],
+                    final_disposition="success:asis",
+                    error=None,
+                    finalized_at=self.m._now_iso(),
+                )
+                processor.successful_archives.append(txn["archive_path"])
+                return True
+
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+
+            with (
+                mock.patch.object(self.m, "_recover_all_outputs"),
+                mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
+                mock.patch.object(
+                    self.m,
+                    "_finalize_one_txn",
+                    side_effect=fake_finalize_one_txn,
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
+                mock.patch.object(self.m, "FileLock", DummyLock),
+                mock.patch.object(
+                    self.m, "_atomic_rename", side_effect=partial_retirement_then_fail
+                ),
+            ):
+                self.m._run_transactional(processor, [current_archive], args=args)
+
+            current_txn = observed["current_txn"]
+            retired_candidates = [
+                path
+                for path in os.listdir(output_base)
+                if path.startswith(".advdecompress_work.retired.")
+            ]
+
+            self.assertTrue(os.path.exists(work_base))
+            self.assertEqual([], retired_candidates)
+            self.assertFalse(os.path.exists(historical_txn["paths"]["journal_dir"]))
+            self.assertTrue(os.path.exists(current_txn["paths"]["journal_dir"]))
+            self.assertEqual(
+                [
+                    (
+                        os.path.abspath(work_base),
+                        expected_retired_paths[0],
+                    )
+                ],
+                [
+                    (
+                        src,
+                        os.path.abspath(dst),
+                    )
+                    for src, dst in rename_attempts
+                ],
+            )
+            self.assertFalse(self.m._validate_strict_resume_startup(args))
 
     def test_cleanup_skips_work_root_with_failed_txn_pending_source_finalization(self):
         with tempfile.TemporaryDirectory() as td:
@@ -14160,6 +29198,16 @@ class TestTxnPrimitives(unittest.TestCase):
                 manifest_state="failed",
                 final_disposition="failure:move",
                 txn_terminal_state=self.m.TXN_STATE_FAILED,
+            )
+            self.m._plan_finalized_source_destination(
+                txn,
+                archive["archive_path"],
+                os.path.join(
+                    fixture["output_root"],
+                    "failed-dest",
+                    txn["txn_id"],
+                    os.path.basename(archive["archive_path"]),
+                ),
             )
             self.m._txn_snapshot(txn)
 
@@ -14310,6 +29358,16 @@ class TestTxnPrimitives(unittest.TestCase):
                 final_disposition="failure:move",
                 txn_terminal_state=self.m.TXN_STATE_FAILED,
             )
+            self.m._plan_finalized_source_destination(
+                txn,
+                archive_path,
+                os.path.join(
+                    args.output,
+                    "failed-dest",
+                    txn["txn_id"],
+                    os.path.basename(archive_path),
+                ),
+            )
             txn["state"] = self.m.TXN_STATE_FAILED
             txn["error"] = {
                 "type": "PLACE_FAILED",
@@ -14356,49 +29414,122 @@ class TestTxnPrimitives(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             args = self._make_processing_args(
                 td,
-                output=os.path.join(td, "out"),
+                threads=1,
+                output_lock_timeout_ms=1000,
+                output_lock_retry_ms=10,
+                keep_journal_days=7,
                 success_clean_journal=True,
                 fail_clean_journal=False,
+                conflict_mode="fail",
             )
-            output_dir = os.path.join(args.output, "ok-out")
-            archive_path = os.path.join(td, "alpha.zip")
-            with open(archive_path, "wb") as f:
-                f.write(b"zip")
+            output_base = args.output
+            historical_archive = os.path.join(td, "historical.zip")
+            current_archive = os.path.join(td, "current.zip")
+            for archive_path, payload in (
+                (historical_archive, b"historical"),
+                (current_archive, b"current"),
+            ):
+                with open(archive_path, "wb") as f:
+                    f.write(payload)
+
+            historical_output_dir = os.path.join(output_base, "historical-out")
+            current_output_dir = os.path.join(output_base, "current-out")
             self.m._create_dataset_manifest(
                 input_root=td,
-                output_root=args.output,
+                output_root=output_base,
                 discovered_archives=[
                     {
-                        "archive_path": archive_path,
-                        "output_dir": output_dir,
-                        "volumes": [archive_path],
+                        "archive_path": historical_archive,
+                        "output_dir": historical_output_dir,
+                        "volumes": [historical_archive],
+                        "requested_policy": "direct",
+                    },
+                    {
+                        "archive_path": current_archive,
+                        "output_dir": current_output_dir,
+                        "volumes": [current_archive],
                         "requested_policy": "direct",
                     }
                 ],
                 command_fingerprint=self.m._build_command_fingerprint(args),
             )
-            txn = self.m._txn_create(
-                archive_path=archive_path,
-                volumes=[archive_path],
-                output_dir=output_dir,
-                output_base=args.output,
+            historical_txn = self.m._txn_create(
+                archive_path=historical_archive,
+                volumes=[historical_archive],
+                output_dir=historical_output_dir,
+                output_base=output_base,
                 policy="direct",
                 wal_fsync_every=1,
                 snapshot_every=1,
                 durability_enabled=False,
             )
-            self.m._mark_txn_success_terminal(txn, final_disposition="success:asis")
+            historical_txn["state"] = self.m.TXN_STATE_DONE
+            historical_txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(historical_txn)
+            self.m._update_dataset_manifest_archive(
+                output_base,
+                historical_archive,
+                state="succeeded",
+                last_txn_id=historical_txn["txn_id"],
+                final_disposition="success:asis",
+                error=None,
+                finalized_at=self.m._now_iso(),
+            )
+
+            work_base = self.m._work_base(output_base)
+            retire_calls = []
 
             processor = types.SimpleNamespace(successful_archives=[], failed_archives=[], skipped_archives=[])
+
+            def fail_retirement(path, manifest):
+                retire_calls.append(os.path.abspath(path))
+                return False
+
+            def fake_extract(processor, archive_path, *, args, output_base):
+                return self._make_txn_result(
+                    archive_path,
+                    output_dir=current_output_dir,
+                    output_base=output_base,
+                )
+
+            def fake_finalize_one_txn(txn, *, processor, args, output_base):
+                txn["state"] = self.m.TXN_STATE_DONE
+                txn["terminal_final_disposition"] = "success:asis"
+                self.m._txn_snapshot(txn)
+                self.m._update_dataset_manifest_archive(
+                    output_base,
+                    txn["archive_path"],
+                    state="succeeded",
+                    last_txn_id=txn["txn_id"],
+                    final_disposition="success:asis",
+                    error=None,
+                    finalized_at=self.m._now_iso(),
+                )
+                processor.successful_archives.append(txn["archive_path"])
+                return True
+
             with (
+                mock.patch.object(self.m, "_recover_all_outputs"),
+                mock.patch.object(self.m, "_extract_phase", side_effect=fake_extract),
+                mock.patch.object(
+                    self.m,
+                    "_finalize_one_txn",
+                    side_effect=fake_finalize_one_txn,
+                ),
+                mock.patch.object(self.m, "_garbage_collect"),
                 mock.patch.object(self.m, "FileLock", DummyLock),
-                mock.patch.object(self.m, "safe_rmtree", side_effect=[True, False]),
-                mock.patch.object(self.m, "_run_transactional_extract_phase", return_value=None),
+                mock.patch.object(
+                    self.m, "_retire_terminal_work_base", side_effect=fail_retirement
+                ),
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
             ):
-                self.m._run_transactional(processor, [], args=args)
+                self.m._run_transactional(processor, [current_archive], args=args)
 
-            self.assertIn(self.m._work_base(args.output), stdout.getvalue())
+            self.assertEqual([os.path.abspath(work_base)], retire_calls)
+            self.assertIn(
+                f"Warning: Could not remove terminal transactional workdir {work_base}; future runs will treat it as terminal residue rather than active state.",
+                stdout.getvalue(),
+            )
 
     def test_top_level_cleanup_skips_work_base_when_orphan_work_root_is_active(self):
         class DummyLock:
@@ -14664,6 +29795,9 @@ class TestTxnPrimitives(unittest.TestCase):
                 )
 
             def fake_finalize_one_txn(txn, *, processor, args, output_base):
+                txn["state"] = self.m.TXN_STATE_DONE
+                txn["terminal_final_disposition"] = "success:asis"
+                self.m._txn_snapshot(txn)
                 self.m._update_dataset_manifest_archive(
                     output_base,
                     txn["archive_path"],
@@ -14758,6 +29892,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             historical_txn["state"] = self.m.TXN_STATE_DONE
+            historical_txn["terminal_final_disposition"] = "success:asis"
             self.m._txn_snapshot(historical_txn)
             self.m._update_dataset_manifest_archive(
                 output_base,
@@ -14789,6 +29924,9 @@ class TestTxnPrimitives(unittest.TestCase):
                 )
 
             def fake_finalize_one_txn(txn, *, processor, args, output_base):
+                txn["state"] = self.m.TXN_STATE_DONE
+                txn["terminal_final_disposition"] = "success:asis"
+                self.m._txn_snapshot(txn)
                 self.m._update_dataset_manifest_archive(
                     output_base,
                     txn["archive_path"],
@@ -14914,6 +30052,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 durability_enabled=False,
             )
             selected_txn["state"] = self.m.TXN_STATE_EXTRACTED
+            self._make_valid_recovered_tree(selected_txn["paths"]["staging_extracted"])
             self.m._txn_snapshot(selected_txn)
 
             newer_txn = self.m._txn_create(
@@ -15040,6 +30179,7 @@ class TestTxnPrimitives(unittest.TestCase):
                     durability_enabled=False,
                 )
                 txn["state"] = self.m.TXN_STATE_DONE
+                txn["terminal_final_disposition"] = "success:asis"
                 self.m._txn_snapshot(txn)
                 self.m._update_dataset_manifest_archive(
                     output_root,
@@ -15210,6 +30350,9 @@ class TestTxnPrimitives(unittest.TestCase):
                 self.fail(f"unexpected archive: {archive_path}")
 
             def fake_finalize_one_txn(txn, *, processor, args, output_base):
+                txn["state"] = self.m.TXN_STATE_DONE
+                txn["terminal_final_disposition"] = "success:asis"
+                self.m._txn_snapshot(txn)
                 processor.successful_archives.append(txn["archive_path"])
                 return True
 

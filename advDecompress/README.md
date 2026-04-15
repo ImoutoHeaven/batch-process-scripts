@@ -98,13 +98,15 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 ## 事务模式说明（默认）
 
 * 默认使用事务化流程；`--legacy` 才会切回旧版非事务化流程。
-* 首次运行会把本轮待处理归档列表、顺序与关键参数写入 `.advdecompress_work/dataset_manifest.json`。
+* 首次运行会把本轮待处理归档列表、顺序与关键参数写入 `.advdecompress_work/dataset_manifest.json`，并把事务回放所需的版本化元数据写入各事务自己的 `txn.json`。
 * 之后恢复遵循**严格数据集恢复**：只继续 manifest 中已有的归档，不会在恢复时重新发现并纳入后来新增的归档；如需把后来新增的归档也纳入处理，请删除 `.advdecompress_work/` 后重新开始新一轮运行。
 * 能直接续跑完成的归档会继续完成，不会重新解压；必须重试的归档只重跑对应单个归档。
 * 若命令指纹不一致，或 manifest 记录的归档缺失、大小变化、时间戳变化等，脚本会拒绝恢复，并明确提示先删除 `.advdecompress_work/` 后再重新开始。
+* 旧的 `.advdecompress_work/` 与当前事务协议不兼容；恢复若发现缺少或不支持当前 schema version 的 manifest / txn 元数据，会拒绝继续，并要求先删除该目录后再重试。
 * 单个事务一旦成功落位并通过 durability barrier，就会立刻执行该事务自己的成功后处理（例如 `-sp delete` / `-sp move`）；不是 extract 成功后立刻处理源归档，也不再等待整批归档都提取完成。
 * 会变更源归档的事务化后处理（如 `-sp delete` / `-sp move` / `-fp move` / `-tzp move`）只有在事务 journal 与已落位输出都通过 durability barrier 后才会执行；因此不能与 `--no-durability` 或 `--fsync-files none` 同用。
-* 同一 `output_dir` 的事务仍通过 `output_dir.lock` 串行落位；多线程下先完成提取的事务可能先落位，因此同目录内的命名/冲突处理顺序可能不同于扫描顺序。
+* 同一 `output_dir` 的事务仍通过 `output_dir.lock` 串行落位，并按 manifest 里的 discovered order 提交；多线程只影响提取并发，不会改变同目录内的命名/冲突处理顺序。
+* 启用 `--degrade-cross-volume` 时，事务模式下的跨卷落位与源归档收尾都会按 `txn.json` 记录的阶段逐步回放，而不是退回到不可回放的 opaque move fallback。
 * 多线程只保留受 orchestration window / `--threads` 约束的在途提取任务，不会先把整批归档都提取完再统一落位。
 * 因此磁盘峰值主要受并发度与同目录串行点影响，不再随着整批归档数量线性累积。
 * `--keep-journal-days` 只会回收已收敛到终态的旧 journal；仍可恢复 / 可重试的记录会保留，避免把恢复现场提前清掉。

@@ -29,3 +29,71 @@ jobs:
 
       - name: Run advDecompress transactional pytest coverage
         run: python -m pytest advDecompress/tests/test_txn_primitives.py -q
+
+  advdecompress-windows-real-cli-guardrail:
+    name: advDecompress Windows real CLI guardrail (${{ matrix.os }} / ${{ matrix.scenario.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-2022
+          - windows-2025
+        scenario:
+          - name: baseline
+            threads: '10'
+            archive_count: '10'
+            iterations: '1'
+            fixture_style: unicode
+            path_style: downloads
+            decompress_policy: file-content-auto-folder-2-collect-meaningful-ent
+          - name: race-high-threads
+            threads: '32'
+            archive_count: '48'
+            iterations: '2'
+            fixture_style: unicode
+            path_style: downloads
+            decompress_policy: file-content-auto-folder-2-collect-meaningful-ent
+          - name: race-same-output
+            threads: '24'
+            archive_count: '40'
+            iterations: '2'
+            fixture_style: mixed
+            path_style: flat
+            decompress_policy: direct
+          - name: race-mixed-unicode
+            threads: '24'
+            archive_count: '40'
+            iterations: '2'
+            fixture_style: mixed
+            path_style: nested-deep
+            decompress_policy: file-content-auto-folder-2-collect-meaningful-ent
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install runtime dependencies
+        run: python -m pip install chardet charset-normalizer
+
+      - name: Ensure 7-Zip is available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
+            choco install 7zip -y --no-progress
+          }
+          7z i
+
+      - name: Run advDecompress real CLI guardrail
+        env:
+          ADVD_GUARDRAIL_THREADS: ${{ matrix.scenario.threads }}
+          ADVD_GUARDRAIL_ARCHIVE_COUNT: ${{ matrix.scenario.archive_count }}
+          ADVD_GUARDRAIL_FIXTURE_STYLE: ${{ matrix.scenario.fixture_style }}
+          ADVD_GUARDRAIL_PATH_STYLE: ${{ matrix.scenario.path_style }}
+          ADVD_GUARDRAIL_DECOMPRESS_POLICY: ${{ matrix.scenario.decompress_policy }}
+          ADVD_GUARDRAIL_ITERATIONS: ${{ matrix.os == 'windows-2025' && '5' || matrix.scenario.iterations }}
+        run: python advDecompress/tests/real_cli_guardrail.py
