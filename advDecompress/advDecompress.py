@@ -18,6 +18,7 @@ import json
 import time
 import threading
 import uuid
+import sqlite3
 import glob
 import socket
 import platform
@@ -43,6 +44,8 @@ VERBOSE = False
 # If True, temporary directories are forcibly deleted even when non-empty.
 # Default keeps non-empty temp dirs to avoid silent data loss and to aid debugging.
 FORCE_CLEAN_TMP = False
+_RUNTIME_METADATA_DB_BY_OUTPUT_BASE = {}
+_MANIFEST_UNSET = object()
 
 
 # Track active subprocesses so SIGINT/SIGTERM can terminate them promptly.
@@ -71,6 +74,39 @@ def _register_active_subprocess(proc: subprocess.Popen):
 def _unregister_active_subprocess(proc: subprocess.Popen):
     with _active_subprocesses_lock:
         _active_subprocesses.discard(proc)
+
+
+def _register_runtime_metadata_db(output_base, metadata_db_path):
+    if not output_base or not metadata_db_path:
+        return
+    _RUNTIME_METADATA_DB_BY_OUTPUT_BASE[os.path.abspath(output_base)] = os.path.abspath(
+        metadata_db_path
+    )
+
+
+def _unregister_runtime_metadata_db(output_base):
+    if not output_base:
+        return
+    _RUNTIME_METADATA_DB_BY_OUTPUT_BASE.pop(os.path.abspath(output_base), None)
+
+
+def _runtime_metadata_db_path(output_base):
+    output_base_abs = os.path.abspath(output_base)
+    configured = _RUNTIME_METADATA_DB_BY_OUTPUT_BASE.get(output_base_abs)
+    if configured:
+        return configured
+    marker_path = os.path.join(
+        _work_base(output_base_abs),
+        "metadata.backend.json",
+    )
+    if safe_exists(marker_path, VERBOSE):
+        try:
+            marker = _load_metadata_backend_marker(output_base_abs)
+        except Exception:
+            return None
+        if marker.get("mode") == "local":
+            return _default_metadata_db_path(output_base_abs)
+    return None
 
 
 def _terminate_process_tree(proc: subprocess.Popen, timeout_s: float = 2.0):
@@ -4173,6 +4209,758 @@ def _work_base(output_base):
     return os.path.join(output_base, ".advdecompress_work")
 
 
+def _default_metadata_db_path(output_base):
+    return os.path.join(_work_base(os.path.abspath(output_base)), "metadata.sqlite")
+
+
+def _metadata_backend_marker_path(output_base):
+    return os.path.join(
+        _work_base(os.path.abspath(output_base)),
+        "metadata.backend.json",
+    )
+
+
+def _resolve_metadata_backend_config(args, output_base):
+    requested = getattr(args, "metadata_db", None)
+    if requested:
+        return {"mode": "external", "db_path": os.path.abspath(requested)}
+    return {"mode": "local", "db_path": _default_metadata_db_path(output_base)}
+
+
+def _build_metadata_backend_marker(
+    *, mode, schema_version, db_instance_id, db_fingerprint
+):
+    return {
+        "backend": "sqlite",
+        "mode": mode,
+        "schema_version": schema_version,
+        "db_instance_id": db_instance_id,
+        "db_fingerprint": db_fingerprint,
+    }
+
+
+def _validate_metadata_backend_marker(marker):
+    if not isinstance(marker, dict):
+        raise RuntimeError(
+            "incompatible transactional metadata: backend marker must be a JSON object"
+        )
+
+    allowed_fields = {
+        "backend",
+        "mode",
+        "schema_version",
+        "db_instance_id",
+        "db_fingerprint",
+    }
+    unexpected_fields = sorted(set(marker.keys()) - allowed_fields)
+    if unexpected_fields:
+        raise RuntimeError(
+            "incompatible transactional metadata: backend marker contains unexpected fields: "
+            + ", ".join(unexpected_fields)
+        )
+
+    if marker.get("backend") != "sqlite":
+        raise RuntimeError(
+            "incompatible transactional metadata: backend marker does not describe the SQLite backend"
+        )
+    if marker.get("mode") not in ("local", "external"):
+        raise RuntimeError(
+            "incompatible transactional metadata: backend marker mode is invalid"
+        )
+    if (
+        not isinstance(marker.get("schema_version"), int)
+        or marker["schema_version"] <= 0
+    ):
+        raise RuntimeError(
+            "incompatible transactional metadata: backend marker schema_version is invalid"
+        )
+    if marker["schema_version"] != SQLITE_METADATA_SCHEMA_VERSION:
+        raise RuntimeError(
+            "incompatible transactional metadata: backend marker schema version is incompatible with current SQLite metadata schema"
+        )
+    for field in ("db_instance_id", "db_fingerprint"):
+        if (
+            not isinstance(marker.get(field), str)
+            or not marker.get(field, "").strip()
+        ):
+            raise RuntimeError(
+                f"incompatible transactional metadata: backend marker {field} is invalid"
+            )
+
+    return marker
+
+
+def _load_metadata_backend_marker(output_base):
+    marker_path = _metadata_backend_marker_path(output_base)
+    if not safe_exists(marker_path, VERBOSE):
+        raise RuntimeError(
+            "incompatible transactional metadata: metadata backend marker is missing"
+        )
+    try:
+        with open(marker_path, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            "incompatible transactional metadata: backend marker is malformed"
+        ) from e
+    return _validate_metadata_backend_marker(marker)
+
+
+def _write_metadata_backend_marker(
+    output_base, *, mode, schema_version, db_instance_id, db_fingerprint
+):
+    atomic_write_json(
+        _metadata_backend_marker_path(output_base),
+        _build_metadata_backend_marker(
+            mode=mode,
+            schema_version=schema_version,
+            db_instance_id=db_instance_id,
+            db_fingerprint=db_fingerprint,
+        ),
+        debug=VERBOSE,
+    )
+
+
+def _write_raw_backend_marker(output_base, payload):
+    atomic_write_json(
+        _metadata_backend_marker_path(output_base),
+        payload,
+        debug=VERBOSE,
+    )
+
+
+def _validate_metadata_backend_identity(cfg, marker, output_base):
+    if marker["mode"] == "local" and not safe_exists(cfg["db_path"], VERBOSE):
+        raise RuntimeError("metadata-missing: local SQLite metadata DB is missing")
+
+    conn = _metadata_connect(cfg["db_path"], create_if_missing=False)
+    try:
+        store = _metadata_load_store(conn)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if store["schema_version"] != marker["schema_version"]:
+        raise RuntimeError(
+            "metadata_db_mismatch: database schema version does not match the workdir marker"
+        )
+    if store["mode"] != marker["mode"]:
+        raise RuntimeError(
+            "metadata_db_mismatch: database mode does not match the workdir marker"
+        )
+    if store["db_instance_id"] != marker["db_instance_id"]:
+        raise RuntimeError(
+            "metadata_db_mismatch: database instance id does not match the workdir marker"
+        )
+    if store["db_fingerprint"] != marker["db_fingerprint"]:
+        raise RuntimeError(
+            "metadata_db_mismatch: database fingerprint does not match the workdir marker"
+        )
+    if store["output_root"] != os.path.abspath(output_base):
+        raise RuntimeError(
+            "metadata_db_mismatch: database belongs to a different output root"
+        )
+
+
+def _resolve_resume_metadata_backend(args, output_base):
+    marker = _load_metadata_backend_marker(output_base)
+    requested = getattr(args, "metadata_db", None)
+
+    if marker["mode"] == "external" and not requested:
+        raise RuntimeError(
+            "Existing transactional workdir requires --metadata-db because its persistent metadata backend is external."
+        )
+    if marker["mode"] == "local" and requested:
+        raise RuntimeError(
+            "metadata backend-mode mismatch: workdir is local but --metadata-db was supplied"
+        )
+
+    cfg = _resolve_metadata_backend_config(args, output_base)
+    _validate_metadata_backend_identity(cfg, marker, output_base)
+    return cfg
+
+
+SQLITE_METADATA_SCHEMA_VERSION = 1
+
+
+def _metadata_connect(db_path, *, create_if_missing):
+    db_path = os.path.abspath(db_path)
+    db_dir = os.path.dirname(db_path)
+
+    if create_if_missing:
+        safe_makedirs(db_dir, debug=VERBOSE)
+        if not safe_isdir(db_dir, VERBOSE) or not os.access(
+            db_dir, os.R_OK | os.W_OK | os.X_OK
+        ):
+            raise RuntimeError(f"metadata DB path is unreadable or unwritable: {db_dir}")
+    else:
+        if not safe_exists(db_path, VERBOSE):
+            raise RuntimeError("metadata-missing: transactional metadata DB is missing")
+        if not os.access(db_path, os.R_OK | os.W_OK):
+            raise RuntimeError(
+                f"metadata DB path is unreadable or unwritable: {db_path}"
+            )
+
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.Error as e:
+        raise RuntimeError(
+            "incompatible transactional metadata: "
+            f"SQLite metadata is unreadable or schema-incompatible: {e}"
+        ) from e
+
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def _metadata_init_schema(conn):
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS metadata_store (
+                schema_version INTEGER NOT NULL,
+                output_root TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                db_instance_id TEXT NOT NULL PRIMARY KEY,
+                db_fingerprint TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS dataset_state (
+                output_root TEXT NOT NULL PRIMARY KEY,
+                status TEXT NOT NULL,
+                command_fingerprint_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS archives (
+                archive_path TEXT NOT NULL PRIMARY KEY,
+                output_dir TEXT NOT NULL,
+                discovered_order INTEGER NOT NULL,
+                identity_size INTEGER NOT NULL,
+                identity_mtime_ns INTEGER NOT NULL,
+                requested_policy TEXT,
+                resolved_policy TEXT,
+                state TEXT NOT NULL,
+                last_txn_id TEXT,
+                attempts INTEGER NOT NULL,
+                final_disposition TEXT NOT NULL,
+                finalized_at TEXT,
+                error_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS txns (
+                txn_id TEXT NOT NULL PRIMARY KEY,
+                archive_path TEXT NOT NULL,
+                output_dir TEXT NOT NULL,
+                output_base TEXT NOT NULL,
+                state TEXT NOT NULL,
+                updated_at_epoch REAL NOT NULL,
+                terminal_state INTEGER NOT NULL,
+                txn_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS placement_ops (
+                txn_id TEXT NOT NULL,
+                op_id INTEGER NOT NULL,
+                op_json TEXT NOT NULL,
+                PRIMARY KEY (txn_id, op_id)
+            );
+            CREATE TABLE IF NOT EXISTS source_finalization_ops (
+                txn_id TEXT NOT NULL,
+                op_id INTEGER NOT NULL,
+                op_json TEXT NOT NULL,
+                PRIMARY KEY (txn_id, op_id)
+            );
+            CREATE TABLE IF NOT EXISTS archive_volumes (
+                archive_path TEXT NOT NULL,
+                volume_path TEXT NOT NULL,
+                PRIMARY KEY (archive_path, volume_path)
+            );
+            """
+        )
+    except sqlite3.DatabaseError as e:
+        raise RuntimeError(
+            "incompatible transactional metadata: "
+            f"SQLite metadata is unreadable or schema-incompatible: {e}"
+        ) from e
+
+
+def _metadata_load_store(conn):
+    try:
+        row = conn.execute(
+            "SELECT schema_version, output_root, mode, db_instance_id, db_fingerprint FROM metadata_store"
+        ).fetchone()
+    except sqlite3.DatabaseError as e:
+        raise RuntimeError(
+            "incompatible transactional metadata: "
+            f"SQLite metadata is unreadable or schema-incompatible: {e}"
+        ) from e
+
+    if row is None:
+        raise RuntimeError(
+            "incompatible transactional metadata: metadata_store row is missing"
+        )
+
+    store = dict(row)
+    if store.get("schema_version") != SQLITE_METADATA_SCHEMA_VERSION:
+        raise RuntimeError(
+            "incompatible transactional metadata: SQLite metadata schema version is incompatible with current runtime"
+        )
+    return store
+
+
+def _metadata_bootstrap_store(conn, *, output_base, mode):
+    db_instance_id = hashlib.sha256(
+        f"{os.getpid()}:{time.time_ns()}:{random.random()}".encode("utf-8")
+    ).hexdigest()[:32]
+    db_fingerprint = hashlib.sha256(
+        f"{os.path.abspath(output_base)}:{mode}:{db_instance_id}".encode("utf-8")
+    ).hexdigest()
+    try:
+        with conn:
+            conn.execute("DELETE FROM placement_ops")
+            conn.execute("DELETE FROM source_finalization_ops")
+            conn.execute("DELETE FROM txns")
+            conn.execute("DELETE FROM archive_volumes")
+            conn.execute("DELETE FROM archives")
+            conn.execute("DELETE FROM dataset_state")
+            conn.execute("DELETE FROM metadata_store")
+            conn.execute(
+                "INSERT INTO metadata_store(schema_version, output_root, mode, db_instance_id, db_fingerprint) VALUES (?, ?, ?, ?, ?)",
+                (
+                    SQLITE_METADATA_SCHEMA_VERSION,
+                    os.path.abspath(output_base),
+                    mode,
+                    db_instance_id,
+                    db_fingerprint,
+                ),
+            )
+    except sqlite3.DatabaseError as e:
+        raise RuntimeError(
+            "incompatible transactional metadata: "
+            f"SQLite metadata is unreadable or schema-incompatible: {e}"
+        ) from e
+
+
+def _metadata_store_identity(conn):
+    return _metadata_load_store(conn)
+
+
+def _metadata_try_load_store(conn):
+    try:
+        row = conn.execute(
+            "SELECT schema_version, output_root, mode, db_instance_id, db_fingerprint FROM metadata_store"
+        ).fetchone()
+    except sqlite3.DatabaseError as e:
+        raise RuntimeError(
+            "incompatible transactional metadata: "
+            f"SQLite metadata is unreadable or schema-incompatible: {e}"
+        ) from e
+    if row is None:
+        return None
+    return dict(row)
+
+
+def _rewrite_metadata_store_identity(
+    db_path,
+    *,
+    output_root,
+    mode,
+    schema_version,
+    db_instance_id,
+    db_fingerprint,
+):
+    conn = _metadata_connect(db_path, create_if_missing=False)
+    try:
+        with conn:
+            conn.execute("DELETE FROM metadata_store")
+            conn.execute(
+                "INSERT INTO metadata_store(schema_version, output_root, mode, db_instance_id, db_fingerprint) VALUES (?, ?, ?, ?, ?)",
+                (
+                    schema_version,
+                    os.path.abspath(output_root),
+                    mode,
+                    db_instance_id,
+                    db_fingerprint,
+                ),
+            )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _bootstrap_sqlite_metadata_store(
+    db_path,
+    *,
+    output_root,
+    mode,
+    schema_version=1,
+    db_instance_id="seed-db",
+    db_fingerprint="seed-fingerprint",
+):
+    conn = _metadata_connect(db_path, create_if_missing=True)
+    try:
+        _metadata_init_schema(conn)
+        with conn:
+            conn.execute("DELETE FROM metadata_store")
+            conn.execute(
+                "INSERT INTO metadata_store(schema_version, output_root, mode, db_instance_id, db_fingerprint) VALUES (?, ?, ?, ?, ?)",
+                (
+                    schema_version,
+                    os.path.abspath(output_root),
+                    mode,
+                    db_instance_id,
+                    db_fingerprint,
+                ),
+            )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _write_invalid_sqlite_store(db_path):
+    safe_makedirs(os.path.dirname(os.path.abspath(db_path)), debug=VERBOSE)
+    with open(db_path, "wb") as f:
+        f.write(b"not-a-valid-sqlite-db")
+
+
+def _reject_legacy_json_workdir(output_base):
+    work_base = _work_base(os.path.abspath(output_base))
+    manifest_path = os.path.join(work_base, "dataset_manifest.json")
+    marker_path = _metadata_backend_marker_path(output_base)
+    if safe_exists(manifest_path, VERBOSE) and not safe_exists(marker_path, VERBOSE):
+        raise RuntimeError(
+            "incompatible transactional metadata: legacy dataset_manifest.json workdir detected"
+        )
+
+
+def _open_metadata_backend_for_new_run(args, output_base):
+    _reject_legacy_json_workdir(output_base)
+    cfg = _resolve_metadata_backend_config(args, output_base)
+
+    safe_makedirs(_work_base(output_base), debug=VERBOSE)
+
+    conn = _metadata_connect(cfg["db_path"], create_if_missing=True)
+    try:
+        _metadata_init_schema(conn)
+        existing_store = _metadata_try_load_store(conn)
+        if existing_store is not None:
+            if existing_store["schema_version"] != SQLITE_METADATA_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "incompatible transactional metadata: SQLite metadata schema version is incompatible with current runtime"
+                )
+            if existing_store["output_root"] != os.path.abspath(output_base):
+                raise RuntimeError(
+                    "metadata_db_mismatch: database belongs to a different output root"
+                )
+            if existing_store["mode"] != cfg["mode"]:
+                raise RuntimeError(
+                    "metadata_db_mismatch: database backend mode does not match the requested mode"
+                )
+        _metadata_bootstrap_store(conn, output_base=output_base, mode=cfg["mode"])
+
+        store = _metadata_store_identity(conn)
+        _write_metadata_backend_marker(
+            output_base,
+            mode=cfg["mode"],
+            schema_version=store["schema_version"],
+            db_instance_id=store["db_instance_id"],
+            db_fingerprint=store["db_fingerprint"],
+        )
+        _register_runtime_metadata_db(output_base, cfg["db_path"])
+        return {
+            "mode": cfg["mode"],
+            "db_path": cfg["db_path"],
+            "conn": conn,
+        }
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+
+
+def _metadata_create_dataset(
+    conn, *, output_root, command_fingerprint, discovered_archives
+):
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO dataset_state(output_root, status, command_fingerprint_json) VALUES (?, ?, ?)",
+            (
+                os.path.abspath(output_root),
+                "active",
+                json.dumps(command_fingerprint, sort_keys=True),
+            ),
+        )
+
+        for discovered_order, archive in enumerate(discovered_archives, start=1):
+            archive_path = os.path.abspath(archive["archive_path"])
+            output_dir = os.path.abspath(archive["output_dir"])
+            stat_result = os.stat(archive_path)
+            conn.execute(
+                "INSERT OR REPLACE INTO archives(archive_path, output_dir, discovered_order, identity_size, identity_mtime_ns, requested_policy, resolved_policy, state, last_txn_id, attempts, final_disposition, finalized_at, error_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    archive_path,
+                    output_dir,
+                    discovered_order,
+                    int(stat_result.st_size),
+                    int(stat_result.st_mtime_ns),
+                    archive.get("requested_policy"),
+                    archive.get("resolved_policy"),
+                    "pending",
+                    None,
+                    0,
+                    "unknown",
+                    None,
+                    None,
+                ),
+            )
+
+            for volume_path in archive.get("volumes", [archive_path]):
+                conn.execute(
+                    "INSERT OR REPLACE INTO archive_volumes(archive_path, volume_path) VALUES (?, ?)",
+                    (archive_path, os.path.abspath(volume_path)),
+                )
+
+
+def _metadata_recompute_dataset_status(conn):
+    rows = conn.execute("SELECT state FROM archives ORDER BY discovered_order").fetchall()
+    archive_states = [row["state"] for row in rows]
+    terminal_states = {"succeeded", "failed"}
+    if any(state not in terminal_states for state in archive_states):
+        status = "active"
+    elif any(state == "failed" for state in archive_states):
+        status = "failed"
+    else:
+        status = "completed"
+    conn.execute("UPDATE dataset_state SET status = ?", (status,))
+    return status
+
+
+def _metadata_update_archive(
+    conn,
+    archive_path,
+    *,
+    state,
+    last_txn_id,
+    attempts_increment=0,
+    final_disposition,
+    error=None,
+    finalized_at=None,
+):
+    with conn:
+        conn.execute(
+            "UPDATE archives SET state = ?, last_txn_id = ?, attempts = attempts + ?, final_disposition = ?, finalized_at = ?, error_json = ? WHERE archive_path = ?",
+            (
+                state,
+                last_txn_id,
+                int(attempts_increment),
+                final_disposition,
+                finalized_at,
+                json.dumps(error, sort_keys=True) if error is not None else None,
+                os.path.abspath(archive_path),
+            ),
+        )
+        _metadata_recompute_dataset_status(conn)
+
+
+def _metadata_load_archive(conn, archive_path):
+    row = conn.execute(
+        "SELECT archive_path, output_dir, discovered_order, state, last_txn_id, attempts, final_disposition, finalized_at, error_json FROM archives WHERE archive_path = ?",
+        (os.path.abspath(archive_path),),
+    ).fetchone()
+    if row is None:
+        return None
+
+    archive = dict(row)
+    archive["error"] = (
+        json.loads(archive["error_json"]) if archive.get("error_json") else None
+    )
+    return archive
+
+
+def _metadata_upsert_txn_row(conn, txn):
+    conn.execute(
+        "INSERT OR REPLACE INTO txns(txn_id, archive_path, output_dir, output_base, state, updated_at_epoch, terminal_state, txn_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            txn["txn_id"],
+            os.path.abspath(txn["archive_path"]),
+            os.path.abspath(txn["output_dir"]),
+            os.path.abspath(txn["output_base"]),
+            txn.get("state"),
+            time.time(),
+            1
+            if txn.get("state")
+            in (
+                TXN_STATE_DONE,
+                TXN_STATE_FAILED,
+                TXN_STATE_CLEANED,
+                TXN_STATE_SOURCE_FINALIZED,
+            )
+            else 0,
+            json.dumps(txn, sort_keys=True),
+        ),
+    )
+
+
+def _metadata_replace_placement_ops(conn, txn_id, ops):
+    conn.execute("DELETE FROM placement_ops WHERE txn_id = ?", (txn_id,))
+    for op in ops:
+        conn.execute(
+            "INSERT INTO placement_ops(txn_id, op_id, op_json) VALUES (?, ?, ?)",
+            (
+                txn_id,
+                int(op["op_id"]),
+                json.dumps(op, sort_keys=True),
+            ),
+        )
+
+
+def _metadata_replace_source_finalization_ops(conn, txn_id, ops):
+    conn.execute("DELETE FROM source_finalization_ops WHERE txn_id = ?", (txn_id,))
+    for op in ops:
+        conn.execute(
+            "INSERT INTO source_finalization_ops(txn_id, op_id, op_json) VALUES (?, ?, ?)",
+            (
+                txn_id,
+                int(op["op_id"]),
+                json.dumps(op, sort_keys=True),
+            ),
+        )
+
+
+def _metadata_persist_txn_snapshot(txn):
+    metadata_db_path = txn.get("metadata_db_path")
+    if not metadata_db_path:
+        return
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        with conn:
+            _metadata_upsert_txn_row(conn, txn)
+            _metadata_replace_placement_ops(
+                conn,
+                txn["txn_id"],
+                ((txn.get("placement_v2") or {}).get("ops") or []),
+            )
+            _metadata_replace_source_finalization_ops(
+                conn,
+                txn["txn_id"],
+                ((txn.get("source_finalization_v2") or {}).get("ops") or []),
+            )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _metadata_load_latest_txn(output_base, archive_path, *, metadata_db_path):
+    archive_path = os.path.abspath(archive_path)
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        archive_row = conn.execute(
+            "SELECT output_dir, state, last_txn_id FROM archives WHERE archive_path = ?",
+            (archive_path,),
+        ).fetchone()
+        selected_txn_id = None
+        if archive_row is not None and archive_row["last_txn_id"]:
+            selected_txn_id = str(archive_row["last_txn_id"])
+        if selected_txn_id:
+            selected_txn = conn.execute(
+                "SELECT txn_json FROM txns WHERE txn_id = ? LIMIT 1",
+                (selected_txn_id,),
+            ).fetchone()
+            if selected_txn is not None:
+                validated_txn = _validated_metadata_txn(
+                    json.loads(selected_txn["txn_json"]),
+                    output_base=output_base,
+                )
+                if archive_row is not None and archive_row["state"] == "recoverable":
+                    selected_journal_dir = os.path.join(
+                        _work_root(validated_txn["output_dir"], output_base),
+                        "journal",
+                        validated_txn["txn_id"],
+                    )
+                    if not safe_exists(selected_journal_dir, VERBOSE):
+                        _raise_refuse_recovery(
+                            {
+                                "archive_path": archive_path,
+                                "output_dir": (
+                                    os.path.abspath(archive_row["output_dir"])
+                                    if archive_row["output_dir"]
+                                    else None
+                                ),
+                                "last_txn_id": selected_txn_id,
+                            },
+                            "missing_selected_txn",
+                        )
+                return validated_txn
+            _raise_refuse_recovery(
+                {
+                    "archive_path": archive_path,
+                    "output_dir": (
+                        os.path.abspath(archive_row["output_dir"])
+                        if archive_row is not None and archive_row["output_dir"]
+                        else None
+                    ),
+                    "last_txn_id": selected_txn_id,
+                },
+                "missing_selected_txn",
+            )
+
+        rows = conn.execute(
+            "SELECT txn_json FROM txns WHERE archive_path = ? ORDER BY updated_at_epoch DESC, txn_id DESC",
+            (archive_path,),
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if rows:
+        latest_txn = _validated_metadata_txn(
+            json.loads(rows[0]["txn_json"]),
+            output_base=output_base,
+        )
+        if archive_row is not None and archive_row["state"] == "recoverable":
+            if _txn_is_closed_terminal_outcome(latest_txn):
+                _raise_refuse_recovery(
+                    {
+                        "archive_path": archive_path,
+                        "output_dir": (
+                            os.path.abspath(archive_row["output_dir"])
+                            if archive_row["output_dir"]
+                            else None
+                        ),
+                        "last_txn_id": None,
+                    },
+                    "missing_selected_txn",
+                )
+        return latest_txn
+
+    return None
+
+
+def _metadata_load_all_txns_for_output_dir(output_dir, *, metadata_db_path):
+    output_dir = os.path.abspath(output_dir)
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        rows = conn.execute(
+            "SELECT txn_json FROM txns WHERE output_dir = ? ORDER BY updated_at_epoch, txn_id",
+            (output_dir,),
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return [json.loads(row["txn_json"]) for row in rows]
+
+
 def _dataset_manifest_path(output_root):
     return os.path.join(
         _work_base(os.path.abspath(output_root)), "dataset_manifest.json"
@@ -4321,6 +5109,89 @@ def _build_command_fingerprint(args):
         "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
         "fields": fields,
     }
+
+
+def _metadata_command_fingerprint(metadata_db_path):
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        row = conn.execute(
+            "SELECT command_fingerprint_json FROM dataset_state"
+        ).fetchone()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if row is None or not row["command_fingerprint_json"]:
+        return {}
+    try:
+        command_fingerprint = json.loads(row["command_fingerprint_json"])
+    except Exception:
+        raise RuntimeError(
+            "incompatible transactional metadata: dataset_state command_fingerprint_json is malformed"
+        )
+    return command_fingerprint if isinstance(command_fingerprint, dict) else {}
+
+
+def _metadata_update_command_fingerprint(output_base, command_fingerprint, *, metadata_db_path):
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE dataset_state SET command_fingerprint_json = ? WHERE output_root = ?",
+                (
+                    json.dumps(command_fingerprint, sort_keys=True),
+                    os.path.abspath(output_base),
+                ),
+            )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _command_fingerprint_fields_for_output_base(output_base, *, metadata_db_path=None):
+    if metadata_db_path is None:
+        metadata_db_path = _runtime_metadata_db_path(output_base)
+    if metadata_db_path:
+        return _metadata_command_fingerprint(metadata_db_path).get("fields") or {}
+    manifest = _load_dataset_manifest(output_base)
+    return _manifest_command_fingerprint_fields(manifest)
+
+
+def _success_disposition_for_output_base(output_base, *, metadata_db_path=None):
+    fields = _command_fingerprint_fields_for_output_base(
+        output_base,
+        metadata_db_path=metadata_db_path,
+    )
+    success_policy = fields.get("success_policy") or "asis"
+    delete_mode = "txn_delete" if success_policy == "delete" else "not_delete"
+    return _success_disposition_for_delete_mode(delete_mode, success_policy)
+
+
+def _failure_disposition_for_output_base(output_base, *, metadata_db_path=None):
+    fields = _command_fingerprint_fields_for_output_base(
+        output_base,
+        metadata_db_path=metadata_db_path,
+    )
+    return f"failure:{fields.get('fail_policy') or 'asis'}"
+
+
+def _source_mutation_requires_durability_for_output_base(
+    output_base,
+    *,
+    metadata_db_path=None,
+):
+    fields = _command_fingerprint_fields_for_output_base(
+        output_base,
+        metadata_db_path=metadata_db_path,
+    )
+    return (
+        (fields.get("success_policy") or "asis") in ("delete", "move")
+        or (fields.get("fail_policy") or "asis") == "move"
+        or (fields.get("traditional_zip_policy") or "decode-auto") == "move"
+    )
 
 
 def _print_strict_resume_delete_workdir_error(work_base, reason):
@@ -4915,8 +5786,9 @@ def _manifest_archive_allows_missing_input(
 ):
     latest_txn = _load_latest_txn_for_archive(manifest_archive, output_base)
     if latest_txn is not None:
-        source_mutation_expected = _manifest_source_mutation_requires_durability(
-            manifest
+        source_mutation_expected = _source_mutation_requires_durability_for_output_base(
+            output_base,
+            metadata_db_path=(latest_txn or {}).get("metadata_db_path"),
         )
         if _txn_missing_input_matches_finalized_source_move(latest_txn, missing_path):
             return True
@@ -4973,16 +5845,18 @@ def _manifest_archive_allows_replay_safe_input_drift(manifest, manifest_archive,
 
     if _txn_allows_terminal_success_snapshot_recovery_without_input(
         latest_txn,
-        source_mutation_expected=_manifest_source_mutation_requires_durability(
-            manifest
+        source_mutation_expected=_source_mutation_requires_durability_for_output_base(
+            output_base,
+            metadata_db_path=(latest_txn or {}).get("metadata_db_path"),
         ),
     ):
         return True
 
     return _txn_allows_pre_placement_snapshot_recovery_without_input(
         latest_txn,
-        source_mutation_expected=_manifest_source_mutation_requires_durability(
-            manifest
+        source_mutation_expected=_source_mutation_requires_durability_for_output_base(
+            output_base,
+            metadata_db_path=(latest_txn or {}).get("metadata_db_path"),
         ),
     ) or _txn_allows_post_placement_snapshot_recovery_without_input(
         latest_txn,
@@ -5403,6 +6277,27 @@ def _load_classifiable_txn(txn_json_path, *, output_base):
             open_attempt += 1
             time.sleep(0.05)
 
+    txn = _validate_classifiable_txn_dict(txn, output_base=output_base)
+
+    paths = txn.get("paths") or {}
+    txn_id = txn["txn_id"]
+    output_dir = txn["output_dir"]
+    expected_journal_dir = os.path.join(
+        _work_root(output_dir, output_base), "journal", txn_id
+    )
+    expected_txn_json = os.path.join(expected_journal_dir, "txn.json")
+    expected_wal = os.path.join(expected_journal_dir, "txn.wal")
+
+    if os.path.abspath(safe_txn_json) != os.path.abspath(expected_txn_json):
+        raise ValueError("txn_json physical path mismatch")
+    if os.path.abspath(paths.get("txn_json", "")) != os.path.abspath(expected_txn_json):
+        raise ValueError("txn_json path mismatch")
+    if os.path.abspath(paths.get("wal", "")) != os.path.abspath(expected_wal):
+        raise ValueError("wal path mismatch")
+    return txn
+
+
+def _validate_classifiable_txn_dict(txn, *, output_base):
     schema_version = txn.get("schema_version")
     if isinstance(schema_version, bool) or not isinstance(schema_version, int):
         raise ValueError(
@@ -5419,15 +6314,7 @@ def _load_classifiable_txn(txn_json_path, *, output_base):
         if key not in txn:
             raise ValueError(f"txn missing field: {key}")
 
-    paths = txn.get("paths") or {}
-    txn_id = txn["txn_id"]
     output_dir = os.path.abspath(txn["output_dir"])
-    expected_journal_dir = os.path.join(
-        _work_root(output_dir, output_base), "journal", txn_id
-    )
-    expected_txn_json = os.path.join(expected_journal_dir, "txn.json")
-    expected_wal = os.path.join(expected_journal_dir, "txn.wal")
-
     if (
         not isinstance(txn["archive_path"], str)
         or not txn["archive_path"].strip()
@@ -5456,16 +6343,25 @@ def _load_classifiable_txn(txn_json_path, *, output_base):
         if str(e) != "txn output_dir outside output_base":
             raise ValueError("txn output_dir outside output_base") from e
         raise
-    if os.path.abspath(safe_txn_json) != os.path.abspath(expected_txn_json):
-        raise ValueError("txn_json physical path mismatch")
-    if os.path.abspath(paths.get("txn_json", "")) != os.path.abspath(expected_txn_json):
-        raise ValueError("txn_json path mismatch")
-    if os.path.abspath(paths.get("wal", "")) != os.path.abspath(expected_wal):
-        raise ValueError("wal path mismatch")
 
     txn["archive_path"] = os.path.abspath(txn["archive_path"])
     txn["output_dir"] = output_dir
     txn["output_base"] = os.path.abspath(txn["output_base"])
+    return txn
+
+
+def _validated_metadata_txn(txn, *, output_base):
+    txn = _validate_classifiable_txn_dict(txn, output_base=output_base)
+    paths = txn.get("paths") or {}
+    expected_journal_dir = os.path.join(
+        _work_root(txn["output_dir"], output_base), "journal", txn["txn_id"]
+    )
+    expected_txn_json = os.path.join(expected_journal_dir, "txn.json")
+    expected_wal = os.path.join(expected_journal_dir, "txn.wal")
+    if os.path.abspath(paths.get("txn_json", "")) != os.path.abspath(expected_txn_json):
+        raise ValueError("txn_json path mismatch")
+    if os.path.abspath(paths.get("wal", "")) != os.path.abspath(expected_wal):
+        raise ValueError("wal path mismatch")
     return txn
 
 
@@ -5974,6 +6870,368 @@ def _classify_existing_work_base(manifest, output_base):
     return "terminal_residue"
 
 
+def _metadata_runtime_policy(output_base, *, metadata_db_path):
+    command_fields = _command_fingerprint_fields_for_output_base(
+        output_base,
+        metadata_db_path=metadata_db_path,
+    )
+    success_policy = command_fields.get("success_policy") or "asis"
+    fail_policy = command_fields.get("fail_policy") or "asis"
+    traditional_zip_policy = command_fields.get("traditional_zip_policy") or "decode-auto"
+    delete_mode = "txn_delete" if success_policy == "delete" else "not_delete"
+    return {
+        "source_mutation_expected": success_policy in ("delete", "move")
+        or fail_policy == "move"
+        or traditional_zip_policy == "move",
+        "success_disposition": _success_disposition_for_delete_mode(
+            delete_mode,
+            success_policy,
+        ),
+        "fail_policy": fail_policy,
+    }
+
+
+def _metadata_archive_volume_paths(archive_path, *, metadata_db_path):
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        rows = conn.execute(
+            "SELECT volume_path FROM archive_volumes WHERE archive_path = ? ORDER BY volume_path",
+            (archive_path,),
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return [row["volume_path"] for row in rows]
+
+
+def _metadata_archive_allows_replay_safe_input_drift(
+    latest_txn,
+    *,
+    runtime_policy,
+):
+    if latest_txn is None:
+        return False
+
+    if _txn_allows_terminal_success_snapshot_recovery_without_input(
+        latest_txn,
+        source_mutation_expected=runtime_policy["source_mutation_expected"],
+    ):
+        return True
+
+    return _txn_allows_pre_placement_snapshot_recovery_without_input(
+        latest_txn,
+        source_mutation_expected=runtime_policy["source_mutation_expected"],
+    ) or (
+        not _success_disposition_requires_source_mutation(
+            runtime_policy["success_disposition"]
+        )
+        and _txn_has_admissible_post_placement_snapshot_retry_evidence(latest_txn)
+    )
+
+
+def _metadata_archive_allows_missing_input(
+    archive_row,
+    latest_txn,
+    *,
+    runtime_policy,
+    missing_path=None,
+):
+    if latest_txn is not None:
+        if _txn_missing_input_matches_finalized_source_move(latest_txn, missing_path):
+            return True
+        if _txn_allows_terminal_success_snapshot_recovery_without_input(
+            latest_txn,
+            source_mutation_expected=runtime_policy["source_mutation_expected"],
+        ):
+            return True
+        if _txn_allows_pre_placement_snapshot_recovery_without_input(
+            latest_txn,
+            source_mutation_expected=runtime_policy["source_mutation_expected"],
+        ):
+            return True
+        if (
+            not _success_disposition_requires_source_mutation(
+                runtime_policy["success_disposition"]
+            )
+            and _txn_has_admissible_post_placement_snapshot_retry_evidence(latest_txn)
+        ):
+            return True
+        if _txn_has_incomplete_source_finalization(latest_txn):
+            return False
+        if _txn_has_recovery_responsibility(latest_txn):
+            return False
+        if _txn_source_finalization_destinations_persisted(latest_txn):
+            return True
+
+        plan = _txn_source_finalization_plan(latest_txn)
+        if plan is not None and plan.get("manifest_state") == "succeeded":
+            if latest_txn.get("state") in (TXN_STATE_SOURCE_FINALIZED, TXN_STATE_CLEANED):
+                _validate_closed_success_source_finalization_terminal_state(latest_txn)
+            if _txn_is_closed_terminal_outcome(latest_txn):
+                return True
+
+        if (
+            runtime_policy["fail_policy"] == "move"
+            and latest_txn.get("state") == TXN_STATE_FAILED
+        ):
+            error_type = _txn_error_type(latest_txn)
+            if error_type not in ("DURABILITY_FAILED", "FAIL_FINALIZE_FAILED"):
+                return _txn_primary_finalized_source_target_exists(latest_txn)
+
+    archive_state = archive_row.get("state")
+    final_disposition = archive_row.get("final_disposition")
+    return archive_state in ("succeeded", "failed") and final_disposition in (
+        *_SUCCESSFUL_SOURCE_FINALIZATION_DISPOSITIONS,
+        "failure:move",
+        "skipped:traditional_zip_moved",
+    )
+
+
+def _metadata_archive_input_drift_reason(
+    archive_row,
+    *,
+    output_base,
+    metadata_db_path,
+    runtime_policy,
+):
+    archive_path_value = archive_row.get("archive_path")
+    if not isinstance(archive_path_value, str) or not archive_path_value.strip():
+        return (
+            "Existing transactional workdir is incompatible with strict dataset resume "
+            "because a SQLite metadata archive entry is missing archive_path."
+        )
+    if not os.path.isabs(archive_path_value):
+        return (
+            "Existing transactional workdir is incompatible with strict dataset resume "
+            f"because SQLite metadata-listed archive path {archive_path_value} is relative."
+        )
+    archive_path = os.path.abspath(archive_path_value)
+    latest_txn = _metadata_load_latest_txn(
+        output_base,
+        archive_path,
+        metadata_db_path=metadata_db_path,
+    )
+
+    if not safe_exists(archive_path, VERBOSE):
+        if _metadata_archive_allows_missing_input(
+            archive_row,
+            latest_txn,
+            runtime_policy=runtime_policy,
+            missing_path=archive_path,
+        ):
+            return None
+        return (
+            "Strict dataset resume detected input drift for metadata-listed archive "
+            f"{archive_path}: archive is missing."
+        )
+
+    if not safe_isfile(archive_path, VERBOSE):
+        if _metadata_archive_allows_replay_safe_input_drift(
+            latest_txn,
+            runtime_policy=runtime_policy,
+        ):
+            return None
+        return (
+            "Existing transactional workdir is incompatible with strict dataset resume "
+            f"because metadata-listed archive path {archive_path} is not a file."
+        )
+
+    try:
+        safe_archive_path = normalize_local_fs_path(archive_path, VERBOSE)
+        stat_result = os.stat(safe_archive_path)
+    except FileNotFoundError:
+        return (
+            "Strict dataset resume detected input drift for manifest-listed archive "
+            f"{archive_path}: archive is missing."
+        )
+    except Exception as e:
+        return (
+            "Strict dataset resume could not validate manifest-listed archive "
+            f"{archive_path}: {e}"
+        )
+
+    recorded_size = archive_row.get("identity_size")
+    if recorded_size is None:
+        return (
+            "Existing transactional workdir is incompatible with strict dataset resume "
+            f"because SQLite metadata-listed archive {archive_path} is missing identity_size."
+        )
+    try:
+        recorded_size = _parse_manifest_strict_int(recorded_size)
+    except (TypeError, ValueError):
+        return (
+            "Existing transactional workdir is incompatible with strict dataset resume "
+            f"because SQLite metadata-listed archive {archive_path} has malformed identity_size."
+        )
+
+    if recorded_size != int(stat_result.st_size):
+        if _metadata_archive_allows_replay_safe_input_drift(
+            latest_txn,
+            runtime_policy=runtime_policy,
+        ):
+            return None
+        return (
+            "Strict dataset resume detected input drift for metadata-listed archive "
+            f"{archive_path}: recorded size {recorded_size} does not match current size {int(stat_result.st_size)}."
+        )
+
+    recorded_mtime_ns = archive_row.get("identity_mtime_ns")
+    if recorded_mtime_ns is None:
+        return (
+            "Existing transactional workdir is incompatible with strict dataset resume "
+            f"because SQLite metadata-listed archive {archive_path} is missing identity_mtime_ns."
+        )
+    try:
+        recorded_mtime_ns = _parse_manifest_strict_int(recorded_mtime_ns)
+    except (TypeError, ValueError):
+        return (
+            "Existing transactional workdir is incompatible with strict dataset resume "
+            f"because SQLite metadata-listed archive {archive_path} has malformed identity_mtime_ns."
+        )
+
+    if recorded_mtime_ns != int(stat_result.st_mtime_ns):
+        if _metadata_archive_allows_replay_safe_input_drift(
+            latest_txn,
+            runtime_policy=runtime_policy,
+        ):
+            return None
+        return (
+            "Strict dataset resume detected input drift for metadata-listed archive "
+            f"{archive_path}: recorded mtime_ns {recorded_mtime_ns} does not match current mtime_ns {int(stat_result.st_mtime_ns)}."
+        )
+
+    for volume_path_value in _metadata_archive_volume_paths(
+        archive_path,
+        metadata_db_path=metadata_db_path,
+    ):
+        if not isinstance(volume_path_value, str) or not volume_path_value.strip():
+            return (
+                "Existing transactional workdir is incompatible with strict dataset resume "
+                f"because SQLite metadata-listed archive {archive_path} has malformed volume path metadata."
+            )
+        if not os.path.isabs(volume_path_value):
+            return (
+                "Existing transactional workdir is incompatible with strict dataset resume "
+                f"because SQLite metadata-listed volume path {volume_path_value} is relative."
+            )
+
+        volume_path = os.path.abspath(volume_path_value)
+        if volume_path == archive_path:
+            continue
+        if not safe_exists(volume_path, VERBOSE):
+            if _metadata_archive_allows_missing_input(
+                archive_row,
+                latest_txn,
+                runtime_policy=runtime_policy,
+                missing_path=volume_path,
+            ):
+                continue
+            return (
+                "Strict dataset resume detected input drift for metadata-listed archive "
+                f"{archive_path}: volume is missing: {volume_path}."
+            )
+        if not safe_isfile(volume_path, VERBOSE):
+            if _metadata_archive_allows_replay_safe_input_drift(
+                latest_txn,
+                runtime_policy=runtime_policy,
+            ):
+                continue
+            return (
+                "Existing transactional workdir is incompatible with strict dataset resume "
+                f"because SQLite metadata-listed volume path {volume_path} is not a file."
+            )
+
+    return None
+
+
+def _validate_archive_input_drift_from_metadata(output_base, metadata_db_path):
+    runtime_policy = _metadata_runtime_policy(
+        output_base,
+        metadata_db_path=metadata_db_path,
+    )
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        rows = conn.execute(
+            "SELECT archive_path, state, final_disposition, identity_size, identity_mtime_ns FROM archives ORDER BY discovered_order"
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    for row in rows:
+        reason = _metadata_archive_input_drift_reason(
+            dict(row),
+            output_base=output_base,
+            metadata_db_path=metadata_db_path,
+            runtime_policy=runtime_policy,
+        )
+        if reason is not None:
+            return reason
+    return None
+
+
+def _classify_existing_work_base_from_metadata(output_base, metadata_db_path):
+    saw_resume_required = False
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        archive_rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT archive_path, output_dir, state FROM archives ORDER BY discovered_order"
+            ).fetchall()
+        ]
+        known_archive_paths = {os.path.abspath(row["archive_path"]) for row in archive_rows}
+        txn_rows = [
+            _validated_metadata_txn(
+                json.loads(row["txn_json"]),
+                output_base=output_base,
+            )
+            for row in conn.execute(
+                "SELECT txn_json FROM txns ORDER BY updated_at_epoch, txn_id"
+            ).fetchall()
+        ]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    for archive_row in archive_rows:
+        txn = _metadata_load_latest_txn(
+            output_base,
+            archive_row["archive_path"],
+            metadata_db_path=metadata_db_path,
+        )
+        _startup_raise_explicit_refuse_if_needed(txn)
+        archive_classification = _reconciled_archive_classification_from_sqlite_state(
+            archive_row,
+            txn,
+        )
+        if archive_classification == "resume_required":
+            saw_resume_required = True
+            continue
+        if archive_classification not in ("succeeded", "failed"):
+            return "ambiguous"
+
+    for txn in txn_rows:
+        archive_path = os.path.abspath(txn.get("archive_path") or "")
+        if archive_path in known_archive_paths:
+            continue
+        _startup_raise_explicit_refuse_if_needed(txn)
+        if _txn_has_recovery_responsibility(txn):
+            return "ambiguous"
+        if not _txn_is_closed_terminal_outcome(txn):
+            return "ambiguous"
+
+    if saw_resume_required:
+        return "resume_required"
+    return "terminal_residue"
+
+
 def _retired_work_base_path(work_base, manifest):
     timestamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
     run_token = (manifest or {}).get("run_id") or hashlib.sha256(
@@ -6012,39 +7270,60 @@ def _validate_strict_resume_startup(args):
     if not safe_exists(work_base, VERBOSE):
         return True
 
+    metadata_fingerprint = None
     try:
-        manifest = _load_dataset_manifest(output_base)
-    except ValueError as e:
-        _print_strict_resume_delete_workdir_error(work_base, str(e))
-        return False
+        _reject_legacy_json_workdir(output_base)
+        cfg = _resolve_resume_metadata_backend(args, output_base)
+        metadata_db_path = cfg["db_path"]
+        _register_runtime_metadata_db(output_base, metadata_db_path)
 
-    if manifest is None:
-        _print_strict_resume_delete_workdir_error(
-            work_base,
-            "Existing transactional workdir is ambiguous because dataset_manifest.json is missing.",
-        )
-        return False
-
-    manifest_reason = _validate_loaded_dataset_manifest(manifest, output_base)
-    if manifest_reason is not None:
-        _print_strict_resume_delete_workdir_error(work_base, manifest_reason)
-        return False
-
-    manifest_reason = _validate_manifest_archive_metadata(manifest, output_base)
-    if manifest_reason is not None:
-        _print_strict_resume_delete_workdir_error(work_base, manifest_reason)
+        conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+        try:
+            store = _metadata_load_store(conn)
+            if store["output_root"] != os.path.abspath(output_base):
+                _print_strict_resume_delete_workdir_error(
+                    _work_base(output_base),
+                    "Existing transactional workdir points at a different output root.",
+                )
+                return False
+            stored = conn.execute(
+                "SELECT command_fingerprint_json FROM dataset_state"
+            ).fetchone()
+            if stored is not None and stored["command_fingerprint_json"]:
+                metadata_fingerprint = json.loads(stored["command_fingerprint_json"])
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except RuntimeError as e:
+        startup_error = str(e)
+        if "metadata backend marker is missing" in startup_error:
+            manifest_path = _dataset_manifest_path(output_base)
+            if not safe_exists(manifest_path, VERBOSE):
+                startup_error = (
+                    "Existing transactional workdir is ambiguous because dataset_manifest.json is missing."
+                )
+        _print_strict_resume_delete_workdir_error(work_base, startup_error)
         return False
 
     startup_classification = None
     startup_classification_error = None
 
     try:
-        startup_classification = _classify_existing_work_base(manifest, output_base)
+        startup_classification = _classify_existing_work_base_from_metadata(
+            output_base,
+            metadata_db_path,
+        )
     except Exception as e:
         startup_classification_error = e
 
     if startup_classification == "terminal_residue":
-        return _retire_terminal_work_base(work_base, manifest)
+        retire_record = _metadata_terminal_retire_record(metadata_db_path)
+        retired = _retire_terminal_work_base(work_base, retire_record)
+        if retired:
+            _unregister_runtime_metadata_db(output_base)
+        return retired
 
     if startup_classification_error is not None:
         if _is_refuse_recovery_error(startup_classification_error):
@@ -6059,7 +7338,21 @@ def _validate_strict_resume_startup(args):
         )
         return False
 
-    drift_reason = _validate_manifest_archive_input_drift(manifest, output_base)
+    current_fingerprint = _build_command_fingerprint(args)
+    if (
+        isinstance(metadata_fingerprint, dict)
+        and metadata_fingerprint.get("sha256") != current_fingerprint.get("sha256")
+    ):
+        _print_strict_resume_delete_workdir_error(
+            work_base,
+            "Existing transactional workdir is incompatible with the current command fingerprint.",
+        )
+        return False
+
+    drift_reason = _validate_archive_input_drift_from_metadata(
+        output_base,
+        metadata_db_path,
+    )
     if drift_reason is not None:
         _print_strict_resume_delete_workdir_error(work_base, drift_reason)
         return False
@@ -6068,15 +7361,6 @@ def _validate_strict_resume_startup(args):
         _print_strict_resume_delete_workdir_error(
             work_base,
             "Existing transactional workdir is ambiguous and requires manual intervention.",
-        )
-        return False
-
-    stored_fingerprint = manifest.get("command_fingerprint") or {}
-    current_fingerprint = _build_command_fingerprint(args)
-    if stored_fingerprint.get("sha256") != current_fingerprint.get("sha256"):
-        _print_strict_resume_delete_workdir_error(
-            work_base,
-            "Existing transactional workdir is incompatible with the current command fingerprint.",
         )
         return False
 
@@ -6113,6 +7397,181 @@ def _save_dataset_manifest(manifest):
         _dataset_manifest_path(manifest["output_root"]), VERBOSE
     )
     atomic_write_json(manifest_path, manifest, debug=VERBOSE)
+
+
+def _run_manifest_cache_write_best_effort(output_base, *, action, write_fn):
+    try:
+        write_fn()
+        return True
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        manifest_path = normalize_local_fs_path(
+            _dataset_manifest_path(output_base), VERBOSE
+        )
+        print(
+            f"Warning: Could not {action} dataset manifest cache {manifest_path}; "
+            f"SQLite metadata remains authoritative: {e}"
+        )
+        return False
+
+
+def _sync_manifest_archive_cache_from_metadata(
+    output_base,
+    archive_path,
+    *,
+    state=_MANIFEST_UNSET,
+    last_txn_id=_MANIFEST_UNSET,
+    attempts_increment=0,
+    final_disposition=_MANIFEST_UNSET,
+    error=_MANIFEST_UNSET,
+    finalized_at=_MANIFEST_UNSET,
+):
+    manifest_path = _dataset_manifest_path(output_base)
+    if not safe_exists(manifest_path, VERBOSE):
+        return None
+
+    lock = FileLock(
+        _dataset_manifest_lock_path(output_base),
+        timeout_ms=30000,
+        retry_ms=50,
+        debug=VERBOSE,
+    )
+    with lock:
+        try:
+            manifest = _load_dataset_manifest(output_base)
+        except ValueError:
+            return None
+        if manifest is None:
+            return None
+        _entry, dirty = _update_dataset_manifest_archive_entry(
+            manifest,
+            archive_path,
+            state=state,
+            last_txn_id=last_txn_id,
+            attempts_increment=attempts_increment,
+            final_disposition=final_disposition,
+            error=error,
+            finalized_at=finalized_at,
+        )
+        if dirty:
+            _run_manifest_cache_write_best_effort(
+                output_base,
+                action="update",
+                write_fn=lambda: _save_dataset_manifest_if_dirty(manifest, dirty),
+            )
+        return manifest
+
+
+def _resolve_metadata_db_path_for_manifest_sync(output_base):
+    output_base = os.path.abspath(output_base)
+    configured = _runtime_metadata_db_path(output_base)
+    if configured:
+        return configured
+    marker_path = _metadata_backend_marker_path(output_base)
+    if not safe_exists(marker_path, VERBOSE):
+        return None
+    try:
+        marker = _load_metadata_backend_marker(output_base)
+    except Exception:
+        return None
+    if marker.get("mode") == "local":
+        return _default_metadata_db_path(output_base)
+    return None
+
+
+def _metadata_sync_archive_row_from_manifest_entry(conn, archive_entry):
+    archive_path = os.path.abspath(archive_entry.get("archive_path") or "")
+    if not archive_path:
+        return
+
+    existing = conn.execute(
+        "SELECT identity_size, identity_mtime_ns, requested_policy, resolved_policy, output_dir, discovered_order FROM archives WHERE archive_path = ?",
+        (archive_path,),
+    ).fetchone()
+
+    identity = archive_entry.get("identity") or {}
+    policy_snapshot = archive_entry.get("policy_snapshot") or {}
+
+    try:
+        identity_size = int(identity.get("size"))
+    except Exception:
+        identity_size = int(existing["identity_size"]) if existing is not None else 0
+
+    try:
+        identity_mtime_ns = int(identity.get("mtime_ns"))
+    except Exception:
+        identity_mtime_ns = int(existing["identity_mtime_ns"]) if existing is not None else 0
+
+    requested_policy = policy_snapshot.get("requested_policy")
+    if requested_policy is None and existing is not None:
+        requested_policy = existing["requested_policy"]
+
+    resolved_policy = policy_snapshot.get("resolved_policy")
+    if resolved_policy is None and existing is not None:
+        resolved_policy = existing["resolved_policy"]
+
+    output_dir = archive_entry.get("output_dir")
+    if output_dir:
+        output_dir = os.path.abspath(output_dir)
+    elif existing is not None and existing["output_dir"]:
+        output_dir = existing["output_dir"]
+    else:
+        output_dir = os.path.dirname(archive_path)
+
+    discovered_order = archive_entry.get("discovered_order")
+    if discovered_order is None and existing is not None:
+        discovered_order = existing["discovered_order"]
+    try:
+        discovered_order = int(discovered_order)
+    except Exception:
+        discovered_order = 0
+
+    attempts = archive_entry.get("attempts", 0)
+    try:
+        attempts = int(attempts)
+    except Exception:
+        attempts = 0
+
+    state = archive_entry.get("state") or "pending"
+    last_txn_id = archive_entry.get("last_txn_id")
+    final_disposition = archive_entry.get("final_disposition") or "unknown"
+    finalized_at = archive_entry.get("finalized_at")
+    error = archive_entry.get("error")
+    error_json = json.dumps(error, sort_keys=True) if error is not None else None
+
+    conn.execute(
+        "INSERT OR REPLACE INTO archives(archive_path, output_dir, discovered_order, identity_size, identity_mtime_ns, requested_policy, resolved_policy, state, last_txn_id, attempts, final_disposition, finalized_at, error_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            archive_path,
+            output_dir,
+            discovered_order,
+            identity_size,
+            identity_mtime_ns,
+            requested_policy,
+            resolved_policy,
+            state,
+            last_txn_id,
+            attempts,
+            final_disposition,
+            finalized_at,
+            error_json,
+        ),
+    )
+
+    conn.execute("DELETE FROM archive_volumes WHERE archive_path = ?", (archive_path,))
+    volumes = archive_entry.get("volumes") or [archive_path]
+    for volume_path in volumes:
+        conn.execute(
+            "INSERT OR REPLACE INTO archive_volumes(archive_path, volume_path) VALUES (?, ?)",
+            (archive_path, os.path.abspath(volume_path)),
+        )
+
+
+def _sync_metadata_from_manifest(manifest):
+    # JSON manifest remains a compatibility/debug cache only. SQLite stays authoritative.
+    del manifest
+    return
 
 
 def _load_dataset_manifest(output_root):
@@ -6245,7 +7704,12 @@ def _dataset_cleanup_enabled_for_manifest(manifest, args):
 
 
 def _create_dataset_manifest(
-    *, input_root, output_root, discovered_archives, command_fingerprint
+    *,
+    input_root,
+    output_root,
+    discovered_archives,
+    command_fingerprint,
+    metadata_db=None,
 ):
     now = _now_iso()
     input_root = os.path.abspath(input_root)
@@ -6276,7 +7740,30 @@ def _create_dataset_manifest(
         "archives": archives,
     }
 
-    _save_dataset_manifest(manifest)
+    marker_path = _metadata_backend_marker_path(output_root)
+    if not safe_exists(marker_path, VERBOSE):
+        backend = _open_metadata_backend_for_new_run(
+            argparse.Namespace(metadata_db=metadata_db),
+            output_root,
+        )
+        try:
+            _metadata_create_dataset(
+                backend["conn"],
+                output_root=output_root,
+                command_fingerprint=command_fingerprint,
+                discovered_archives=discovered_archives,
+            )
+        finally:
+            try:
+                backend["conn"].close()
+            except Exception:
+                pass
+
+    _run_manifest_cache_write_best_effort(
+        output_root,
+        action="create",
+        write_fn=lambda: _save_dataset_manifest(manifest),
+    )
     return manifest
 
 
@@ -6312,7 +7799,11 @@ def _archive_can_advance_same_output_scheduler(manifest_archive, output_base):
     return False
 
 
-def _same_output_archive_is_next_expected(archive_path, output_dir, output_base):
+def _same_output_archive_is_next_expected_from_manifest(
+    archive_path,
+    output_dir,
+    output_base,
+):
     manifest = _load_dataset_manifest(output_base)
     if manifest is None:
         return True
@@ -6328,17 +7819,64 @@ def _same_output_archive_is_next_expected(archive_path, output_dir, output_base)
     return True
 
 
-def _drain_same_output_ready_txns(
-    pending_by_output_dir, *, processor, args, output_base, touched_output_dirs
+def _same_output_archive_is_next_expected(
+    archive_path,
+    output_dir,
+    output_base,
+    metadata_db_path=None,
 ):
-    manifest = _load_dataset_manifest(output_base)
+    if metadata_db_path:
+        return _same_output_archive_is_next_expected_from_metadata(
+            archive_path,
+            output_dir,
+            output_base,
+            metadata_db_path,
+        )
+    return _same_output_archive_is_next_expected_from_manifest(
+        archive_path,
+        output_dir,
+        output_base,
+    )
+
+
+def _drain_same_output_ready_txns(
+    pending_by_output_dir,
+    *,
+    processor,
+    args,
+    output_base,
+    metadata_db_path=None,
+    touched_output_dirs,
+):
+    if metadata_db_path is None:
+        metadata_db_path = _runtime_metadata_db_path(output_base)
+
     discovered_order_by_archive = {}
-    if manifest is not None:
-        for manifest_archive in _iter_dataset_manifest_archives(manifest):
-            discovered_order, _reason = _validate_manifest_archive_order(manifest_archive)
-            discovered_order_by_archive[
-                os.path.abspath(manifest_archive["archive_path"])
-            ] = discovered_order
+    if metadata_db_path:
+        conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+        try:
+            rows = conn.execute(
+                "SELECT archive_path, discovered_order FROM archives"
+            ).fetchall()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        for row in rows:
+            discovered_order_by_archive[os.path.abspath(row["archive_path"])] = row[
+                "discovered_order"
+            ]
+    else:
+        manifest = _load_dataset_manifest(output_base)
+        if manifest is not None:
+            for manifest_archive in _iter_dataset_manifest_archives(manifest):
+                discovered_order, _reason = _validate_manifest_archive_order(
+                    manifest_archive
+                )
+                discovered_order_by_archive[
+                    os.path.abspath(manifest_archive["archive_path"])
+                ] = discovered_order
 
     while True:
         progressed = False
@@ -6358,7 +7896,10 @@ def _drain_same_output_ready_txns(
                 item = queue[0]
                 archive_path = _pending_scheduler_archive_path(item)
                 if not _same_output_archive_is_next_expected(
-                    archive_path, output_dir, output_base
+                    archive_path,
+                    output_dir,
+                    output_base,
+                    metadata_db_path,
                 ):
                     break
                 queue.pop(0)
@@ -6367,6 +7908,7 @@ def _drain_same_output_ready_txns(
                     processor=processor,
                     args=args,
                     output_base=output_base,
+                    metadata_db_path=metadata_db_path,
                     touched_output_dirs=touched_output_dirs,
                 )
                 progressed = True
@@ -6378,9 +7920,6 @@ def _drain_same_output_ready_txns(
 
         if not progressed:
             return
-
-
-_MANIFEST_UNSET = object()
 
 
 def _manifest_success_disposition(args):
@@ -6527,22 +8066,508 @@ def _refresh_dataset_manifest_cache_metadata(manifest):
     return True
 
 
-def _update_dataset_manifest_archive(output_base, archive_path, **kwargs):
-    lock = FileLock(
-        _dataset_manifest_lock_path(output_base),
-        timeout_ms=30000,
-        retry_ms=50,
-        debug=VERBOSE,
+def _metadata_db_path_from_manifest(manifest, output_base):
+    marker = _load_metadata_backend_marker(output_base)
+    mode = marker["mode"]
+    if mode == "local":
+        return _default_metadata_db_path(output_base)
+    raise RuntimeError(
+        "Existing transactional workdir requires --metadata-db because its persistent metadata backend is external."
     )
-    with lock:
-        manifest = _load_dataset_manifest(output_base)
-        if manifest is None:
-            return None
-        _entry, dirty = _update_dataset_manifest_archive_entry(
-            manifest, archive_path, **kwargs
+
+
+def _load_latest_txn_for_archive_from_metadata(
+    manifest_archive,
+    output_base,
+    *,
+    metadata_db_path,
+):
+    if manifest_archive is None:
+        return None
+    return _metadata_load_latest_txn(
+        output_base,
+        manifest_archive["archive_path"],
+        metadata_db_path=metadata_db_path,
+    )
+
+
+def _validate_metadata_archive_latest_txn(archive_row, latest_txn):
+    if latest_txn is None:
+        return
+    selected_txn_id = archive_row.get("last_txn_id")
+    if not selected_txn_id or str(selected_txn_id) != str(latest_txn.get("txn_id")):
+        return
+    archive_output_dir = os.path.abspath(archive_row.get("output_dir") or "")
+    txn_output_dir = os.path.abspath(latest_txn.get("output_dir") or "")
+    if archive_output_dir != txn_output_dir:
+        raise ValueError(
+            f"sqlite archive/txn output_dir mismatch: {archive_output_dir} != {txn_output_dir}"
         )
-        _save_dataset_manifest_if_dirty(manifest, dirty)
-        return manifest
+
+
+def _classify_archive_from_sqlite_state(archive_row, latest_txn):
+    state = archive_row.get("state")
+    _validate_metadata_archive_latest_txn(archive_row, latest_txn)
+    if latest_txn is None:
+        if state in ("extracting", "recoverable"):
+            return "retryable"
+        return state
+
+    txn_state = latest_txn.get("state")
+    if (
+        txn_state == TXN_STATE_INIT
+        and latest_txn.get("placement_v2") is None
+        and latest_txn.get("source_finalization_v2") is None
+    ):
+        recovered_state = _classify_init_txn_resume_window(latest_txn)
+        if recovered_state is None:
+            return "retryable"
+        return "recoverable"
+
+    if txn_state == TXN_STATE_INIT:
+        _classify_recoverable_txn_state(latest_txn)
+
+    if _txn_has_recovery_responsibility(latest_txn, strict=True):
+        if txn_state == TXN_STATE_SOURCE_FINALIZED and state in ("succeeded", "failed"):
+            txn_terminal_state = _txn_terminal_manifest_state(latest_txn)
+            if state != txn_terminal_state:
+                raise ValueError(
+                    f"manifest terminal state {state} conflicts with txn terminal state {txn_terminal_state}"
+                )
+            return state
+        if txn_state == TXN_STATE_ABORTED and not _txn_has_incomplete_source_finalization(
+            latest_txn
+        ):
+            return _classify_aborted_txn_state(latest_txn)
+        recovered_state = _classify_recoverable_txn_state(latest_txn)
+        if recovered_state in (
+            TXN_STATE_EXTRACTED,
+            TXN_STATE_INCOMING_COMMITTED,
+            TXN_STATE_PLACING,
+            TXN_STATE_PLACED,
+            TXN_STATE_DURABLE,
+        ):
+            return "recoverable"
+        if txn_state == TXN_STATE_INIT and _txn_source_finalization_plan(latest_txn) is None:
+            return "retryable"
+        return "recoverable"
+
+    if _txn_is_closed_terminal_outcome(latest_txn):
+        return _txn_terminal_manifest_state(latest_txn)
+    if txn_state == TXN_STATE_ABORTED:
+        return _classify_aborted_txn_state(latest_txn)
+    if state in ("extracting", "recoverable"):
+        return "retryable"
+    return state
+
+
+def _reconciled_archive_classification_from_sqlite_state(archive_row, latest_txn):
+    archive_state = archive_row.get("state")
+    _validate_metadata_archive_latest_txn(archive_row, latest_txn)
+    if latest_txn is None:
+        if archive_state in ("pending", "extracting", "recoverable", "retryable"):
+            return "resume_required"
+        if archive_state in ("succeeded", "failed"):
+            return archive_state
+        raise ValueError(
+            f"invalid sqlite archive state without txn: {archive_state}"
+        )
+
+    if (
+        latest_txn.get("state") == TXN_STATE_INIT
+        and latest_txn.get("placement_v2") is None
+        and latest_txn.get("source_finalization_v2") is None
+    ):
+        _classify_init_txn_resume_window(latest_txn)
+        return "resume_required"
+
+    wal_classification = _wal_dependent_resume_classification(latest_txn)
+    if wal_classification is not None:
+        return wal_classification
+
+    if _txn_has_recovery_responsibility(latest_txn):
+        return "resume_required"
+
+    if latest_txn.get("state") == TXN_STATE_ABORTED:
+        _recoverable_txn_state_from_aborted(latest_txn)
+
+    if _txn_is_closed_terminal_outcome(latest_txn):
+        txn_terminal = _txn_terminal_manifest_state(latest_txn)
+        if archive_state in ("pending", "extracting", "recoverable", "retryable"):
+            return txn_terminal
+        if archive_state in ("succeeded", "failed"):
+            if archive_state != txn_terminal:
+                raise ValueError(
+                    f"sqlite archive terminal state {archive_state} conflicts with txn terminal state {txn_terminal}"
+                )
+            return txn_terminal
+        raise ValueError(
+            f"invalid sqlite archive state with terminal txn: {archive_state}"
+        )
+
+    raise ValueError(
+        f"unreconcilable sqlite archive/txn pair: {archive_state} / {latest_txn.get('state')}"
+    )
+
+
+def _archive_can_advance_same_output_scheduler_from_sqlite_state(archive_row, latest_txn):
+    effective_classification = _reconciled_archive_classification_from_sqlite_state(
+        archive_row,
+        latest_txn,
+    )
+    if effective_classification == "resume_required":
+        return False
+    return _classify_archive_from_sqlite_state(archive_row, latest_txn) in (
+        "failed",
+        "succeeded",
+    )
+
+
+def _build_transactional_archive_plan_from_metadata(output_base, metadata_db_path):
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        archives = conn.execute(
+            "SELECT archive_path, output_dir, state FROM archives ORDER BY discovered_order"
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    recoverable = []
+    retryable = []
+    pending = []
+    for archive in archives:
+        archive_path = archive["archive_path"]
+        latest_txn = _metadata_load_latest_txn(
+            output_base,
+            archive_path,
+            metadata_db_path=metadata_db_path,
+        )
+        archive_row = dict(archive)
+        classification = _classify_archive_from_sqlite_state(archive_row, latest_txn)
+        effective_classification = None
+        if latest_txn is not None:
+            effective_classification = _reconciled_archive_classification_from_sqlite_state(
+                archive_row,
+                latest_txn,
+            )
+        if classification == "recoverable" or effective_classification == "resume_required":
+            recoverable.append(
+                {
+                    "archive_path": archive_path,
+                    "output_dir": archive_row["output_dir"],
+                }
+            )
+        elif classification == "retryable":
+            retryable.append(archive_path)
+        elif classification == "pending":
+            pending.append(archive_path)
+    return recoverable, retryable, pending
+
+
+def _metadata_ordered_archive_paths(metadata_db_path):
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        rows = conn.execute(
+            "SELECT archive_path FROM archives ORDER BY discovered_order"
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return [os.path.abspath(row["archive_path"]) for row in rows]
+
+
+def _same_output_archive_is_next_expected_from_metadata(
+    archive_path,
+    output_dir,
+    output_base,
+    metadata_db_path,
+):
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        rows = conn.execute(
+            "SELECT archive_path, output_dir, state FROM archives WHERE output_dir = ? ORDER BY discovered_order",
+            (os.path.abspath(output_dir),),
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    for archive in rows:
+        current_archive_path = os.path.abspath(archive["archive_path"])
+        if current_archive_path == os.path.abspath(archive_path):
+            return True
+        latest_txn = _metadata_load_latest_txn(
+            output_base,
+            archive["archive_path"],
+            metadata_db_path=metadata_db_path,
+        )
+        archive_row = dict(archive)
+        if not _archive_can_advance_same_output_scheduler_from_sqlite_state(
+            archive_row, latest_txn
+        ):
+            return False
+    return True
+
+
+def _discover_output_dirs_for_recovery_from_metadata(output_base, metadata_db_path):
+    del output_base
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT output_dir FROM archives ORDER BY output_dir"
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return [row["output_dir"] for row in rows]
+
+
+def _all_txns_for_work_root_from_metadata(work_root, output_base, metadata_db_path):
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT output_dir FROM archives ORDER BY output_dir"
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    selected_output_dir = next(
+        (
+            row["output_dir"]
+            for row in rows
+            if _work_root(row["output_dir"], output_base) == work_root
+        ),
+        None,
+    )
+    if selected_output_dir is None:
+        return []
+    return _metadata_load_all_txns_for_output_dir(
+        selected_output_dir,
+        metadata_db_path=metadata_db_path,
+    )
+
+
+def _metadata_dataset_is_terminal(metadata_db_path):
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        row = conn.execute("SELECT status FROM dataset_state").fetchone()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return row is not None and row["status"] in ("completed", "failed")
+
+
+def _metadata_refresh_manifest_cache_from_sqlite(output_base, metadata_db_path):
+    try:
+        manifest = _load_dataset_manifest(output_base)
+    except ValueError:
+        return False
+    if manifest is None:
+        return False
+    if _validate_loaded_dataset_manifest(manifest, output_base) is not None:
+        return False
+
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        rows = conn.execute(
+            "SELECT archive_path, output_dir, state FROM archives"
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    archive_rows_by_path = {
+        os.path.abspath(row["archive_path"]): dict(row) for row in rows
+    }
+    dirty = False
+    for archive in _iter_dataset_manifest_archives(manifest):
+        archive_path = os.path.abspath(archive.get("archive_path") or "")
+        archive_row = archive_rows_by_path.get(archive_path)
+        if archive_row is None:
+            continue
+
+        latest_txn = _metadata_load_latest_txn(
+            output_base,
+            archive_path,
+            metadata_db_path=metadata_db_path,
+        )
+        classified_state = _classify_archive_from_sqlite_state(archive_row, latest_txn)
+        if archive.get("state") != classified_state:
+            archive["state"] = classified_state
+            dirty = True
+
+    dirty = _refresh_dataset_manifest_cache_metadata(manifest) or dirty
+    if not dirty:
+        return False
+    return _run_manifest_cache_write_best_effort(
+        output_base,
+        action="refresh",
+        write_fn=lambda: _save_dataset_manifest_if_dirty(manifest, dirty),
+    )
+
+
+def _metadata_dataset_output_dirs(metadata_db_path):
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT output_dir FROM archives ORDER BY output_dir"
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return [row["output_dir"] for row in rows]
+
+
+def _metadata_terminal_retire_record(metadata_db_path):
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        row = conn.execute("SELECT status FROM dataset_state").fetchone()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return {"status": row["status"] if row is not None else "active"}
+
+
+def _dataset_cleanup_enabled_for_metadata(output_base, args, metadata_db_path):
+    del output_base
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        dataset_state = conn.execute("SELECT status FROM dataset_state").fetchone()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if dataset_state is None:
+        return False
+    if dataset_state["status"] == "failed":
+        return getattr(args, "fail_clean_journal", False)
+    if dataset_state["status"] == "completed":
+        return getattr(args, "success_clean_journal", False)
+    return False
+
+
+def _resolved_archive_update_fields(
+    existing_archive,
+    *,
+    state=_MANIFEST_UNSET,
+    last_txn_id=_MANIFEST_UNSET,
+    final_disposition=_MANIFEST_UNSET,
+    error=_MANIFEST_UNSET,
+    finalized_at=_MANIFEST_UNSET,
+):
+    if existing_archive is None:
+        return None
+
+    return {
+        "state": existing_archive.get("state") if state is _MANIFEST_UNSET else state,
+        "last_txn_id": (
+            existing_archive.get("last_txn_id")
+            if last_txn_id is _MANIFEST_UNSET
+            else last_txn_id
+        ),
+        "final_disposition": (
+            existing_archive.get("final_disposition")
+            if final_disposition is _MANIFEST_UNSET
+            else final_disposition
+        ),
+        "error": existing_archive.get("error") if error is _MANIFEST_UNSET else error,
+        "finalized_at": (
+            existing_archive.get("finalized_at")
+            if finalized_at is _MANIFEST_UNSET
+            else finalized_at
+        ),
+    }
+
+
+def _update_dataset_manifest_archive(output_base, archive_path, **kwargs):
+    metadata_db_path = _runtime_metadata_db_path(output_base)
+    if metadata_db_path:
+        conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+        try:
+            existing_archive = _metadata_load_archive(conn, archive_path)
+            resolved = _resolved_archive_update_fields(existing_archive, **kwargs)
+            if resolved is not None:
+                _metadata_update_archive(
+                    conn,
+                    archive_path,
+                    state=resolved["state"],
+                    last_txn_id=resolved["last_txn_id"],
+                    attempts_increment=kwargs.get("attempts_increment", 0),
+                    final_disposition=(resolved["final_disposition"] or "unknown"),
+                    error=resolved["error"],
+                    finalized_at=resolved["finalized_at"],
+                )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    return _sync_manifest_archive_cache_from_metadata(output_base, archive_path, **kwargs)
+
+
+def _persist_archive_tracking(
+    output_base,
+    archive_path,
+    *,
+    metadata_db_path,
+    state,
+    last_txn_id,
+    attempts_increment=0,
+    final_disposition="unknown",
+    error=None,
+    finalized_at=None,
+):
+    if metadata_db_path:
+        conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+        try:
+            _metadata_update_archive(
+                conn,
+                archive_path,
+                state=state,
+                last_txn_id=last_txn_id,
+                attempts_increment=attempts_increment,
+                final_disposition=final_disposition,
+                error=error,
+                finalized_at=finalized_at,
+            )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    _sync_manifest_archive_cache_from_metadata(
+        output_base,
+        archive_path,
+        state=state,
+        last_txn_id=last_txn_id,
+        attempts_increment=attempts_increment,
+        final_disposition=final_disposition,
+        error=error,
+        finalized_at=finalized_at,
+    )
 
 
 def _build_manifest_discovered_archives(processor, archives, *, args):
@@ -6790,7 +8815,39 @@ def _txn_snapshot(txn):
 
 def _txn_snapshot_v2(txn):
     atomic_write_json(txn["paths"]["txn_json"], txn, debug=VERBOSE)
+    _metadata_persist_txn_snapshot(txn)
     _fsync_journal_checkpoint(txn, include_parent=False)
+
+
+def _persist_archive_state_from_txn(
+    txn,
+    *,
+    state,
+    final_disposition,
+    error=None,
+    finalized_at=None,
+    attempts_increment=0,
+):
+    metadata_db_path = txn.get("metadata_db_path")
+    if not metadata_db_path:
+        return
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        _metadata_update_archive(
+            conn,
+            txn["archive_path"],
+            state=state,
+            last_txn_id=txn.get("txn_id"),
+            attempts_increment=attempts_increment,
+            final_disposition=final_disposition,
+            error=error,
+            finalized_at=finalized_at,
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _txn_fail(txn, error_type, message):
@@ -6819,11 +8876,15 @@ def _txn_create(
     volumes,
     output_dir,
     output_base,
+    metadata_db_path=None,
     policy,
     wal_fsync_every=256,
     snapshot_every=512,
     durability_enabled=True,
 ):
+    if metadata_db_path is None:
+        metadata_db_path = _runtime_metadata_db_path(output_base)
+
     txn_id = uuid.uuid4().hex
     paths = _txn_paths(output_dir, output_base, txn_id)
 
@@ -6842,6 +8903,9 @@ def _txn_create(
         "volumes": [os.path.abspath(v) for v in volumes],
         "output_dir": os.path.abspath(output_dir),
         "output_base": os.path.abspath(output_base),
+        "metadata_db_path": (
+            os.path.abspath(metadata_db_path) if metadata_db_path else None
+        ),
         "policy": policy,
         "resolved_policy": None,
         "policy_frozen": False,
@@ -7570,6 +9634,28 @@ def _execute_plans(txn, plans, *, wal_writer, degrade_cross_volume=False):
 
 
 def _txn_manifest_discovered_order(txn):
+    metadata_db_path = (txn or {}).get("metadata_db_path") or _runtime_metadata_db_path(
+        txn["output_base"]
+    )
+    if metadata_db_path:
+        conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+        try:
+            archive_row = conn.execute(
+                "SELECT discovered_order FROM archives WHERE archive_path = ?",
+                (os.path.abspath(txn["archive_path"]),),
+            ).fetchone()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if archive_row is None:
+            raise RuntimeError("missing_metadata_archive_entry")
+        discovered_order = archive_row["discovered_order"]
+        if isinstance(discovered_order, bool) or not isinstance(discovered_order, int):
+            raise RuntimeError("invalid_metadata_discovered_order")
+        return discovered_order
+
     manifest = _load_dataset_manifest(txn["output_base"])
     if manifest is None:
         raise RuntimeError("missing_dataset_manifest")
@@ -8344,6 +10430,13 @@ def _mark_txn_success_terminal(txn, *, final_disposition):
         error=None,
         finalized_at=_now_iso(),
     )
+    _persist_archive_state_from_txn(
+        txn,
+        state="succeeded",
+        final_disposition=final_disposition,
+        error=None,
+        finalized_at=_now_iso(),
+    )
     txn["state"] = TXN_STATE_DONE
     try:
         _txn_snapshot_v2(txn)
@@ -8383,6 +10476,13 @@ def _mark_txn_failure_terminal(
         txn["archive_path"],
         state="failed",
         last_txn_id=txn["txn_id"],
+        final_disposition=final_disposition,
+        error=txn.get("error"),
+        finalized_at=_now_iso(),
+    )
+    _persist_archive_state_from_txn(
+        txn,
+        state="failed",
         final_disposition=final_disposition,
         error=txn.get("error"),
         finalized_at=_now_iso(),
@@ -8986,21 +11086,47 @@ def _execute_non_transactional_traditional_zip_move(processor, archive_path, ins
 
 
 def _execute_transactional_traditional_zip_move(
-    processor, archive_path, inspected, *, output_base
+    processor,
+    archive_path,
+    inspected,
+    *,
+    output_base,
+    metadata_db_path=None,
 ):
     try:
-        all_volumes = processor.get_all_volumes(archive_path)
+        get_all_volumes = getattr(processor, "get_all_volumes", None)
+        if callable(get_all_volumes):
+            all_volumes = get_all_volumes(archive_path)
+        else:
+            all_volumes = [archive_path]
         output_dir = _compute_output_dir(processor.args, archive_path)
         txn = _txn_create(
             archive_path=archive_path,
             volumes=all_volumes,
             output_dir=output_dir,
             output_base=output_base,
+            metadata_db_path=metadata_db_path,
             policy=getattr(processor.args, "decompress_policy", "direct"),
             wal_fsync_every=getattr(processor.args, "wal_fsync_every", 1),
             snapshot_every=getattr(processor.args, "snapshot_every", 1),
             durability_enabled=not getattr(processor.args, "no_durability", False),
         )
+        if metadata_db_path:
+            conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+            try:
+                _metadata_update_archive(
+                    conn,
+                    archive_path,
+                    state="extracting",
+                    last_txn_id=txn["txn_id"],
+                    attempts_increment=1,
+                    final_disposition="unknown",
+                )
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
     except Exception as e:
         return {
             "kind": "failed",
@@ -9068,13 +11194,239 @@ def _execute_transactional_traditional_zip_move(
         }
 
 
-def _traditional_zip_move_scheduler_result(processor, archive_path, *, args, output_base):
-    if args.dry_run:
+def _call_extract_phase_with_optional_metadata(
+    processor,
+    archive_path,
+    *,
+    args,
+    output_base,
+    metadata_db_path=None,
+):
+    if metadata_db_path is None:
         return _extract_phase(
             processor,
             archive_path,
             args=args,
             output_base=output_base,
+        )
+
+    try:
+        return _extract_phase(
+            processor,
+            archive_path,
+            args=args,
+            output_base=output_base,
+            metadata_db_path=metadata_db_path,
+        )
+    except TypeError as e:
+        if "unexpected keyword argument 'metadata_db_path'" not in str(e):
+            raise
+
+    return _extract_phase(
+        processor,
+        archive_path,
+        args=args,
+        output_base=output_base,
+    )
+
+
+def _call_traditional_zip_move_scheduler_result_with_optional_metadata(
+    processor,
+    archive_path,
+    *,
+    args,
+    output_base,
+    metadata_db_path=None,
+):
+    if metadata_db_path is None:
+        return _traditional_zip_move_scheduler_result(
+            processor,
+            archive_path,
+            args=args,
+            output_base=output_base,
+        )
+
+    try:
+        return _traditional_zip_move_scheduler_result(
+            processor,
+            archive_path,
+            args=args,
+            output_base=output_base,
+            metadata_db_path=metadata_db_path,
+        )
+    except TypeError as e:
+        if "unexpected keyword argument 'metadata_db_path'" not in str(e):
+            raise
+
+    return _traditional_zip_move_scheduler_result(
+        processor,
+        archive_path,
+        args=args,
+        output_base=output_base,
+    )
+
+
+def _call_finalize_one_txn_with_optional_metadata(
+    txn,
+    *,
+    processor,
+    args,
+    output_base,
+    metadata_db_path=None,
+):
+    if metadata_db_path is None:
+        return _finalize_one_txn(
+            txn,
+            processor=processor,
+            args=args,
+            output_base=output_base,
+        )
+
+    try:
+        return _finalize_one_txn(
+            txn,
+            processor=processor,
+            args=args,
+            output_base=output_base,
+            metadata_db_path=metadata_db_path,
+        )
+    except TypeError as e:
+        if "unexpected keyword argument 'metadata_db_path'" not in str(e):
+            raise
+
+    return _finalize_one_txn(
+        txn,
+        processor=processor,
+        args=args,
+        output_base=output_base,
+    )
+
+
+def _call_load_latest_txn_by_archive_path_with_optional_metadata(
+    archive_path,
+    output_dir,
+    output_base,
+    metadata_db_path,
+):
+    if metadata_db_path is None:
+        return _load_latest_txn_by_archive_path(
+            archive_path,
+            output_dir,
+            output_base,
+        )
+
+    try:
+        return _load_latest_txn_by_archive_path(
+            archive_path,
+            output_dir,
+            output_base,
+            metadata_db_path,
+        )
+    except TypeError as e:
+        signature_mismatch = (
+            "takes 3 positional arguments but 4 were given" in str(e)
+            or "unexpected keyword argument 'metadata_db_path'" in str(e)
+        )
+        if not signature_mismatch:
+            raise
+
+    return _load_latest_txn_by_archive_path(
+        archive_path,
+        output_dir,
+        output_base,
+    )
+
+
+def _call_garbage_collect_with_optional_metadata(
+    output_dir,
+    *,
+    output_base,
+    metadata_db_path,
+    keep_journal_days,
+):
+    if metadata_db_path is None:
+        return _garbage_collect(
+            output_dir,
+            output_base=output_base,
+            keep_journal_days=keep_journal_days,
+        )
+
+    try:
+        return _garbage_collect(
+            output_dir,
+            output_base=output_base,
+            metadata_db_path=metadata_db_path,
+            keep_journal_days=keep_journal_days,
+        )
+    except TypeError as e:
+        if "unexpected keyword argument 'metadata_db_path'" not in str(e):
+            raise
+
+    return _garbage_collect(
+        output_dir,
+        output_base=output_base,
+        keep_journal_days=keep_journal_days,
+    )
+
+
+def _call_run_transactional_extract_phase_with_optional_metadata(
+    processor,
+    archives,
+    *,
+    args,
+    output_base,
+    metadata_db_path,
+    current_run_touched_output_dirs,
+):
+    if metadata_db_path is None:
+        return _run_transactional_extract_phase(
+            processor,
+            archives,
+            args=args,
+            output_base=output_base,
+            current_run_touched_output_dirs=current_run_touched_output_dirs,
+        )
+
+    try:
+        return _run_transactional_extract_phase(
+            processor,
+            archives,
+            args=args,
+            output_base=output_base,
+            metadata_db_path=metadata_db_path,
+            current_run_touched_output_dirs=current_run_touched_output_dirs,
+        )
+    except TypeError as e:
+        if "unexpected keyword argument 'metadata_db_path'" not in str(e):
+            raise
+
+    return _run_transactional_extract_phase(
+        processor,
+        archives,
+        args=args,
+        output_base=output_base,
+        current_run_touched_output_dirs=current_run_touched_output_dirs,
+    )
+
+
+def _traditional_zip_move_scheduler_result(
+    processor,
+    archive_path,
+    *,
+    args,
+    output_base,
+    metadata_db_path=None,
+):
+    if metadata_db_path is None:
+        metadata_db_path = _runtime_metadata_db_path(output_base)
+
+    if args.dry_run:
+        return _call_extract_phase_with_optional_metadata(
+            processor,
+            archive_path,
+            args=args,
+            output_base=output_base,
+            metadata_db_path=metadata_db_path,
         )
 
     archive_path = os.path.abspath(archive_path)
@@ -9084,11 +11436,12 @@ def _traditional_zip_move_scheduler_result(processor, archive_path, *, args, out
         and inspected.get("applies")
         and inspected.get("reason") == "traditional_zip_move"
     ):
-        return _extract_phase(
+        return _call_extract_phase_with_optional_metadata(
             processor,
             archive_path,
             args=args,
             output_base=output_base,
+            metadata_db_path=metadata_db_path,
         )
 
     return {
@@ -9109,8 +11462,12 @@ def _finalize_one_traditional_zip_move(
     processor,
     args,
     output_base,
+    metadata_db_path=None,
     touched_output_dirs,
 ):
+    if metadata_db_path is None:
+        metadata_db_path = _runtime_metadata_db_path(output_base)
+
     archive_path = os.path.abspath(result["archive_path"])
     output_dir = os.path.abspath(result["output_dir"])
     touched_output_dirs.add(output_dir)
@@ -9128,6 +11485,7 @@ def _finalize_one_traditional_zip_move(
             archive_path,
             result["inspected"],
             output_base=output_base,
+            metadata_db_path=metadata_db_path,
         )
 
     if txn_result.get("kind") == "txn":
@@ -9146,6 +11504,7 @@ def _finalize_one_traditional_zip_move(
         processor=processor,
         args=args,
         output_base=output_base,
+        metadata_db_path=metadata_db_path,
         touched_output_dirs=touched_output_dirs,
     )
     return False
@@ -9157,21 +11516,27 @@ def _finalize_pending_scheduler_item(
     processor,
     args,
     output_base,
+    metadata_db_path=None,
     touched_output_dirs,
 ):
+    if metadata_db_path is None:
+        metadata_db_path = _runtime_metadata_db_path(output_base)
+
     if item.get("kind") == "traditional_zip_move":
         return _finalize_one_traditional_zip_move(
             item,
             processor=processor,
             args=args,
             output_base=output_base,
+            metadata_db_path=metadata_db_path,
             touched_output_dirs=touched_output_dirs,
         )
-    return _finalize_one_txn(
+    return _call_finalize_one_txn_with_optional_metadata(
         item,
         processor=processor,
         args=args,
         output_base=output_base,
+        metadata_db_path=metadata_db_path,
     )
 
 
@@ -9337,7 +11702,122 @@ def _gc_should_delete_journal(txn, manifest, output_base):
     return False
 
 
-def _garbage_collect(output_dir, *, output_base, keep_journal_days=7):
+def _gc_should_delete_journal_from_metadata(txn, *, output_base, metadata_db_path):
+    archive_path = txn.get("archive_path")
+    if not archive_path:
+        return False
+
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        archive_row = conn.execute(
+            "SELECT state, last_txn_id FROM archives WHERE archive_path = ?",
+            (os.path.abspath(archive_path),),
+        ).fetchone()
+        selected_txn = None
+        selected_txn_id = None
+        if archive_row is not None and archive_row["last_txn_id"]:
+            selected_txn_id = str(archive_row["last_txn_id"])
+            selected_row = conn.execute(
+                "SELECT txn_json FROM txns WHERE txn_id = ? LIMIT 1",
+                (selected_txn_id,),
+            ).fetchone()
+            if selected_row is None:
+                return False
+            try:
+                selected_txn = json.loads(selected_row["txn_json"])
+            except Exception:
+                return False
+        elif archive_row is not None:
+            latest_row = conn.execute(
+                "SELECT txn_json FROM txns WHERE archive_path = ? ORDER BY updated_at_epoch DESC, txn_id DESC LIMIT 1",
+                (os.path.abspath(archive_path),),
+            ).fetchone()
+            if latest_row is not None:
+                try:
+                    selected_txn = json.loads(latest_row["txn_json"])
+                except Exception:
+                    selected_txn = None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if archive_row is None:
+        return False
+
+    if selected_txn_id:
+        if selected_txn_id == str(txn.get("txn_id")):
+            return False
+        return archive_row["state"] in ("succeeded", "failed")
+
+    try:
+        classification = _classify_archive_from_sqlite_state(
+            {"state": archive_row["state"]},
+            selected_txn,
+        )
+    except Exception:
+        return False
+    if classification not in ("succeeded", "failed"):
+        return False
+
+    try:
+        return _txn_is_closed_terminal_outcome(txn)
+    except Exception:
+        return False
+
+
+def _garbage_collect(
+    output_dir,
+    *,
+    output_base,
+    metadata_db_path=None,
+    keep_journal_days=7,
+):
+    if metadata_db_path is None:
+        metadata_db_path = _runtime_metadata_db_path(output_base)
+
+    if metadata_db_path:
+        work_root = _work_root(output_dir, output_base)
+        cutoff = time.time() - float(keep_journal_days) * 86400.0
+        conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+        try:
+            rows = conn.execute(
+                "SELECT txn_id, txn_json FROM txns WHERE output_dir = ?",
+                (os.path.abspath(output_dir),),
+            ).fetchall()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        for row in rows:
+            txn_id = row["txn_id"]
+            txn_dir = os.path.join(work_root, "journal", txn_id)
+            if not safe_exists(txn_dir, VERBOSE):
+                continue
+            try:
+                mtime = os.path.getmtime(txn_dir)
+            except Exception:
+                continue
+            if mtime >= cutoff:
+                continue
+            try:
+                txn = json.loads(row["txn_json"])
+            except Exception:
+                txn = None
+
+            if txn is not None and not _gc_should_delete_journal_from_metadata(
+                txn,
+                output_base=output_base,
+                metadata_db_path=metadata_db_path,
+            ):
+                continue
+
+            safe_rmtree(txn_dir, VERBOSE)
+        return
+
     work_root = _work_root(output_dir, output_base)
     journal_root = os.path.join(work_root, "journal")
     if not safe_exists(journal_root, VERBOSE):
@@ -9369,90 +11849,91 @@ def _recover_output_dir(
     output_dir,
     *,
     args,
+    metadata_db_path=None,
     allowed_archive_paths=None,
     failed_archives=None,
     successful_archives=None,
 ):
+    if metadata_db_path is None:
+        metadata_db_path = _runtime_metadata_db_path(_output_base_from_args(args))
+
     output_base = _output_base_from_args(args)
     work_root = _work_root(output_dir, output_base)
     journal_root = os.path.join(work_root, "journal")
     if not safe_exists(journal_root, VERBOSE):
         return
 
-    manifest = _load_dataset_manifest(output_base)
     if allowed_archive_paths is not None:
         allowed_archive_paths = {
             os.path.abspath(archive_path) for archive_path in allowed_archive_paths
         }
+    if not metadata_db_path:
+        raise RuntimeError("metadata-missing: transactional metadata DB is missing")
+
     ordered_archive_paths = []
     blocked_by_same_output_gate = False
-    if manifest is not None:
-        for manifest_archive in _output_dir_discovered_archives(manifest, output_dir):
-            archive_path = os.path.abspath(manifest_archive["archive_path"])
-            if allowed_archive_paths is not None and archive_path not in allowed_archive_paths:
-                if not _archive_can_advance_same_output_scheduler(
-                    manifest_archive, output_base
-                ):
-                    blocked_by_same_output_gate = True
-                    break
-                continue
-            ordered_archive_paths.append(archive_path)
+    conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+    try:
+        rows = conn.execute(
+            "SELECT archive_path, state FROM archives WHERE output_dir = ? ORDER BY discovered_order",
+            (os.path.abspath(output_dir),),
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    for row in rows:
+        archive_path = os.path.abspath(row["archive_path"])
+        archive_row = dict(row)
+        if allowed_archive_paths is not None and archive_path not in allowed_archive_paths:
+            latest_txn = _metadata_load_latest_txn(
+                output_base,
+                archive_path,
+                metadata_db_path=metadata_db_path,
+            )
+            if not _archive_can_advance_same_output_scheduler_from_sqlite_state(
+                archive_row,
+                latest_txn,
+            ):
+                blocked_by_same_output_gate = True
+                break
+            continue
+        ordered_archive_paths.append(archive_path)
 
-    if manifest is not None and not ordered_archive_paths:
+    if not ordered_archive_paths:
         if blocked_by_same_output_gate or allowed_archive_paths is not None:
             return
 
-    if not ordered_archive_paths:
-        archive_paths = set()
-        for txn_id in sorted(os.listdir(journal_root)):
-            txn_dir = os.path.join(journal_root, txn_id)
-            txn_json = os.path.join(txn_dir, "txn.json")
-            if not safe_exists(txn_json, VERBOSE):
-                continue
-            try:
-                txn = _load_classifiable_txn(txn_json, output_base=output_base)
-                archive_path = txn.get("archive_path")
-                if not archive_path:
-                    continue
-                archive_path = os.path.abspath(archive_path)
-                if (
-                    allowed_archive_paths is not None
-                    and archive_path not in allowed_archive_paths
-                ):
-                    continue
-                archive_paths.add(archive_path)
-            except Exception as e:
-                print(f"  Warning: Could not load txn.json ({txn_json}): {e}")
-                continue
-        ordered_archive_paths = sorted(archive_paths)
-
     txns = []
     for archive_path in ordered_archive_paths:
-        txn = _load_latest_txn_by_archive_path(archive_path, output_dir, output_base)
+        txn = _call_load_latest_txn_by_archive_path_with_optional_metadata(
+            archive_path,
+            output_dir,
+            output_base,
+            metadata_db_path,
+        )
         if txn is not None:
             txns.append(txn)
 
-    manifest_archive_by_path = {}
-    if manifest is not None:
-        manifest_archive_by_path = {
-            os.path.abspath(archive["archive_path"]): archive
-            for archive in _iter_dataset_manifest_archives(manifest)
-        }
-
     for txn in txns:
-        manifest_archive = manifest_archive_by_path.get(
-            os.path.abspath(txn.get("archive_path") or "")
-        )
-        if manifest_archive is not None:
-            classified_state = _classify_manifest_archive_state(manifest_archive, output_base)
-            effective_classification = None
-            if (
-                txn.get("state") == TXN_STATE_SOURCE_FINALIZED
-                and manifest_archive.get("state") in ("succeeded", "failed")
-            ):
-                effective_classification = _reconciled_archive_classification(
-                    manifest_archive, txn
-                )
+        archive_path = os.path.abspath(txn.get("archive_path") or "")
+        archive_row = None
+        conn = _metadata_connect(metadata_db_path, create_if_missing=False)
+        try:
+            archive_row = _metadata_load_archive(conn, archive_path)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        if archive_row is not None:
+            classified_state = _classify_archive_from_sqlite_state(archive_row, txn)
+            effective_classification = _reconciled_archive_classification_from_sqlite_state(
+                archive_row,
+                txn,
+            )
             if (
                 effective_classification != "resume_required"
                 and classified_state not in ("recoverable", "retryable")
@@ -9505,14 +11986,14 @@ def _recover_output_dir(
                 txn,
                 persisted_state=state,
                 recovery=True,
-                manifest=manifest,
+                manifest=None,
             ):
                 break
             if _is_recoverable_placed_promotion_snapshot_failure(
                 txn,
                 persisted_state=state,
                 recovery=True,
-                manifest=manifest,
+                manifest=None,
             ):
                 break
             if _txn_has_recoverable_closed_success_retry_state(txn):
@@ -9545,17 +12026,32 @@ def _load_latest_txn_for_archive(manifest_archive, output_base):
     return _selected_txn_for_manifest_archive(manifest_archive, output_base)
 
 
-def _load_latest_txn_by_archive_path(archive_path, output_dir, output_base):
-    manifest = _load_dataset_manifest(output_base)
-    manifest_archive = _get_dataset_manifest_archive_entry(manifest, archive_path)
-    if manifest_archive is not None:
-        return _load_latest_txn_for_archive(manifest_archive, output_base)
-    return _load_latest_txn_for_archive(
-        {
-            "archive_path": archive_path,
-            "output_dir": output_dir,
-        },
+def _load_latest_txn_by_archive_path(
+    archive_path,
+    output_dir,
+    output_base,
+    metadata_db_path=None,
+):
+    if metadata_db_path is None:
+        metadata_db_path = _runtime_metadata_db_path(output_base)
+    if not metadata_db_path:
+        manifest = _load_dataset_manifest(output_base)
+        manifest_archive = _get_dataset_manifest_archive_entry(manifest, archive_path)
+        if manifest_archive is not None:
+            return _load_latest_txn_for_archive(manifest_archive, output_base)
+        return _load_latest_txn_for_archive(
+            {
+                "archive_path": archive_path,
+                "output_dir": output_dir,
+            },
+            output_base,
+        )
+
+    del output_dir
+    return _metadata_load_latest_txn(
         output_base,
+        archive_path,
+        metadata_db_path=metadata_db_path,
     )
 
 
@@ -9618,8 +12114,13 @@ def _txn_manifest_command_fields(txn):
     output_base = (txn or {}).get("output_base")
     if not isinstance(output_base, str) or not output_base.strip():
         return {}
-    manifest = _load_dataset_manifest(output_base)
-    return _manifest_command_fingerprint_fields(manifest)
+    metadata_db_path = (txn or {}).get("metadata_db_path") or _runtime_metadata_db_path(
+        output_base
+    )
+    return _command_fingerprint_fields_for_output_base(
+        output_base,
+        metadata_db_path=metadata_db_path,
+    )
 
 
 def _txn_volume_paths(txn):
@@ -10496,6 +12997,7 @@ def _run_transactional_extract_phase(
     *,
     args,
     output_base,
+    metadata_db_path=None,
     current_run_touched_output_dirs,
 ):
     if not archives:
@@ -10505,14 +13007,19 @@ def _run_transactional_extract_phase(
 
     if args.threads == 1:
         for archive_path in archives:
-            result = _traditional_zip_move_scheduler_result(
-                processor, archive_path, args=args, output_base=output_base
+            result = _call_traditional_zip_move_scheduler_result_with_optional_metadata(
+                processor,
+                archive_path,
+                args=args,
+                output_base=output_base,
+                metadata_db_path=metadata_db_path,
             )
             _handle_transactional_result(
                 result,
                 processor=processor,
                 args=args,
                 output_base=output_base,
+                metadata_db_path=metadata_db_path,
                 touched_output_dirs=current_run_touched_output_dirs,
                 pending_by_output_dir=pending_by_output_dir,
             )
@@ -10521,6 +13028,7 @@ def _run_transactional_extract_phase(
             processor=processor,
             args=args,
             output_base=output_base,
+            metadata_db_path=metadata_db_path,
             touched_output_dirs=current_run_touched_output_dirs,
         )
         return
@@ -10538,8 +13046,17 @@ def _run_transactional_extract_phase(
         except StopIteration:
             return False
 
+        def _invoke_scheduler(processor_arg, archive_path_arg, *, args, output_base):
+            return _call_traditional_zip_move_scheduler_result_with_optional_metadata(
+                processor_arg,
+                archive_path_arg,
+                args=args,
+                output_base=output_base,
+                metadata_db_path=metadata_db_path,
+            )
+
         future = executor.submit(
-            _traditional_zip_move_scheduler_result,
+            _invoke_scheduler,
             processor,
             archive_path,
             args=args,
@@ -10567,6 +13084,7 @@ def _run_transactional_extract_phase(
                 processor=processor,
                 args=args,
                 output_base=output_base,
+                metadata_db_path=metadata_db_path,
                 touched_output_dirs=current_run_touched_output_dirs,
                 pending_by_output_dir=pending_by_output_dir,
             )
@@ -10597,6 +13115,7 @@ def _run_transactional_extract_phase(
         processor=processor,
         args=args,
         output_base=output_base,
+        metadata_db_path=metadata_db_path,
         touched_output_dirs=current_run_touched_output_dirs,
     )
 
@@ -10634,12 +13153,19 @@ def _recover_all_outputs(
     output_base,
     *,
     args,
+    metadata_db_path=None,
     recoverable_archives=None,
     failed_archives=None,
     successful_archives=None,
 ):
+    if metadata_db_path is None:
+        metadata_db_path = _runtime_metadata_db_path(output_base)
+
     if recoverable_archives is None:
-        output_dirs = _discover_output_dirs_for_recovery(output_base)
+        output_dirs = _discover_output_dirs_for_recovery_from_metadata(
+            output_base,
+            metadata_db_path,
+        )
         for output_dir in output_dirs:
             lock_path = _output_lock_path(output_dir, output_base)
             lock = FileLock(
@@ -10649,15 +13175,28 @@ def _recover_all_outputs(
                 debug=VERBOSE,
             )
             with lock:
-                _recover_output_dir(
-                    output_dir,
-                    args=args,
-                    failed_archives=failed_archives,
-                    successful_archives=successful_archives,
-                )
-                _garbage_collect(
+                try:
+                    _recover_output_dir(
+                        output_dir,
+                        args=args,
+                        metadata_db_path=metadata_db_path,
+                        failed_archives=failed_archives,
+                        successful_archives=successful_archives,
+                    )
+                except TypeError as e:
+                    # Compatibility for tests that patch legacy call signatures.
+                    if "unexpected keyword argument 'metadata_db_path'" not in str(e):
+                        raise
+                    _recover_output_dir(
+                        output_dir,
+                        args=args,
+                        failed_archives=failed_archives,
+                        successful_archives=successful_archives,
+                    )
+                _call_garbage_collect_with_optional_metadata(
                     output_dir,
                     output_base=output_base,
+                    metadata_db_path=metadata_db_path,
                     keep_journal_days=args.keep_journal_days,
                 )
         return
@@ -10678,16 +13217,30 @@ def _recover_all_outputs(
             debug=VERBOSE,
         )
         with lock:
-            _recover_output_dir(
-                output_dir,
-                args=args,
-                allowed_archive_paths=grouped_archives[output_dir],
-                failed_archives=failed_archives,
-                successful_archives=successful_archives,
-            )
-            _garbage_collect(
+            try:
+                _recover_output_dir(
+                    output_dir,
+                    args=args,
+                    metadata_db_path=metadata_db_path,
+                    allowed_archive_paths=grouped_archives[output_dir],
+                    failed_archives=failed_archives,
+                    successful_archives=successful_archives,
+                )
+            except TypeError as e:
+                # Compatibility for tests that patch legacy call signatures.
+                if "unexpected keyword argument 'metadata_db_path'" not in str(e):
+                    raise
+                _recover_output_dir(
+                    output_dir,
+                    args=args,
+                    allowed_archive_paths=grouped_archives[output_dir],
+                    failed_archives=failed_archives,
+                    successful_archives=successful_archives,
+                )
+            _call_garbage_collect_with_optional_metadata(
                 output_dir,
                 output_base=output_base,
+                metadata_db_path=metadata_db_path,
                 keep_journal_days=args.keep_journal_days,
             )
 
@@ -10720,8 +13273,23 @@ def _compute_output_dir(args, archive_path):
     )
 
 
-def _extract_phase(processor, archive_path, *, args, output_base):
+def _extract_phase(
+    processor,
+    archive_path,
+    *,
+    args,
+    output_base,
+    metadata_db_path=None,
+):
+    if metadata_db_path is None:
+        metadata_db_path = _runtime_metadata_db_path(output_base)
+
     archive_path = os.path.abspath(archive_path)
+    get_all_volumes = getattr(processor, "get_all_volumes", None)
+    if callable(get_all_volumes):
+        volumes = get_all_volumes(archive_path)
+    else:
+        volumes = [archive_path]
     print(f"Extracting: {archive_path}")
 
     output_dir = _compute_output_dir(args, archive_path)
@@ -10761,6 +13329,7 @@ def _extract_phase(processor, archive_path, *, args, output_base):
             archive_path,
             inspected,
             output_base=output_base,
+            metadata_db_path=metadata_db_path,
         )
 
     zip_decode_from_policy = inspected["zip_decode"]
@@ -10802,9 +13371,10 @@ def _extract_phase(processor, archive_path, *, args, output_base):
             print(f"  Error: No correct password found for {archive_path}")
             txn = _txn_create(
                 archive_path=archive_path,
-                volumes=processor.get_all_volumes(archive_path),
+                volumes=volumes,
                 output_dir=output_dir,
                 output_base=output_base,
+                metadata_db_path=metadata_db_path,
                 policy=args.decompress_policy,
                 wal_fsync_every=args.wal_fsync_every,
                 snapshot_every=args.snapshot_every,
@@ -10843,23 +13413,25 @@ def _extract_phase(processor, archive_path, *, args, output_base):
         print("  Warning: RAR command not available, falling back to 7z")
         enable_rar = False
 
-    volumes = processor.get_all_volumes(archive_path)
     txn = _txn_create(
         archive_path=archive_path,
         volumes=volumes,
         output_dir=output_dir,
         output_base=output_base,
+        metadata_db_path=metadata_db_path,
         policy=args.decompress_policy,
         wal_fsync_every=args.wal_fsync_every,
         snapshot_every=args.snapshot_every,
         durability_enabled=not args.no_durability,
     )
-    _update_dataset_manifest_archive(
+    _persist_archive_tracking(
         output_base,
         archive_path,
+        metadata_db_path=metadata_db_path,
         state="extracting",
         last_txn_id=txn["txn_id"],
         attempts_increment=1,
+        final_disposition="unknown",
         error=None,
     )
 
@@ -10890,21 +13462,25 @@ def _extract_phase(processor, archive_path, *, args, output_base):
 
         txn["state"] = TXN_STATE_EXTRACTED
         _txn_snapshot_v2(txn)
-        _update_dataset_manifest_archive(
+        _persist_archive_tracking(
             output_base,
             archive_path,
+            metadata_db_path=metadata_db_path,
             state="recoverable",
             last_txn_id=txn["txn_id"],
+            final_disposition="unknown",
             error=None,
         )
         return {"kind": "txn", "txn": txn}
     except KeyboardInterrupt as e:
         _txn_fail(txn, "ABORTED", e)
-        _update_dataset_manifest_archive(
+        _persist_archive_tracking(
             output_base,
             archive_path,
+            metadata_db_path=metadata_db_path,
             state="retryable",
             last_txn_id=txn["txn_id"],
+            final_disposition="unknown",
             error=txn.get("error"),
         )
         raise
@@ -10927,7 +13503,6 @@ def _place_and_finalize_txn(txn, *, args, recovery=False):
     if txn.get("state") == TXN_STATE_DONE:
         return
     persisted_state = txn.get("state")
-    manifest = _load_dataset_manifest(txn["output_base"])
     _validate_persisted_replay_metadata(txn)
     _validate_closed_success_source_finalization_terminal_state(txn)
     if txn.get("state") == TXN_STATE_CLEANED and _txn_has_incomplete_source_finalization(txn):
@@ -11427,7 +14002,15 @@ def _place_and_finalize_txn(txn, *, args, recovery=False):
         raise
 
 
-def _finalize_one_txn(txn, *, processor, args, output_base):
+def _finalize_one_txn(
+    txn,
+    *,
+    processor,
+    args,
+    output_base,
+    metadata_db_path=None,
+):
+    del metadata_db_path
     output_dir = txn["output_dir"]
     lock_path = _output_lock_path(output_dir, output_base)
     lock = FileLock(
@@ -11456,9 +14039,13 @@ def _handle_transactional_result(
     processor,
     args,
     output_base,
+    metadata_db_path=None,
     touched_output_dirs,
     pending_by_output_dir=None,
 ):
+    if metadata_db_path is None:
+        metadata_db_path = _runtime_metadata_db_path(output_base)
+
     if not result:
         return
 
@@ -11474,6 +14061,7 @@ def _handle_transactional_result(
                 processor=processor,
                 args=args,
                 output_base=output_base,
+                metadata_db_path=metadata_db_path,
                 touched_output_dirs=touched_output_dirs,
             )
             return
@@ -11483,6 +14071,7 @@ def _handle_transactional_result(
             processor=processor,
             args=args,
             output_base=output_base,
+            metadata_db_path=metadata_db_path,
             touched_output_dirs=touched_output_dirs,
         )
         return
@@ -11493,7 +14082,13 @@ def _handle_transactional_result(
         if output_dir:
             touched_output_dirs.add(output_dir)
         if pending_by_output_dir is None:
-            _finalize_one_txn(txn, processor=processor, args=args, output_base=output_base)
+            _call_finalize_one_txn_with_optional_metadata(
+                txn,
+                processor=processor,
+                args=args,
+                output_base=output_base,
+                metadata_db_path=metadata_db_path,
+            )
             return
         pending_by_output_dir.setdefault(output_dir, []).append(txn)
         _drain_same_output_ready_txns(
@@ -11501,6 +14096,7 @@ def _handle_transactional_result(
             processor=processor,
             args=args,
             output_base=output_base,
+            metadata_db_path=metadata_db_path,
             touched_output_dirs=touched_output_dirs,
         )
         return
@@ -11522,10 +14118,12 @@ def _handle_transactional_result(
             state = result.get("manifest_state") or "succeeded"
             finalized_at = _now_iso() if state == "succeeded" else None
             error = result.get("manifest_error")
-        _update_dataset_manifest_archive(
+        _persist_archive_tracking(
             output_base,
             archive_path,
+            metadata_db_path=metadata_db_path,
             state=state,
+            last_txn_id=None,
             final_disposition=final_disposition,
             error=error,
             finalized_at=finalized_at,
@@ -11563,11 +14161,12 @@ def _handle_transactional_result(
                     manifest_state = "retryable"
                     manifest_final_disposition = "unknown"
                     manifest_finalized_at = None
-            _update_dataset_manifest_archive(
+            _persist_archive_tracking(
                 output_base,
                 archive_path,
+                metadata_db_path=metadata_db_path,
                 state=manifest_state,
-                last_txn_id=txn.get("txn_id", _MANIFEST_UNSET),
+                last_txn_id=txn.get("txn_id"),
                 final_disposition=manifest_final_disposition,
                 error=manifest_error,
                 finalized_at=manifest_finalized_at,
@@ -11588,7 +14187,7 @@ def _all_txns_for_work_root(work_root, output_base):
     return txns
 
 
-def _work_root_cleanup_eligible(work_root, output_base):
+def _work_root_cleanup_eligible_from_journal(work_root, output_base):
     try:
         txns = _all_txns_for_work_root(work_root, output_base)
     except Exception:
@@ -11606,9 +14205,47 @@ def _work_root_cleanup_eligible(work_root, output_base):
     return True
 
 
+def _work_root_cleanup_eligible(work_root, output_base, *, metadata_db_path=None):
+    if not metadata_db_path:
+        return _work_root_cleanup_eligible_from_journal(work_root, output_base)
+
+    txns = _all_txns_for_work_root_from_metadata(
+        work_root,
+        output_base,
+        metadata_db_path,
+    )
+    if not txns:
+        return True
+
+    for txn in txns:
+        try:
+            if _txn_has_recovery_responsibility(txn):
+                return False
+            if not _txn_is_closed_terminal_outcome(txn):
+                return False
+        except Exception as e:
+            if _is_refuse_recovery_error(e):
+                return False
+            raise
+    return True
+
+
 def _cleanup_one_transactional_output_dir(
-    output_dir, *, output_base, args, should_clean, manifest_terminal=False
+    output_dir,
+    *,
+    output_base,
+    metadata_db_path=None,
+    args,
+    should_clean,
+    metadata_terminal=False,
+    manifest_terminal=None,
 ):
+    if manifest_terminal is not None:
+        metadata_terminal = bool(manifest_terminal)
+
+    if metadata_db_path is None:
+        metadata_db_path = _runtime_metadata_db_path(output_base)
+
     work_root = _work_root(output_dir, output_base)
     lock_path = _output_lock_path(output_dir, output_base)
     lock = FileLock(
@@ -11620,9 +14257,10 @@ def _cleanup_one_transactional_output_dir(
     try:
         with lock:
             try:
-                _garbage_collect(
+                _call_garbage_collect_with_optional_metadata(
                     output_dir,
                     output_base=output_base,
+                    metadata_db_path=metadata_db_path,
                     keep_journal_days=args.keep_journal_days,
                 )
             except KeyboardInterrupt:
@@ -11631,8 +14269,12 @@ def _cleanup_one_transactional_output_dir(
                 print(f"  Warning: Could not garbage collect {output_dir}: {e}")
                 return False
 
-            if should_clean and manifest_terminal:
-                if not _work_root_cleanup_eligible(work_root, output_base):
+            if should_clean and metadata_terminal:
+                if not _work_root_cleanup_eligible(
+                    work_root,
+                    output_base,
+                    metadata_db_path=metadata_db_path,
+                ):
                     return False
             return True
     except KeyboardInterrupt:
@@ -11649,16 +14291,18 @@ def _run_transactional(processor, archives, *, args):
     if not _validate_delete_durability_args(args):
         return False
 
+    metadata_db_path = _runtime_metadata_db_path(output_base)
+
     if args.dry_run:
-        manifest = _load_dataset_manifest(output_base)
         dry_run_archives = list(archives)
-        if manifest is not None:
-            recoverable_archives, retryable_archives, pending_archives = (
-                _build_transactional_archive_plan(
-                    manifest,
-                    output_base,
-                    persist=False,
-                )
+        if metadata_db_path:
+            (
+                recoverable_archives,
+                retryable_archives,
+                pending_archives,
+            ) = _build_transactional_archive_plan_from_metadata(
+                output_base,
+                metadata_db_path,
             )
             for recoverable_archive in recoverable_archives:
                 archive_path = os.path.abspath(recoverable_archive["archive_path"])
@@ -11666,33 +14310,71 @@ def _run_transactional(processor, archives, *, args):
                 processor.skipped_archives.append(archive_path)
             dry_run_archives = retryable_archives + pending_archives
 
-        _run_transactional_extract_phase(
+        _call_run_transactional_extract_phase_with_optional_metadata(
             processor,
             dry_run_archives,
             args=args,
             output_base=output_base,
+            metadata_db_path=metadata_db_path,
             current_run_touched_output_dirs=set(),
         )
         return True
 
-    manifest = _load_dataset_manifest(output_base)
-    if manifest is None and not archives:
+    current_fingerprint = _build_command_fingerprint(args)
+    metadata_db_path = _runtime_metadata_db_path(output_base)
+    if metadata_db_path:
+        try:
+            stored_fingerprint = _metadata_command_fingerprint(metadata_db_path)
+        except RuntimeError as e:
+            if str(e) != "metadata-missing: transactional metadata DB is missing":
+                raise
+            _unregister_runtime_metadata_db(output_base)
+            metadata_db_path = None
+        else:
+            if (
+                isinstance(stored_fingerprint, dict)
+                and stored_fingerprint.get("sha256")
+                and stored_fingerprint.get("sha256") != current_fingerprint.get("sha256")
+            ):
+                return False
+    else:
+        manifest = _load_dataset_manifest(output_base)
+        if (
+            manifest is not None
+            and isinstance(manifest.get("command_fingerprint"), dict)
+            and manifest["command_fingerprint"].get("sha256")
+            != current_fingerprint.get("sha256")
+        ):
+            return False
+
+    if metadata_db_path is None and not archives:
         return None
-    if manifest is None:
-        manifest = _create_dataset_manifest(
+    if metadata_db_path is None:
+        _create_dataset_manifest(
             input_root=args.path,
             output_root=output_base,
             discovered_archives=_build_manifest_discovered_archives(
                 processor, archives, args=args
             ),
             command_fingerprint=_build_command_fingerprint(args),
+            metadata_db=getattr(args, "metadata_db", None),
+        )
+
+    metadata_db_path = _runtime_metadata_db_path(output_base)
+    if metadata_db_path is None:
+        raise RuntimeError(
+            "metadata-missing: transactional metadata DB is missing"
         )
 
     (
         recoverable_archives,
         retryable_archives,
         pending_archives,
-    ) = _build_transactional_archive_plan(manifest, output_base)
+    ) = _build_transactional_archive_plan_from_metadata(
+        output_base,
+        metadata_db_path,
+    )
+    _metadata_refresh_manifest_cache_from_sqlite(output_base, metadata_db_path)
     current_run_touched_output_dirs = set()
     recovery_failed_archives = set()
     recovery_successful_archives = set()
@@ -11700,22 +14382,26 @@ def _run_transactional(processor, archives, *, args):
     def _current_run_recoverable_archives():
         if not current_run_touched_output_dirs:
             return []
-        manifest = _load_dataset_manifest(output_base)
-        if manifest is None:
-            return []
+        (
+            recoverable,
+            _retryable,
+            _pending,
+        ) = _build_transactional_archive_plan_from_metadata(
+            output_base,
+            metadata_db_path,
+        )
         excluded_archive_paths = {
             os.path.abspath(path)
             for path in list(recovery_failed_archives) + list(processor.failed_archives)
         }
         return [
             {
-                "archive_path": archive["archive_path"],
-                "output_dir": archive["output_dir"],
+                "archive_path": os.path.abspath(archive["archive_path"]),
+                "output_dir": os.path.abspath(archive["output_dir"]),
             }
-            for archive in _iter_dataset_manifest_archives(manifest)
+            for archive in recoverable
             if os.path.abspath(archive.get("output_dir") or "")
             in current_run_touched_output_dirs
-            and archive.get("state") == "recoverable"
             and os.path.abspath(archive.get("archive_path") or "")
             not in excluded_archive_paths
         ]
@@ -11723,6 +14409,7 @@ def _run_transactional(processor, archives, *, args):
     _recover_all_outputs(
         output_base,
         args=args,
+        metadata_db_path=metadata_db_path,
         recoverable_archives=recoverable_archives,
         failed_archives=recovery_failed_archives,
         successful_archives=recovery_successful_archives,
@@ -11739,43 +14426,62 @@ def _run_transactional(processor, archives, *, args):
         ):
             processor.successful_archives.append(archive_path)
 
-    _run_transactional_extract_phase(
+    _call_run_transactional_extract_phase_with_optional_metadata(
         processor,
         retryable_archives,
         args=args,
         output_base=output_base,
+        metadata_db_path=metadata_db_path,
         current_run_touched_output_dirs=current_run_touched_output_dirs,
     )
     if current_run_touched_output_dirs:
         _recover_all_outputs(
             output_base,
             args=args,
+            metadata_db_path=metadata_db_path,
             recoverable_archives=_current_run_recoverable_archives(),
             failed_archives=recovery_failed_archives,
             successful_archives=recovery_successful_archives,
         )
-    _run_transactional_extract_phase(
+    _call_run_transactional_extract_phase_with_optional_metadata(
         processor,
         pending_archives,
         args=args,
         output_base=output_base,
+        metadata_db_path=metadata_db_path,
         current_run_touched_output_dirs=current_run_touched_output_dirs,
     )
     if current_run_touched_output_dirs:
         _recover_all_outputs(
             output_base,
             args=args,
+            metadata_db_path=metadata_db_path,
             recoverable_archives=_current_run_recoverable_archives(),
             failed_archives=recovery_failed_archives,
             successful_archives=recovery_successful_archives,
         )
 
-    final_manifest = _load_dataset_manifest(output_base)
-    manifest_terminal = _dataset_manifest_is_terminal(final_manifest)
-    should_clean = _dataset_cleanup_enabled_for_manifest(final_manifest, args)
+    (
+        final_recoverable_archives,
+        final_retryable_archives,
+        final_pending_archives,
+    ) = _build_transactional_archive_plan_from_metadata(
+        output_base,
+        metadata_db_path,
+    )
+    metadata_terminal = not (
+        final_recoverable_archives
+        or final_retryable_archives
+        or final_pending_archives
+    )
+    should_clean = metadata_terminal and _dataset_cleanup_enabled_for_metadata(
+        output_base,
+        args,
+        metadata_db_path,
+    )
     cleanup_output_dirs = sorted(current_run_touched_output_dirs)
-    if manifest_terminal:
-        cleanup_output_dirs = _dataset_manifest_output_dirs(final_manifest)
+    if metadata_terminal:
+        cleanup_output_dirs = _metadata_dataset_output_dirs(metadata_db_path)
 
     all_cleanup_succeeded = True
     for output_dir in cleanup_output_dirs:
@@ -11784,13 +14490,15 @@ def _run_transactional(processor, archives, *, args):
         cleanup_succeeded = _cleanup_one_transactional_output_dir(
             output_dir,
             output_base=output_base,
+            metadata_db_path=metadata_db_path,
             args=args,
             should_clean=should_clean,
-            manifest_terminal=manifest_terminal,
+            metadata_terminal=metadata_terminal,
+            manifest_terminal=metadata_terminal,
         )
         all_cleanup_succeeded = all_cleanup_succeeded and cleanup_succeeded
 
-    if should_clean and manifest_terminal and all_cleanup_succeeded:
+    if should_clean and metadata_terminal and all_cleanup_succeeded:
         work_base = _work_base(output_base)
         outputs_root = os.path.join(work_base, "outputs")
         all_work_roots_eligible = True
@@ -11799,11 +14507,16 @@ def _run_transactional(processor, archives, *, args):
                 work_root = os.path.join(outputs_root, token)
                 if not safe_isdir(work_root, VERBOSE):
                     continue
-                if not _work_root_cleanup_eligible(work_root, output_base):
+                if not _work_root_cleanup_eligible(
+                    work_root,
+                    output_base,
+                    metadata_db_path=metadata_db_path,
+                ):
                     all_work_roots_eligible = False
                     break
         if all_work_roots_eligible and not _retire_terminal_work_base(
-            work_base, final_manifest
+            work_base,
+            _metadata_terminal_retire_record(metadata_db_path),
         ):
             print(
                 f"Warning: Could not remove terminal transactional workdir {work_base}; future runs will treat it as terminal residue rather than active state."
@@ -14629,6 +17342,10 @@ def main():
         help="Use legacy non-transactional pipeline (no journal/recovery).",
     )
     parser.add_argument(
+        "--metadata-db",
+        help="Path to the SQLite transactional metadata DB. Required again when resuming an external-mode workdir.",
+    )
+    parser.add_argument(
         "--degrade-cross-volume",
         action="store_true",
         help="Allow cross-volume moves via copy+delete (reduces atomic/crash-safety guarantees).",
@@ -14853,20 +17570,17 @@ def main():
         # Create processor and find archives
         processor = ArchiveProcessor(args)
         abs_path = os.path.abspath(args.path)
-        manifest = None
+        metadata_db_path = None
         if not args.legacy:
-            manifest = _load_dataset_manifest(_output_base_from_args(args))
+            metadata_db_path = _runtime_metadata_db_path(_output_base_from_args(args))
 
-        if manifest is None:
+        if metadata_db_path:
+            archives = _metadata_ordered_archive_paths(metadata_db_path)
+        else:
             # Fix archive extensions if requested
             if not args.dry_run:
                 fix_archive_ext(processor, abs_path, args)
             archives = processor.find_archives(abs_path)
-        else:
-            archives = [
-                os.path.abspath(archive["archive_path"])
-                for archive in _iter_dataset_manifest_archives(manifest)
-            ]
 
         if not archives:
             print("No archives found to process.")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -62,6 +63,42 @@ def _read_json(path: Path) -> object | None:
     except Exception as exc:
         _safe_print(f"could not parse json {path}: {exc}")
         return None
+
+
+def _read_sqlite_table(db_path: Path, query: str) -> list[dict[str, object]]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute(query).fetchall()]
+    finally:
+        conn.close()
+
+
+def _collect_metadata_backend_diagnostics(
+    work_base: Path,
+    *,
+    metadata_db_path: str | Path | None = None,
+) -> dict[str, object]:
+    marker_path = work_base / "metadata.backend.json"
+    marker = _read_json(marker_path) if marker_path.exists() else None
+    db_path = Path(metadata_db_path) if metadata_db_path else (work_base / "metadata.sqlite")
+    sqlite_metadata: dict[str, object] = {
+        "metadata_store": None,
+        "dataset_state": None,
+    }
+    if db_path.exists():
+        for key, query in (
+            ("metadata_store", "SELECT * FROM metadata_store"),
+            ("dataset_state", "SELECT * FROM dataset_state"),
+        ):
+            try:
+                sqlite_metadata[key] = _read_sqlite_table(db_path, query)
+            except sqlite3.Error as exc:
+                sqlite_metadata[key] = {"error": str(exc)}
+    return {
+        "backend_marker": marker,
+        "sqlite_metadata": sqlite_metadata,
+    }
 
 
 def _extract_failed_archives(stdout: str) -> list[str]:
@@ -141,6 +178,14 @@ def _print_manifest_diagnostics(input_root: Path, failed_archives: list[str]) ->
     for work_base in work_bases:
         manifest_path = work_base / "dataset_manifest.json"
         _safe_print(f"diagnostic work base: {work_base}")
+        _safe_print(
+            json.dumps(
+                _collect_metadata_backend_diagnostics(work_base),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
         if not manifest_path.exists():
             _safe_print(f"manifest missing: {manifest_path}")
             continue

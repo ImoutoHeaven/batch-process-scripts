@@ -77,6 +77,7 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 | `--no-lock` | 禁用全局锁（多实例慎用） | 关闭 |
 | `--lock-timeout` | 获取锁最大重试次数 | 30 |
 | `--legacy` | 切回旧版非事务化流程（默认是事务化流程，启用 journal / 恢复） | 关闭 |
+| `--metadata-db` | 事务模式 SQLite 元数据数据库路径；resume 外置 metadata DB workdir 时必须再次传入 `--metadata-db` 并指向匹配的外置 metadata DB | `.advdecompress_work/metadata.sqlite` |
 | `--degrade-cross-volume` | 允许跨卷降级 copy+delete（降低原子性） | 关闭 |
 | `--conflict-mode` | 事务化落位冲突策略：`fail` / `suffix` | `fail` |
 | `--no-durability` | 关闭事务模式的 durability barrier；与会变更源归档的事务化后处理不兼容（如 `-sp delete` / `-sp move` / `-fp move` / `-tzp move`） | 关闭 |
@@ -91,22 +92,24 @@ python advDecompress.py <扫描路径> -o <输出目录> --fix-ext -fet 500kb -t
 
 ---
 
-> 事务模式下的工作目录统一放在输出根目录的 `.advdecompress_work/` 下，其中 `dataset_manifest.json` 用于记录本轮数据集并驱动严格恢复。
+> 事务模式下的工作目录统一放在输出根目录的 `.advdecompress_work/` 下；默认持久化元数据数据库为 `.advdecompress_work/metadata.sqlite`。
+> 若传入 `--metadata-db <path>`，事务模式会改用该 SQLite 数据库；后续 resume 必须再次传入 `--metadata-db` 并指向与当前 workdir 匹配的外置 metadata DB，脚本不会从本地 workdir 自动推断外置数据库路径。
+> `.advdecompress_work/metadata.backend.json` 是强制存在的 backend marker，只记录 backend 类型、mode、schema version、数据库实例 ID / 指纹等校验信息，不记录外置数据库路径。
+> `dataset_manifest.json` / `txn.json` 仅保留为兼容 / 调试产物；恢复、状态分类、回放与 archive 状态决策都以 SQLite 元数据为准。
 > 默认不会在仍有可恢复 / 可重试状态时清掉该目录；是否删除整个 `.advdecompress_work/` 取决于数据集终态后的 `-scj` / `-fcj`，旧 journal 则按 `--keep-journal-days` 在不影响恢复时回收。
-> 若 `.advdecompress_work/` 已存在但缺少 `dataset_manifest.json`，该状态也视为不兼容且不可恢复，需先删除整个 `.advdecompress_work/` 后再重新开始。
 
 ## 事务模式说明（默认）
 
 * 默认使用事务化流程；`--legacy` 才会切回旧版非事务化流程。
-* 首次运行会把本轮待处理归档列表、顺序与关键参数写入 `.advdecompress_work/dataset_manifest.json`，并把事务回放所需的版本化元数据写入各事务自己的 `txn.json`。
-* 之后恢复遵循**严格数据集恢复**：只继续 manifest 中已有的归档，不会在恢复时重新发现并纳入后来新增的归档；如需把后来新增的归档也纳入处理，请删除 `.advdecompress_work/` 后重新开始新一轮运行。
+* 首次运行会建立 SQLite metadata backend，并把当前数据集、archive 顺序、archive 状态与事务回放所需的持久化元数据写入 SQLite；本地模式默认使用 `.advdecompress_work/metadata.sqlite`。
+* 之后恢复遵循**严格数据集恢复**：只继续 SQLite 元数据中已有的归档，不会在恢复时重新发现并纳入后来新增的归档；如需把后来新增的归档也纳入处理，请删除 `.advdecompress_work/` 后重新开始新一轮运行。
 * 能直接续跑完成的归档会继续完成，不会重新解压；必须重试的归档只重跑对应单个归档。
-* 若命令指纹不一致，或 manifest 记录的归档缺失、大小变化、时间戳变化等，脚本会拒绝恢复，并明确提示先删除 `.advdecompress_work/` 后再重新开始。
-* 旧的 `.advdecompress_work/` 与当前事务协议不兼容；恢复若发现缺少或不支持当前 schema version 的 manifest / txn 元数据，会拒绝继续，并要求先删除该目录后再重试。
+* 若命令指纹不一致，或 SQLite 元数据记录的归档缺失、大小变化、时间戳变化等，脚本会拒绝恢复，并明确提示先删除 `.advdecompress_work/` 后再重新开始。
+* 旧的仅含 `dataset_manifest.json` / `txn.json` 的 JSON 型事务工作目录与当前 SQLite 协议不兼容；恢复会拒绝继续，并要求先删除 `.advdecompress_work/` 后再重试。
 * 单个事务一旦成功落位并通过 durability barrier，就会立刻执行该事务自己的成功后处理（例如 `-sp delete` / `-sp move`）；不是 extract 成功后立刻处理源归档，也不再等待整批归档都提取完成。
 * 会变更源归档的事务化后处理（如 `-sp delete` / `-sp move` / `-fp move` / `-tzp move`）只有在事务 journal 与已落位输出都通过 durability barrier 后才会执行；因此不能与 `--no-durability` 或 `--fsync-files none` 同用。
-* 同一 `output_dir` 的事务仍通过 `output_dir.lock` 串行落位，并按 manifest 里的 discovered order 提交；多线程只影响提取并发，不会改变同目录内的命名/冲突处理顺序。
-* 启用 `--degrade-cross-volume` 时，事务模式下的跨卷落位与源归档收尾都会按 `txn.json` 记录的阶段逐步回放，而不是退回到不可回放的 opaque move fallback。
+* 同一 `output_dir` 的事务仍通过 `output_dir.lock` 串行落位，并按 SQLite 中记录的 discovered order 提交；多线程只影响提取并发，不会改变同目录内的命名/冲突处理顺序。
+* 启用 `--degrade-cross-volume` 时，事务模式下的跨卷落位与源归档收尾都会按 SQLite 元数据记录的事务阶段逐步回放，而不是退回到不可回放的 opaque move fallback。
 * 多线程只保留受 orchestration window / `--threads` 约束的在途提取任务，不会先把整批归档都提取完再统一落位。
 * 因此磁盘峰值主要受并发度与同目录串行点影响，不再随着整批归档数量线性累积。
 * `--keep-journal-days` 只会回收已收敛到终态的旧 journal；仍可恢复 / 可重试的记录会保留，避免把恢复现场提前清掉。

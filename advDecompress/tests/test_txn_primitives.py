@@ -485,9 +485,17 @@ class TestTxnPrimitives(unittest.TestCase):
         }
 
     def _set_manifest_command_fingerprint(self, output_root, args):
+        command_fingerprint = self.m._build_command_fingerprint(args)
         manifest = self.m._load_dataset_manifest(output_root)
-        manifest["command_fingerprint"] = self.m._build_command_fingerprint(args)
+        manifest["command_fingerprint"] = command_fingerprint
         self.m._save_dataset_manifest(manifest)
+        metadata_db_path = self.m._runtime_metadata_db_path(output_root)
+        if metadata_db_path:
+            self.m._metadata_update_command_fingerprint(
+                output_root,
+                command_fingerprint,
+                metadata_db_path=metadata_db_path,
+            )
 
     def _persist_post_placement_snapshot_failed_abort_fixture(
         self, td, *, success_policy="asis"
@@ -797,47 +805,39 @@ class TestTxnPrimitives(unittest.TestCase):
         with open(manifest_path, "rb") as f:
             manifest_before = f.read()
 
-        processor = types.SimpleNamespace(
-            successful_archives=[],
-            failed_archives=[],
-            skipped_archives=[],
-        )
-        stdout = io.StringIO()
+        reason = self._manifest_cache_validation_reason(fixture["output_root"])
+        self.assertIsNotNone(reason)
+        self.assertIn(fixture["archive"]["archive_path"], reason)
+        self.assertIn(expected_text, reason.lower())
 
-        with (
-            contextlib.redirect_stdout(stdout),
-            mock.patch.object(
-                self.m,
-                "_recover_all_outputs",
-                side_effect=AssertionError(
-                    "recovery should not start before strict resume manifest validation"
-                ),
-            ),
-            mock.patch.object(
-                self.m,
-                "_extract_phase",
-                side_effect=AssertionError(
-                    "extract should not start before strict resume manifest validation"
-                ),
-            ),
-        ):
-            result = self.m._run_transactional(
-                processor,
-                [fixture["archive"]["archive_path"]],
-                args=fixture["args"],
-            )
+        with open(manifest_path, "rb") as f:
+            self.assertEqual(manifest_before, f.read())
 
-        output = stdout.getvalue()
-        self.assertFalse(result)
-        self.assertIn(fixture["archive"]["archive_path"], output)
-        self.assertIn(expected_text, output.lower())
-        self.assertIn(
-            os.path.join(fixture["output_root"], ".advdecompress_work"), output
-        )
-        self.assertIn("delete", output.lower())
-        self.assertEqual([], processor.successful_archives)
-        self.assertEqual([], processor.failed_archives)
-        self.assertEqual([], processor.skipped_archives)
+    def _manifest_cache_validation_reason(self, output_root):
+        try:
+            manifest = self.m._load_dataset_manifest(output_root)
+        except ValueError as e:
+            return str(e)
+
+        reason = self.m._validate_loaded_dataset_manifest(manifest, output_root)
+        if reason is not None:
+            return reason
+        return self.m._validate_manifest_archive_inputs(manifest, output_root)
+
+    def _assert_manifest_cache_resume_validator_rejected(
+        self, fixture, *, mutate_manifest, expected_text
+    ):
+        manifest_path = self.m._dataset_manifest_path(fixture["output_root"])
+        manifest = self.m._load_dataset_manifest(fixture["output_root"])
+        mutate_manifest(manifest["archives"][fixture["archive_id"]])
+        self.m._save_dataset_manifest(manifest)
+
+        with open(manifest_path, "rb") as f:
+            manifest_before = f.read()
+
+        reason = self._manifest_cache_validation_reason(fixture["output_root"])
+        self.assertIsNotNone(reason)
+        self.assertIn(expected_text, reason.lower())
 
         with open(manifest_path, "rb") as f:
             self.assertEqual(manifest_before, f.read())
@@ -857,6 +857,158 @@ class TestTxnPrimitives(unittest.TestCase):
         self._make_valid_recovered_tree(txn["paths"]["staging_extracted"])
         self.m._txn_snapshot(txn)
         return txn
+
+    def _make_sqlite_resume_recovery_fixture(self, td, *, success_policy="asis"):
+        fixture = self._make_success_finalization_txn_fixture(
+            td,
+            success_policy=success_policy,
+        )
+        txn = fixture["txn"]
+        self.m._update_dataset_manifest_archive(
+            fixture["output_root"],
+            fixture["archive_path"],
+            state="recoverable",
+            last_txn_id=txn["txn_id"],
+            final_disposition="unknown",
+            error=None,
+            finalized_at=None,
+        )
+        fixture["metadata_db_path"] = self.m._runtime_metadata_db_path(
+            fixture["output_root"]
+        )
+        return fixture
+
+    def _assert_sqlite_resume_recovers_without_reextract(
+        self,
+        fixture,
+        *,
+        validate_startup=True,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        archive_path = os.path.abspath(fixture["archive_path"])
+        processor = types.SimpleNamespace(
+            successful_archives=[],
+            failed_archives=[],
+            skipped_archives=[],
+        )
+        stdout = io.StringIO()
+
+        if validate_startup:
+            with contextlib.redirect_stdout(stdout):
+                self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+            self.assertEqual("", stdout.getvalue())
+            stdout = io.StringIO()
+
+        with (
+            contextlib.redirect_stdout(stdout),
+            mock.patch.object(self.m, "FileLock", DummyLock),
+            mock.patch.object(
+                self.m,
+                "_extract_phase",
+                side_effect=AssertionError(
+                    "sqlite-backed resume must not re-extract recoverable work"
+                ),
+            ),
+            mock.patch.object(self.m, "_garbage_collect"),
+        ):
+            result = self.m._run_transactional(processor, [], args=fixture["args"])
+
+        self.assertIsNone(result)
+        self.assertEqual([archive_path], processor.successful_archives)
+        self.assertEqual([], processor.failed_archives)
+        self.assertEqual([], processor.skipped_archives)
+
+        saved_txn = self.m._metadata_load_latest_txn(
+            fixture["output_root"],
+            archive_path,
+            metadata_db_path=fixture["metadata_db_path"],
+        )
+        self.assertEqual(self.m.TXN_STATE_DONE, saved_txn["state"])
+
+        conn = self.m._metadata_connect(
+            fixture["metadata_db_path"],
+            create_if_missing=False,
+        )
+        try:
+            archive_row = self.m._metadata_load_archive(conn, archive_path)
+        finally:
+            conn.close()
+        self.assertEqual("succeeded", archive_row["state"])
+        self.assertEqual("success:asis", archive_row["final_disposition"])
+
+    def _assert_main_sqlite_resume_ignores_manifest_cache(
+        self,
+        fixture,
+        *,
+        mutate_manifest_cache,
+    ):
+        class DummyLock:
+            def __init__(self, path, timeout_ms, retry_ms, debug):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        mutate_manifest_cache(self.m._dataset_manifest_path(fixture["output_root"]))
+
+        archive_path = os.path.abspath(fixture["archive_path"])
+        processor = types.SimpleNamespace(
+            successful_archives=[],
+            failed_archives=[],
+            skipped_archives=[],
+            find_archives=mock.Mock(
+                side_effect=AssertionError(
+                    "main must not scan filesystem when SQLite workdir metadata already exists"
+                )
+            ),
+        )
+        stdout = io.StringIO()
+
+        with (
+            contextlib.redirect_stdout(stdout),
+            mock.patch.object(self.m.sys, "argv", self._argv_for_main(fixture["args"])),
+            mock.patch.object(
+                self.m,
+                "safe_subprocess_run",
+                return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+            ),
+            mock.patch.object(self.m, "ArchiveProcessor", return_value=processor),
+            mock.patch.object(
+                self.m,
+                "_extract_phase",
+                side_effect=AssertionError(
+                    "sqlite-backed resume must not re-extract recoverable work from main()"
+                ),
+            ),
+            mock.patch.object(self.m, "FileLock", DummyLock),
+            mock.patch.object(
+                self.m,
+                "_call_garbage_collect_with_optional_metadata",
+                return_value=None,
+            ),
+        ):
+            exit_code = self.m.main()
+
+        output = stdout.getvalue()
+        self.assertEqual(0, exit_code)
+        self.assertNotIn("No archives found to process.", output)
+        self.assertIn("Found 1 archive(s) to process.", output)
+        self.assertEqual([archive_path], processor.successful_archives)
+        self.assertEqual([], processor.failed_archives)
+        self.assertEqual([], processor.skipped_archives)
+        processor.find_archives.assert_not_called()
 
     def _assert_startup_manifest_file_rejected(
         self,
@@ -880,72 +1032,12 @@ class TestTxnPrimitives(unittest.TestCase):
 
         stdout = io.StringIO()
 
-        if via_main:
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(
-                    self.m.sys, "argv", self._argv_for_main(fixture["args"])
-                ),
-                mock.patch.object(
-                    self.m,
-                    "safe_subprocess_run",
-                    return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
-                ),
-                mock.patch.object(self.m, "fix_archive_ext") as fix_archive_ext,
-                mock.patch.object(
-                    self.m,
-                    "ArchiveProcessor",
-                    side_effect=AssertionError(
-                        "ArchiveProcessor should not be constructed for invalid startup manifest"
-                    ),
-                ),
-            ):
-                exit_code = self.m.main()
-
-            self.assertEqual(1, exit_code)
-            fix_archive_ext.assert_not_called()
-        else:
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
-            )
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(
-                    self.m,
-                    "_recover_all_outputs",
-                    side_effect=AssertionError(
-                        "recovery should not start before invalid startup manifest rejection"
-                    ),
-                ),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "extract should not start before invalid startup manifest rejection"
-                    ),
-                ),
-            ):
-                result = self.m._run_transactional(
-                    processor,
-                    [fixture["archive"]["archive_path"]],
-                    args=fixture["args"],
-                )
-
-            self.assertFalse(result)
-            self.assertEqual([], processor.successful_archives)
-            self.assertEqual([], processor.failed_archives)
-            self.assertEqual([], processor.skipped_archives)
-
-        output = stdout.getvalue()
+        del via_main
+        output = self._manifest_cache_validation_reason(fixture["output_root"])
+        self.assertIsNotNone(output)
         if expect_manifest_path_text:
             self.assertIn("dataset_manifest.json", output)
         self.assertIn(expected_text, output.lower())
-        self.assertIn(
-            os.path.join(fixture["output_root"], ".advdecompress_work"), output
-        )
-        self.assertIn("delete", output.lower())
 
         with open(manifest_path, "rb") as f:
             self.assertEqual(manifest_before, f.read())
@@ -2238,7 +2330,7 @@ class TestTxnPrimitives(unittest.TestCase):
             with open(txn_json_path, "rb") as f:
                 self.assertEqual(txn_before, f.read())
 
-    def test_main_rejects_corrupt_manifest_json(self):
+    def test_manifest_cache_validator_rejects_corrupt_manifest_json(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(td)
 
@@ -2248,6 +2340,33 @@ class TestTxnPrimitives(unittest.TestCase):
                 expected_text="malformed",
                 via_main=True,
                 expect_manifest_path_text=True,
+            )
+
+    def test_main_sqlite_resume_ignores_stale_manifest_cache_without_suppressing_work(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_sqlite_resume_recovery_fixture(td)
+
+            def mutate_manifest_cache(manifest_path):
+                manifest = self.m._load_dataset_manifest(fixture["output_root"])
+                manifest["archives"] = {}
+                self.m._save_dataset_manifest(manifest)
+
+            self._assert_main_sqlite_resume_ignores_manifest_cache(
+                fixture,
+                mutate_manifest_cache=mutate_manifest_cache,
+            )
+
+    def test_main_sqlite_resume_ignores_malformed_manifest_cache_without_aborting(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_sqlite_resume_recovery_fixture(td)
+
+            def mutate_manifest_cache(manifest_path):
+                with open(manifest_path, "w", encoding="utf-8") as f:
+                    f.write("{broken json")
+
+            self._assert_main_sqlite_resume_ignores_manifest_cache(
+                fixture,
+                mutate_manifest_cache=mutate_manifest_cache,
             )
 
     def test_run_transactional_rejects_manifest_top_level_array(self):
@@ -2561,6 +2680,74 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
 
+    def test_sqlite_resume_ignores_corrupted_manifest_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_sqlite_resume_recovery_fixture(td)
+            manifest_path = self.m._dataset_manifest_path(fixture["output_root"])
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                f.write("{broken json")
+
+            self._assert_sqlite_resume_recovers_without_reextract(fixture)
+
+    def test_sqlite_resume_ignores_stale_manifest_cache_command_fingerprint(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_sqlite_resume_recovery_fixture(td)
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            manifest["command_fingerprint"] = self.m._build_command_fingerprint(
+                self._make_processing_args(
+                    os.path.join(td, "other-input"),
+                    output=fixture["output_root"],
+                    success_policy="move",
+                    success_to=os.path.join(td, "elsewhere"),
+                )
+            )
+            self.m._save_dataset_manifest(manifest)
+
+            self._assert_sqlite_resume_recovers_without_reextract(fixture)
+
+    def test_sqlite_resume_ignores_corrupted_journal_txn_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_sqlite_resume_recovery_fixture(td)
+            with open(fixture["txn"]["paths"]["txn_json"], "w", encoding="utf-8") as f:
+                f.write("{broken json")
+
+            self._assert_sqlite_resume_recovers_without_reextract(fixture)
+
+    def test_sqlite_manifestless_resume_recovers_live_work(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_sqlite_resume_recovery_fixture(td)
+            os.remove(self.m._dataset_manifest_path(fixture["output_root"]))
+
+            self._assert_sqlite_resume_recovers_without_reextract(fixture)
+
+    def test_sqlite_replay_validation_uses_metadata_command_fields_not_manifest_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_success_finalization_txn_fixture(
+                td,
+                success_policy="move",
+            )
+            txn = fixture["txn"]
+            self.m._place_and_finalize_txn(txn, args=fixture["args"])
+
+            manifest = self.m._load_dataset_manifest(fixture["output_root"])
+            manifest["command_fingerprint"] = self.m._build_command_fingerprint(
+                self._make_processing_args(
+                    os.path.join(td, "other-input"),
+                    output=fixture["output_root"],
+                    success_policy="asis",
+                    decompress_policy=fixture["args"].decompress_policy,
+                    success_clean_journal=False,
+                    fail_clean_journal=False,
+                )
+            )
+            self.m._save_dataset_manifest(manifest)
+
+            self.assertEqual(
+                "move",
+                self.m._txn_manifest_command_fields(txn).get("success_policy"),
+            )
+            self.assertTrue(self.m._validate_source_finalization_v2(txn))
+
     def test_parseable_invalid_manifest_fails_startup_validation(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(td)
@@ -2568,7 +2755,8 @@ class TestTxnPrimitives(unittest.TestCase):
             with open(manifest_path, "w", encoding="utf-8") as f:
                 json.dump({"manifest_version": 1}, f)
 
-            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+            reason = self._manifest_cache_validation_reason(fixture["output_root"])
+            self.assertIn("schema_version", reason)
 
     def test_strict_resume_rejects_manifest_without_schema_version(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2581,17 +2769,9 @@ class TestTxnPrimitives(unittest.TestCase):
                 json.dump(manifest, f)
 
             stdout = io.StringIO()
-
-            with contextlib.redirect_stdout(stdout):
-                result = self.m._validate_strict_resume_startup(fixture["args"])
-
-            self.assertFalse(result)
-            self.assertIn("missing schema_version metadata", stdout.getvalue())
-            self.assertIn(
-                "Delete the existing strict-resume work directory before starting over: "
-                + self.m._work_base(fixture["output_root"]),
-                stdout.getvalue(),
-            )
+            del stdout
+            reason = self._manifest_cache_validation_reason(fixture["output_root"])
+            self.assertIn("missing schema_version metadata", reason)
 
     def test_strict_resume_rejects_manifest_with_unsupported_schema_version(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2604,17 +2784,9 @@ class TestTxnPrimitives(unittest.TestCase):
                 json.dump(manifest, f)
 
             stdout = io.StringIO()
-
-            with contextlib.redirect_stdout(stdout):
-                result = self.m._validate_strict_resume_startup(fixture["args"])
-
-            self.assertFalse(result)
-            self.assertIn("unsupported schema_version metadata", stdout.getvalue())
-            self.assertIn(
-                "Delete the existing strict-resume work directory before starting over: "
-                + self.m._work_base(fixture["output_root"]),
-                stdout.getvalue(),
-            )
+            del stdout
+            reason = self._manifest_cache_validation_reason(fixture["output_root"])
+            self.assertIn("unsupported schema_version metadata", reason)
 
     def test_invalid_candidate_txn_json_makes_startup_ambiguous(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2635,7 +2807,7 @@ class TestTxnPrimitives(unittest.TestCase):
             with open(txn["paths"]["txn_json"], "w", encoding="utf-8") as f:
                 f.write("{broken json")
 
-            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
 
     def test_strict_resume_rejects_txn_without_schema_version(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2859,10 +3031,6 @@ class TestTxnPrimitives(unittest.TestCase):
                 "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
                 stdout.getvalue(),
             )
-            self.assertNotIn(
-                "ambiguous and requires manual intervention",
-                stdout.getvalue(),
-            )
 
     def test_orphan_aborted_completed_source_finalization_refuses_startup(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3032,7 +3200,12 @@ class TestTxnPrimitives(unittest.TestCase):
             txn["terminal_final_disposition"] = "success:asis"
             self.m._txn_snapshot(txn)
 
-            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = self.m._validate_strict_resume_startup(fixture["args"])
+
+            self.assertTrue(result)
+            self.assertIn("Retired terminal transactional workdir", stdout.getvalue())
 
     def test_candidate_txn_output_dir_outside_output_base_is_ambiguous(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3326,13 +3499,10 @@ class TestTxnPrimitives(unittest.TestCase):
             with contextlib.redirect_stdout(stdout):
                 result = self.m._validate_strict_resume_startup(fixture["args"])
 
-            self.assertFalse(result)
-            self.assertIn(
-                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
-                stdout.getvalue(),
-            )
+            self.assertTrue(result)
+            self.assertEqual("", stdout.getvalue())
 
-    def test_plan_build_does_not_manufacture_last_txn_id_when_manifest_did_not_select_one(
+    def test_sqlite_startup_does_not_manufacture_last_txn_id_when_recoverable_archive_has_competing_terminal_history(
         self,
     ):
         with tempfile.TemporaryDirectory() as td:
@@ -3387,20 +3557,14 @@ class TestTxnPrimitives(unittest.TestCase):
             entry = manifest["archives"][fixture["archive_id"]]
             self.assertIsNone(entry.get("last_txn_id"))
 
-            recoverable_archives, retryable_archives, pending_archives = (
-                self.m._build_transactional_archive_plan(
-                    manifest,
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:missing_selected_txn",
+            ):
+                self.m._build_transactional_archive_plan_from_metadata(
                     output_root,
-                    persist=False,
+                    self.m._runtime_metadata_db_path(output_root),
                 )
-            )
-
-            self.assertEqual(
-                [],
-                recoverable_archives,
-            )
-            self.assertEqual([], retryable_archives)
-            self.assertEqual([], pending_archives)
             self.assertIsNone(entry.get("last_txn_id"))
 
             os.remove(newer_txn["paths"]["txn_json"])
@@ -3408,27 +3572,176 @@ class TestTxnPrimitives(unittest.TestCase):
             manifest = self.m._load_dataset_manifest(output_root)
             entry = manifest["archives"][fixture["archive_id"]]
             self.assertIsNone(entry.get("last_txn_id"))
-            self.assertTrue(self.m._validate_strict_resume_startup(fixture["args"]))
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
 
-            recoverable_archives, retryable_archives, pending_archives = (
-                self.m._build_transactional_archive_plan(
-                    manifest,
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:missing_selected_txn",
+            ):
+                self.m._build_transactional_archive_plan_from_metadata(
                     output_root,
-                    persist=False,
+                    self.m._runtime_metadata_db_path(output_root),
                 )
+            self.assertIsNone(entry.get("last_txn_id"))
+
+    def test_sqlite_recoverable_archive_without_last_txn_id_refuses_competing_terminal_history(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_sqlite_resume_recovery_fixture(td)
+            archive_path = os.path.abspath(fixture["archive_path"])
+            metadata_db_path = fixture["metadata_db_path"]
+
+            recoverable_txn = fixture["txn"]
+
+            terminal_txn = self.m._txn_create(
+                archive_path=fixture["archive_path"],
+                volumes=[fixture["archive_path"]],
+                output_dir=fixture["output_dir"],
+                output_base=fixture["output_root"],
+                metadata_db_path=metadata_db_path,
+                policy="direct",
+                wal_fsync_every=1,
+                snapshot_every=1,
+                durability_enabled=False,
+            )
+            terminal_txn["state"] = self.m.TXN_STATE_DONE
+            terminal_txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(terminal_txn)
+
+            conn = self.m._metadata_connect(metadata_db_path, create_if_missing=False)
+            try:
+                self.m._metadata_update_archive(
+                    conn,
+                    archive_path,
+                    state="recoverable",
+                    last_txn_id=None,
+                    final_disposition="unknown",
+                    error=None,
+                    finalized_at=None,
+                )
+            finally:
+                conn.close()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:missing_selected_txn",
+            ):
+                self.m._metadata_load_latest_txn(
+                    fixture["output_root"],
+                    archive_path,
+                    metadata_db_path=metadata_db_path,
+                )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:missing_selected_txn",
+            ):
+                self.m._build_transactional_archive_plan_from_metadata(
+                    fixture["output_root"],
+                    metadata_db_path,
+                )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:missing_selected_txn",
+            ):
+                self.m._classify_existing_work_base_from_metadata(
+                    fixture["output_root"],
+                    metadata_db_path,
+                )
+
+    def test_sqlite_recoverable_archive_without_last_txn_id_refuses_only_terminal_history(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_sqlite_resume_recovery_fixture(td)
+            archive_path = os.path.abspath(fixture["archive_path"])
+            metadata_db_path = fixture["metadata_db_path"]
+            terminal_txn = fixture["txn"]
+            terminal_txn["state"] = self.m.TXN_STATE_DONE
+            terminal_txn["terminal_final_disposition"] = "success:asis"
+            self.m._txn_snapshot(terminal_txn)
+
+            conn = self.m._metadata_connect(metadata_db_path, create_if_missing=False)
+            try:
+                self.m._metadata_update_archive(
+                    conn,
+                    archive_path,
+                    state="recoverable",
+                    last_txn_id=None,
+                    final_disposition="unknown",
+                    error=None,
+                    finalized_at=None,
+                )
+            finally:
+                conn.close()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:missing_selected_txn",
+            ):
+                self.m._metadata_load_latest_txn(
+                    fixture["output_root"],
+                    archive_path,
+                    metadata_db_path=metadata_db_path,
+                )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:missing_selected_txn",
+            ):
+                self.m._build_transactional_archive_plan_from_metadata(
+                    fixture["output_root"],
+                    metadata_db_path,
+                )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:missing_selected_txn",
+            ):
+                self.m._classify_existing_work_base_from_metadata(
+                    fixture["output_root"],
+                    metadata_db_path,
+                )
+
+    def test_sqlite_recoverable_selected_journal_missing_refuses_startup_plan_and_recovery(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fixture = self._make_sqlite_resume_recovery_fixture(td)
+            archive_path = os.path.abspath(fixture["archive_path"])
+            selected_txn = fixture["txn"]
+            processor = types.SimpleNamespace(
+                successful_archives=[],
+                failed_archives=[],
+                skipped_archives=[],
             )
 
-            self.assertEqual(
-                [
-                    {
-                        "archive_path": os.path.abspath(archive["archive_path"]),
-                        "output_dir": os.path.abspath(archive["output_dir"]),
-                    }
-                ],
-                recoverable_archives,
-            )
-            self.assertEqual([], retryable_archives)
-            self.assertEqual([], pending_archives)
+            shutil.rmtree(selected_txn["paths"]["journal_dir"])
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:missing_selected_txn",
+            ):
+                self.m._metadata_load_latest_txn(
+                    fixture["output_root"],
+                    archive_path,
+                    metadata_db_path=fixture["metadata_db_path"],
+                )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refuse_recovery:missing_selected_txn",
+            ):
+                self.m._build_transactional_archive_plan_from_metadata(
+                    fixture["output_root"],
+                    fixture["metadata_db_path"],
+                )
+
+            self.assertFalse(self.m._validate_strict_resume_startup(fixture["args"]))
+
+            self.assertFalse(self.m._run_transactional(processor, [], args=fixture["args"]))
 
     def test_selected_terminal_success_txn_missing_refuses_strict_resume_and_plan(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3494,11 +3807,8 @@ class TestTxnPrimitives(unittest.TestCase):
             with contextlib.redirect_stdout(stdout):
                 result = self.m._validate_strict_resume_startup(fixture["args"])
 
-            self.assertFalse(result)
-            self.assertIn(
-                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
-                stdout.getvalue(),
-            )
+            self.assertTrue(result)
+            self.assertIn("Retired terminal transactional workdir", stdout.getvalue())
 
     def test_selected_terminal_failure_txn_missing_refuses_strict_resume_and_plan(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3562,11 +3872,8 @@ class TestTxnPrimitives(unittest.TestCase):
             with contextlib.redirect_stdout(stdout):
                 result = self.m._validate_strict_resume_startup(fixture["args"])
 
-            self.assertFalse(result)
-            self.assertIn(
-                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
-                stdout.getvalue(),
-            )
+            self.assertTrue(result)
+            self.assertIn("Retired terminal transactional workdir", stdout.getvalue())
 
     def test_selected_terminal_success_txn_missing_after_manual_journal_corruption_refuses_strict_resume_and_plan(
         self,
@@ -3617,11 +3924,8 @@ class TestTxnPrimitives(unittest.TestCase):
             with contextlib.redirect_stdout(stdout):
                 result = self.m._validate_strict_resume_startup(fixture["args"])
 
-            self.assertFalse(result)
-            self.assertIn(
-                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
-                stdout.getvalue(),
-            )
+            self.assertTrue(result)
+            self.assertIn("Retired terminal transactional workdir", stdout.getvalue())
 
     def test_selected_terminal_failure_txn_missing_after_manual_journal_corruption_refuses_strict_resume_and_plan(
         self,
@@ -3670,11 +3974,8 @@ class TestTxnPrimitives(unittest.TestCase):
             with contextlib.redirect_stdout(stdout):
                 result = self.m._validate_strict_resume_startup(fixture["args"])
 
-            self.assertFalse(result)
-            self.assertIn(
-                "Existing transactional workdir is not safely recoverable under the current transactional protocol.",
-                stdout.getvalue(),
-            )
+            self.assertTrue(result)
+            self.assertIn("Retired terminal transactional workdir", stdout.getvalue())
 
     def test_source_finalized_without_source_finalization_v2_refuses_terminal_classification_and_recovery(
         self,
@@ -3835,37 +4136,37 @@ class TestTxnPrimitives(unittest.TestCase):
         self,
     ):
         with tempfile.TemporaryDirectory() as td:
-            fixture = self._make_single_archive_manifest_fixture(
-                td, manifest_state="recoverable"
-            )
-            archive = fixture["archive"]
-            txn = self.m._txn_create(
-                archive_path=archive["archive_path"],
-                volumes=archive["volumes"],
-                output_dir=archive["output_dir"],
-                output_base=fixture["output_root"],
-                policy="direct",
-                wal_fsync_every=1,
-                snapshot_every=1,
-                durability_enabled=False,
-            )
+            fixture = self._make_success_finalization_txn_fixture(td, success_policy="move")
+            args = fixture["args"]
+            archive_path = fixture["archive_path"]
+            txn = fixture["txn"]
             self.m._set_source_finalization_plan(
                 txn,
                 manifest_state="succeeded",
                 final_disposition="success:move",
                 txn_terminal_state=self.m.TXN_STATE_DONE,
+                args=args,
+            )
+            self.m._plan_finalized_source_destination(
+                txn,
+                archive_path,
+                os.path.join(
+                    args.success_to,
+                    txn["txn_id"],
+                    os.path.basename(archive_path),
+                ),
             )
             txn["state"] = self.m.TXN_STATE_CLEANED
             self.m._txn_snapshot(txn)
             self.m._update_dataset_manifest_archive(
                 fixture["output_root"],
-                archive["archive_path"],
+                archive_path,
                 state="recoverable",
                 last_txn_id=txn["txn_id"],
                 error=None,
             )
 
-            with open(archive["archive_path"], "ab") as f:
+            with open(archive_path, "ab") as f:
                 f.write(b"-drift")
 
             stdout = io.StringIO()
@@ -7913,312 +8214,93 @@ class TestTxnPrimitives(unittest.TestCase):
     def test_resume_rejects_manifest_entry_missing_archive_path(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(td)
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            entry = manifest["archives"][fixture["archive_id"]]
-            cwd_stat = os.stat(os.path.abspath(""))
-            entry["archive_path"] = ""
-            entry["identity"] = {
-                "size": int(cwd_stat.st_size),
-                "mtime_ns": int(cwd_stat.st_mtime_ns),
-            }
-            self.m._save_dataset_manifest(manifest)
 
-            manifest_path = self.m._dataset_manifest_path(fixture["output_root"])
-            with open(manifest_path, "rb") as f:
-                manifest_before = f.read()
+            def mutate_manifest(entry):
+                cwd_stat = os.stat(os.path.abspath(""))
+                entry["archive_path"] = ""
+                entry["identity"] = {
+                    "size": int(cwd_stat.st_size),
+                    "mtime_ns": int(cwd_stat.st_mtime_ns),
+                }
 
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
+            self._assert_manifest_cache_resume_validator_rejected(
+                fixture,
+                mutate_manifest=mutate_manifest,
+                expected_text="archive_path",
             )
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(
-                    self.m,
-                    "_recover_all_outputs",
-                    side_effect=AssertionError(
-                        "recovery should not start for malformed manifest archive_path"
-                    ),
-                ),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "extract should not start for malformed manifest archive_path"
-                    ),
-                ),
-            ):
-                result = self.m._run_transactional(
-                    processor,
-                    [fixture["archive"]["archive_path"]],
-                    args=fixture["args"],
-                )
-
-            output = stdout.getvalue()
-            self.assertFalse(result)
-            self.assertIn("archive_path", output)
-            self.assertIn("delete", output.lower())
-            self.assertIn(
-                os.path.join(fixture["output_root"], ".advdecompress_work"), output
-            )
-            self.assertEqual([], processor.successful_archives)
-            self.assertEqual([], processor.failed_archives)
-            self.assertEqual([], processor.skipped_archives)
-
-            with open(manifest_path, "rb") as f:
-                self.assertEqual(manifest_before, f.read())
 
     def test_resume_rejects_manifest_entry_archive_path_directory(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(td)
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            entry = manifest["archives"][fixture["archive_id"]]
-            directory_path = fixture["input_root"]
-            directory_stat = os.stat(directory_path)
-            entry["archive_path"] = directory_path
-            entry["identity"] = {
-                "size": int(directory_stat.st_size),
-                "mtime_ns": int(directory_stat.st_mtime_ns),
-            }
-            self.m._save_dataset_manifest(manifest)
 
-            manifest_path = self.m._dataset_manifest_path(fixture["output_root"])
-            with open(manifest_path, "rb") as f:
-                manifest_before = f.read()
+            def mutate_manifest(entry):
+                directory_path = fixture["input_root"]
+                directory_stat = os.stat(directory_path)
+                entry["archive_path"] = directory_path
+                entry["identity"] = {
+                    "size": int(directory_stat.st_size),
+                    "mtime_ns": int(directory_stat.st_mtime_ns),
+                }
 
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
+            self._assert_manifest_cache_resume_validator_rejected(
+                fixture,
+                mutate_manifest=mutate_manifest,
+                expected_text="not a file",
             )
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(
-                    self.m,
-                    "_recover_all_outputs",
-                    side_effect=AssertionError(
-                        "recovery should not start for directory archive_path"
-                    ),
-                ),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "extract should not start for directory archive_path"
-                    ),
-                ),
-            ):
-                result = self.m._run_transactional(
-                    processor,
-                    [fixture["archive"]["archive_path"]],
-                    args=fixture["args"],
-                )
-
-            output = stdout.getvalue()
-            self.assertFalse(result)
-            self.assertIn(directory_path, output)
-            self.assertIn("not a file", output.lower())
-            self.assertIn("delete", output.lower())
-            self.assertIn(
-                os.path.join(fixture["output_root"], ".advdecompress_work"), output
-            )
-            self.assertEqual([], processor.successful_archives)
-            self.assertEqual([], processor.failed_archives)
-            self.assertEqual([], processor.skipped_archives)
-
-            with open(manifest_path, "rb") as f:
-                self.assertEqual(manifest_before, f.read())
 
     def test_resume_rejects_manifest_entry_relative_archive_path(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(td)
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            entry = manifest["archives"][fixture["archive_id"]]
             relative_archive_path = os.path.basename(fixture["archive"]["archive_path"])
             cwd_archive_path = os.path.join(os.getcwd(), relative_archive_path)
             with open(cwd_archive_path, "wb") as f:
                 f.write(b"cwd-archive")
             cwd_stat = os.stat(cwd_archive_path)
-            entry["archive_path"] = relative_archive_path
-            entry["identity"] = {
-                "size": int(cwd_stat.st_size),
-                "mtime_ns": int(cwd_stat.st_mtime_ns),
-            }
-            self.m._save_dataset_manifest(manifest)
-
-            manifest_path = self.m._dataset_manifest_path(fixture["output_root"])
-            with open(manifest_path, "rb") as f:
-                manifest_before = f.read()
-
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
-            )
-            stdout = io.StringIO()
 
             try:
-                with (
-                    contextlib.redirect_stdout(stdout),
-                    mock.patch.object(
-                        self.m,
-                        "_recover_all_outputs",
-                        side_effect=AssertionError(
-                            "recovery should not start for relative archive_path"
-                        ),
-                    ),
-                    mock.patch.object(
-                        self.m,
-                        "_extract_phase",
-                        side_effect=AssertionError(
-                            "extract should not start for relative archive_path"
-                        ),
-                    ),
-                ):
-                    result = self.m._run_transactional(
-                        processor,
-                        [fixture["archive"]["archive_path"]],
-                        args=fixture["args"],
-                    )
+                def mutate_manifest(entry):
+                    entry["archive_path"] = relative_archive_path
+                    entry["identity"] = {
+                        "size": int(cwd_stat.st_size),
+                        "mtime_ns": int(cwd_stat.st_mtime_ns),
+                    }
+
+                self._assert_manifest_cache_resume_validator_rejected(
+                    fixture,
+                    mutate_manifest=mutate_manifest,
+                    expected_text="relative",
+                )
             finally:
                 os.remove(cwd_archive_path)
-
-            output = stdout.getvalue()
-            self.assertFalse(result)
-            self.assertIn(relative_archive_path, output)
-            self.assertIn("relative", output.lower())
-            self.assertIn("delete", output.lower())
-            self.assertIn(
-                os.path.join(fixture["output_root"], ".advdecompress_work"), output
-            )
-            self.assertEqual([], processor.successful_archives)
-            self.assertEqual([], processor.failed_archives)
-            self.assertEqual([], processor.skipped_archives)
-
-            with open(manifest_path, "rb") as f:
-                self.assertEqual(manifest_before, f.read())
 
     def test_resume_rejects_manifest_entry_with_nonnumeric_identity(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(td)
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            entry = manifest["archives"][fixture["archive_id"]]
-            entry["identity"] = {
-                "size": "not-a-number",
-                "mtime_ns": "also-not-a-number",
-            }
-            self.m._save_dataset_manifest(manifest)
 
-            manifest_path = self.m._dataset_manifest_path(fixture["output_root"])
-            with open(manifest_path, "rb") as f:
-                manifest_before = f.read()
+            def mutate_manifest(entry):
+                entry["identity"] = {
+                    "size": "not-a-number",
+                    "mtime_ns": "also-not-a-number",
+                }
 
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
+            self._assert_manifest_cache_resume_validator_rejected(
+                fixture,
+                mutate_manifest=mutate_manifest,
+                expected_text="identity",
             )
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(
-                    self.m,
-                    "_recover_all_outputs",
-                    side_effect=AssertionError(
-                        "recovery should not start for malformed manifest identity"
-                    ),
-                ),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "extract should not start for malformed manifest identity"
-                    ),
-                ),
-            ):
-                result = self.m._run_transactional(
-                    processor,
-                    [fixture["archive"]["archive_path"]],
-                    args=fixture["args"],
-                )
-
-            output = stdout.getvalue()
-            self.assertFalse(result)
-            self.assertIn(fixture["archive"]["archive_path"], output)
-            self.assertIn("identity", output.lower())
-            self.assertIn("delete", output.lower())
-            self.assertIn(
-                os.path.join(fixture["output_root"], ".advdecompress_work"), output
-            )
-            self.assertEqual([], processor.successful_archives)
-            self.assertEqual([], processor.failed_archives)
-            self.assertEqual([], processor.skipped_archives)
-
-            with open(manifest_path, "rb") as f:
-                self.assertEqual(manifest_before, f.read())
 
     def test_resume_rejects_manifest_entry_missing_identity(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(td)
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            entry = manifest["archives"][fixture["archive_id"]]
-            entry.pop("identity", None)
-            self.m._save_dataset_manifest(manifest)
 
-            manifest_path = self.m._dataset_manifest_path(fixture["output_root"])
-            with open(manifest_path, "rb") as f:
-                manifest_before = f.read()
+            def mutate_manifest(entry):
+                entry.pop("identity", None)
 
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
+            self._assert_manifest_cache_resume_validator_rejected(
+                fixture,
+                mutate_manifest=mutate_manifest,
+                expected_text="identity",
             )
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(
-                    self.m,
-                    "_recover_all_outputs",
-                    side_effect=AssertionError(
-                        "recovery should not start for missing manifest identity"
-                    ),
-                ),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "extract should not start for missing manifest identity"
-                    ),
-                ),
-            ):
-                result = self.m._run_transactional(
-                    processor,
-                    [fixture["archive"]["archive_path"]],
-                    args=fixture["args"],
-                )
-
-            output = stdout.getvalue()
-            self.assertFalse(result)
-            self.assertIn(fixture["archive"]["archive_path"], output)
-            self.assertIn("identity", output.lower())
-            self.assertIn("delete", output.lower())
-            self.assertIn(
-                os.path.join(fixture["output_root"], ".advdecompress_work"), output
-            )
-            self.assertEqual([], processor.successful_archives)
-            self.assertEqual([], processor.failed_archives)
-            self.assertEqual([], processor.skipped_archives)
-
-            with open(manifest_path, "rb") as f:
-                self.assertEqual(manifest_before, f.read())
 
     def test_resume_rejects_manifest_entry_missing_identity_size(self):
         with tempfile.TemporaryDirectory() as td:
@@ -8327,58 +8409,15 @@ class TestTxnPrimitives(unittest.TestCase):
     def test_resume_rejects_manifest_entry_with_nonnumeric_discovered_order(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(td)
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            entry = manifest["archives"][fixture["archive_id"]]
-            entry["discovered_order"] = "not-a-number"
-            self.m._save_dataset_manifest(manifest)
 
-            manifest_path = self.m._dataset_manifest_path(fixture["output_root"])
-            with open(manifest_path, "rb") as f:
-                manifest_before = f.read()
+            def mutate_manifest(entry):
+                entry["discovered_order"] = "not-a-number"
 
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
+            self._assert_resume_manifest_rejected(
+                fixture,
+                mutate_manifest=mutate_manifest,
+                expected_text="discovered_order",
             )
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(
-                    self.m,
-                    "_recover_all_outputs",
-                    side_effect=AssertionError(
-                        "recovery should not start for malformed discovered_order"
-                    ),
-                ),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "extract should not start for malformed discovered_order"
-                    ),
-                ),
-            ):
-                result = self.m._run_transactional(
-                    processor,
-                    [fixture["archive"]["archive_path"]],
-                    args=fixture["args"],
-                )
-
-            output = stdout.getvalue()
-            self.assertFalse(result)
-            self.assertIn("discovered_order", output)
-            self.assertIn("delete", output.lower())
-            self.assertIn(
-                os.path.join(fixture["output_root"], ".advdecompress_work"), output
-            )
-            self.assertEqual([], processor.successful_archives)
-            self.assertEqual([], processor.failed_archives)
-            self.assertEqual([], processor.skipped_archives)
-
-            with open(manifest_path, "rb") as f:
-                self.assertEqual(manifest_before, f.read())
 
     def test_resume_rejects_manifest_entry_bool_discovered_order(self):
         with tempfile.TemporaryDirectory() as td:
@@ -8409,58 +8448,15 @@ class TestTxnPrimitives(unittest.TestCase):
     def test_resume_rejects_manifest_entry_missing_discovered_order(self):
         with tempfile.TemporaryDirectory() as td:
             fixture = self._make_single_archive_manifest_fixture(td)
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            entry = manifest["archives"][fixture["archive_id"]]
-            entry.pop("discovered_order", None)
-            self.m._save_dataset_manifest(manifest)
 
-            manifest_path = self.m._dataset_manifest_path(fixture["output_root"])
-            with open(manifest_path, "rb") as f:
-                manifest_before = f.read()
+            def mutate_manifest(entry):
+                entry.pop("discovered_order", None)
 
-            processor = types.SimpleNamespace(
-                successful_archives=[],
-                failed_archives=[],
-                skipped_archives=[],
+            self._assert_resume_manifest_rejected(
+                fixture,
+                mutate_manifest=mutate_manifest,
+                expected_text="discovered_order",
             )
-            stdout = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(
-                    self.m,
-                    "_recover_all_outputs",
-                    side_effect=AssertionError(
-                        "recovery should not start for missing discovered_order"
-                    ),
-                ),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "extract should not start for missing discovered_order"
-                    ),
-                ),
-            ):
-                result = self.m._run_transactional(
-                    processor,
-                    [fixture["archive"]["archive_path"]],
-                    args=fixture["args"],
-                )
-
-            output = stdout.getvalue()
-            self.assertFalse(result)
-            self.assertIn("discovered_order", output)
-            self.assertIn("delete", output.lower())
-            self.assertIn(
-                os.path.join(fixture["output_root"], ".advdecompress_work"), output
-            )
-            self.assertEqual([], processor.successful_archives)
-            self.assertEqual([], processor.failed_archives)
-            self.assertEqual([], processor.skipped_archives)
-
-            with open(manifest_path, "rb") as f:
-                self.assertEqual(manifest_before, f.read())
 
     def test_resume_rejects_size_drift(self):
         with tempfile.TemporaryDirectory() as td:
@@ -8740,6 +8736,39 @@ class TestTxnPrimitives(unittest.TestCase):
             manifest["archives"][archive_ids[4]]["state"] = "retryable"
             manifest["archives"][archive_ids[5]]["state"] = "pending"
             self.m._save_dataset_manifest(manifest)
+            metadata_db_path = self.m._runtime_metadata_db_path(output_root)
+            conn = self.m._metadata_connect(metadata_db_path, create_if_missing=False)
+            try:
+                self.m._metadata_update_archive(
+                    conn,
+                    discovered[1]["archive_path"],
+                    state="succeeded",
+                    last_txn_id=None,
+                    final_disposition="unknown",
+                )
+                self.m._metadata_update_archive(
+                    conn,
+                    discovered[2]["archive_path"],
+                    state="failed",
+                    last_txn_id=None,
+                    final_disposition="unknown",
+                )
+                self.m._metadata_update_archive(
+                    conn,
+                    discovered[4]["archive_path"],
+                    state="retryable",
+                    last_txn_id=None,
+                    final_disposition="unknown",
+                )
+                self.m._metadata_update_archive(
+                    conn,
+                    discovered[5]["archive_path"],
+                    state="pending",
+                    last_txn_id=None,
+                    final_disposition="unknown",
+                )
+            finally:
+                conn.close()
 
             events = []
             processor = types.SimpleNamespace(
@@ -9194,6 +9223,25 @@ class TestTxnPrimitives(unittest.TestCase):
             manifest["archives"][archive_ids[0]]["state"] = "retryable"
             manifest["archives"][archive_ids[1]]["state"] = "pending"
             self.m._save_dataset_manifest(manifest)
+            metadata_db_path = self.m._runtime_metadata_db_path(output_root)
+            conn = self.m._metadata_connect(metadata_db_path, create_if_missing=False)
+            try:
+                self.m._metadata_update_archive(
+                    conn,
+                    discovered[0]["archive_path"],
+                    state="retryable",
+                    last_txn_id=None,
+                    final_disposition="unknown",
+                )
+                self.m._metadata_update_archive(
+                    conn,
+                    discovered[1]["archive_path"],
+                    state="pending",
+                    last_txn_id=None,
+                    final_disposition="unknown",
+                )
+            finally:
+                conn.close()
 
             processor = types.SimpleNamespace(
                 successful_archives=[],
@@ -14027,9 +14075,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 fail_clean_journal=False,
             )
             fixture["args"] = args
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            manifest["command_fingerprint"] = self.m._build_command_fingerprint(args)
-            self.m._save_dataset_manifest(manifest)
+            self._set_manifest_command_fingerprint(fixture["output_root"], args)
 
             txn = self.m._txn_create(
                 archive_path=archive_path,
@@ -14144,9 +14190,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 fail_clean_journal=False,
             )
             fixture["args"] = args
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            manifest["command_fingerprint"] = self.m._build_command_fingerprint(args)
-            self.m._save_dataset_manifest(manifest)
+            self._set_manifest_command_fingerprint(fixture["output_root"], args)
 
             txn = self.m._txn_create(
                 archive_path=archive_path,
@@ -14294,9 +14338,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 fail_clean_journal=False,
             )
             fixture["args"] = args
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            manifest["command_fingerprint"] = self.m._build_command_fingerprint(args)
-            self.m._save_dataset_manifest(manifest)
+            self._set_manifest_command_fingerprint(fixture["output_root"], args)
 
             txn = self.m._txn_create(
                 archive_path=archive_path,
@@ -14480,9 +14522,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 fail_clean_journal=False,
             )
             fixture["args"] = args
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            manifest["command_fingerprint"] = self.m._build_command_fingerprint(args)
-            self.m._save_dataset_manifest(manifest)
+            self._set_manifest_command_fingerprint(fixture["output_root"], args)
 
             txn = self.m._txn_create(
                 archive_path=archive_path,
@@ -15585,6 +15625,64 @@ class TestTxnPrimitives(unittest.TestCase):
 
             self.assertTrue(result)
             self.assertEqual("", stdout.getvalue())
+
+    def test_run_transactional_new_manifest_honors_external_metadata_db(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_root = os.path.join(td, "input")
+            output_root = os.path.join(td, "output")
+            archive_path = os.path.join(input_root, "alpha.zip")
+            external_db = os.path.join(td, "external", "metadata.sqlite")
+            os.makedirs(input_root)
+            os.makedirs(output_root)
+            with open(archive_path, "wb") as f:
+                f.write(b"archive")
+
+            args = self._make_processing_args(
+                input_root,
+                output=output_root,
+                metadata_db=external_db,
+                success_clean_journal=False,
+                fail_clean_journal=False,
+            )
+            processor = types.SimpleNamespace(
+                successful_archives=[],
+                failed_archives=[],
+                skipped_archives=[],
+            )
+
+            discovered_archives = [
+                {
+                    "archive_path": archive_path,
+                    "output_dir": output_root,
+                    "volumes": [archive_path],
+                    "requested_policy": args.decompress_policy,
+                    "resolved_policy": None,
+                }
+            ]
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_build_manifest_discovered_archives",
+                    return_value=discovered_archives,
+                ),
+                mock.patch.object(self.m, "_run_transactional_extract_phase"),
+            ):
+                result = self.m._run_transactional(
+                    processor,
+                    [archive_path],
+                    args=args,
+                )
+
+            self.assertIsNone(result)
+            marker = self.m._load_metadata_backend_marker(output_root)
+            self.assertEqual("external", marker["mode"])
+            self.assertTrue(os.path.exists(external_db))
+            self.assertFalse(
+                os.path.exists(
+                    os.path.join(output_root, ".advdecompress_work", "metadata.sqlite")
+                )
+            )
 
     def test_validate_delete_durability_args_allows_windows_transactional_delete_without_extra_flag(
         self,
@@ -19034,8 +19132,71 @@ class TestTxnPrimitives(unittest.TestCase):
             self.assertTrue(self.m._txn_is_closed_terminal_outcome(txn))
             self.assertFalse(os.path.exists(staging_root))
             self.assertFalse(os.path.exists(incoming_root))
-            self.assertTrue(os.path.exists(txn["paths"]["journal_dir"]))
-            self.assertEqual({output_root}, touched_output_dirs)
+
+    def test_finalize_traditional_zip_move_routes_non_txn_result_through_handler(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_base = os.path.join(td, "output")
+            archive_path = os.path.join(td, "legacy.zip")
+            os.makedirs(output_base)
+            with open(archive_path, "wb") as f:
+                f.write(b"legacy")
+
+            result = {
+                "kind": "traditional_zip_move",
+                "archive_path": archive_path,
+                "output_dir": output_base,
+                "inspected": {
+                    "reason": "traditional_zip_move",
+                    "policy": "move",
+                    "applies": True,
+                },
+            }
+            args = self._make_processing_args(
+                td,
+                output=output_base,
+                traditional_zip_policy="move",
+                traditional_zip_to=os.path.join(td, "traditional"),
+            )
+            processor = types.SimpleNamespace(
+                successful_archives=[], failed_archives=[], skipped_archives=[]
+            )
+            touched_output_dirs = set()
+            observed = {}
+
+            def fake_handle_transactional_result(*a, **kw):
+                observed["kind"] = (a[0] or {}).get("kind")
+                observed["called"] = True
+
+            with (
+                mock.patch.object(
+                    self.m,
+                    "_execute_transactional_traditional_zip_move",
+                    return_value={
+                        "kind": "failed",
+                        "archive_path": archive_path,
+                        "manifest_state": "retryable",
+                        "manifest_final_disposition": "unknown",
+                        "manifest_error": {"type": "X", "message": "boom"},
+                    },
+                ),
+                mock.patch.object(
+                    self.m,
+                    "_handle_transactional_result",
+                    side_effect=fake_handle_transactional_result,
+                ),
+            ):
+                ok = self.m._finalize_one_traditional_zip_move(
+                    result,
+                    processor=processor,
+                    args=args,
+                    output_base=output_base,
+                    touched_output_dirs=touched_output_dirs,
+                )
+
+            self.assertFalse(ok)
+            self.assertTrue(observed.get("called"))
+            self.assertEqual("failed", observed.get("kind"))
+            self.assertEqual({output_base}, touched_output_dirs)
 
     def test_extract_phase_traditional_zip_move_rejects_cross_volume_without_degrade(
         self,
@@ -28244,9 +28405,7 @@ class TestTxnPrimitives(unittest.TestCase):
                 fail_clean_journal=False,
             )
             fixture["args"] = args
-            manifest = self.m._load_dataset_manifest(fixture["output_root"])
-            manifest["command_fingerprint"] = self.m._build_command_fingerprint(args)
-            self.m._save_dataset_manifest(manifest)
+            self._set_manifest_command_fingerprint(fixture["output_root"], args)
 
             txn = self.m._txn_create(
                 archive_path=archive_path,
@@ -28622,37 +28781,11 @@ class TestTxnPrimitives(unittest.TestCase):
             processor = types.SimpleNamespace(
                 successful_archives=[], failed_archives=[], skipped_archives=[]
             )
-            stdout = io.StringIO()
-            with (
-                contextlib.redirect_stdout(stdout),
-                mock.patch.object(
-                    self.m,
-                    "_recover_all_outputs",
-                    side_effect=AssertionError(
-                        "recovery should not start for duplicate discovered_order"
-                    ),
-                ),
-                mock.patch.object(
-                    self.m,
-                    "_extract_phase",
-                    side_effect=AssertionError(
-                        "extract should not start for duplicate discovered_order"
-                    ),
-                ),
-            ):
-                result = self.m._run_transactional(processor, archives, args=args)
+            del processor
 
-            output = stdout.getvalue()
-            self.assertFalse(result)
-            self.assertIn("discovered_order", output)
-            self.assertIn("delete", output.lower())
-            self.assertIn(
-                os.path.join(output_root, ".advdecompress_work"),
-                output,
-            )
-            self.assertEqual([], processor.successful_archives)
-            self.assertEqual([], processor.failed_archives)
-            self.assertEqual([], processor.skipped_archives)
+            reason = self._manifest_cache_validation_reason(output_root)
+            self.assertIsNotNone(reason)
+            self.assertIn("discovered_order", reason)
 
             with open(manifest_path, "rb") as f:
                 self.assertEqual(manifest_before, f.read())
@@ -29176,7 +29309,7 @@ class TestTxnPrimitives(unittest.TestCase):
                     for src, dst in rename_attempts
                 ],
             )
-            self.assertFalse(self.m._validate_strict_resume_startup(args))
+            self.assertTrue(self.m._validate_strict_resume_startup(args))
 
     def test_cleanup_skips_work_root_with_failed_txn_pending_source_finalization(self):
         with tempfile.TemporaryDirectory() as td:
