@@ -258,6 +258,9 @@ class TestTxnPrimitives(unittest.TestCase):
             txn["paths"]["work_root"] = work_root
         return txn
 
+    def _assert_eventually_set(self, event, *, timeout, message=None):
+        self.assertTrue(event.wait(timeout=timeout), message)
+
     def _make_single_archive_manifest_fixture(
         self, td, *, rel_path="alpha.zip", manifest_state="pending"
     ):
@@ -26345,9 +26348,15 @@ class TestTxnPrimitives(unittest.TestCase):
             ):
                 runner = threading.Thread(target=run_transactional)
                 runner.start()
-                self.assertTrue(b_extract_done.wait(timeout=1))
-                allow_a_finish.set()
-                runner.join(timeout=5)
+                try:
+                    self._assert_eventually_set(
+                        b_extract_done,
+                        timeout=5,
+                        message="later same-output archive should still reach extract before the earlier archive is released",
+                    )
+                finally:
+                    allow_a_finish.set()
+                runner.join(timeout=10)
 
             if runner.is_alive():
                 self.fail("transactional runner did not finish")
@@ -26510,13 +26519,19 @@ class TestTxnPrimitives(unittest.TestCase):
             ):
                 runner = threading.Thread(target=run_transactional, name="txn-runner")
                 runner.start()
-                self.assertTrue(b_extract_done.wait(timeout=1))
-                self.assertFalse(
-                    b_plan_started.wait(timeout=1),
-                    "later same-output archive should stay buffered until earlier discovered archive is ready",
-                )
-                allow_a_finish.set()
-                runner.join(timeout=5)
+                try:
+                    self._assert_eventually_set(
+                        b_extract_done,
+                        timeout=5,
+                        message="later same-output archive should still finish extraction while earlier archive is blocked",
+                    )
+                    self.assertFalse(
+                        b_plan_started.wait(timeout=1),
+                        "later same-output archive should stay buffered until earlier discovered archive is ready",
+                    )
+                finally:
+                    allow_a_finish.set()
+                runner.join(timeout=10)
 
             if runner.is_alive():
                 self.fail("transactional runner did not finish")
@@ -26835,18 +26850,29 @@ class TestTxnPrimitives(unittest.TestCase):
             ):
                 runner = threading.Thread(target=run_transactional)
                 runner.start()
-                self.assertTrue(b_extract_done.wait(timeout=1))
-                self.assertTrue(c_extract_done.wait(timeout=1))
-                self.assertTrue(
-                    c_plan_started.wait(timeout=1),
-                    "different output dir should not be blocked by same-output scheduler",
-                )
-                self.assertFalse(
-                    b_plan_started.wait(timeout=1),
-                    "same-output later archive should remain blocked until earlier discovered archive advances",
-                )
-                allow_a_finish.set()
-                runner.join(timeout=5)
+                try:
+                    self._assert_eventually_set(
+                        b_extract_done,
+                        timeout=5,
+                        message="same-output sibling should reach extract while earlier archive is blocked",
+                    )
+                    self._assert_eventually_set(
+                        c_extract_done,
+                        timeout=5,
+                        message="different-output archive should reach extract while earlier archive is blocked",
+                    )
+                    self._assert_eventually_set(
+                        c_plan_started,
+                        timeout=5,
+                        message="different output dir should not be blocked by same-output scheduler",
+                    )
+                    self.assertFalse(
+                        b_plan_started.wait(timeout=1),
+                        "same-output later archive should remain blocked until earlier discovered archive advances",
+                    )
+                finally:
+                    allow_a_finish.set()
+                runner.join(timeout=10)
 
             if runner.is_alive():
                 self.fail("transactional runner did not finish")
