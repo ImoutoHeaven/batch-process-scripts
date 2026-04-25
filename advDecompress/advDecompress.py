@@ -4383,6 +4383,32 @@ def _resolve_resume_metadata_backend(args, output_base):
 
 
 SQLITE_METADATA_SCHEMA_VERSION = 1
+SQLITE_METADATA_BUSY_TIMEOUT_MS = 30000
+SQLITE_METADATA_BUSY_RETRY_MS = 50
+
+
+def _is_sqlite_busy_error(exc):
+    message = str(exc).lower()
+    return isinstance(exc, sqlite3.OperationalError) and (
+        "database is locked" in message
+        or "database table is locked" in message
+        or "database schema is locked" in message
+    )
+
+
+def _metadata_enable_wal(conn):
+    deadline = time.monotonic() + (float(SQLITE_METADATA_BUSY_TIMEOUT_MS) / 1000.0)
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.Error as e:
+            if not _is_sqlite_busy_error(e):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(float(SQLITE_METADATA_BUSY_RETRY_MS) / 1000.0, remaining))
 
 
 def _metadata_connect(db_path, *, create_if_missing):
@@ -4404,15 +4430,25 @@ def _metadata_connect(db_path, *, create_if_missing):
             )
 
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(
+            db_path,
+            timeout=float(SQLITE_METADATA_BUSY_TIMEOUT_MS) / 1000.0,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {int(SQLITE_METADATA_BUSY_TIMEOUT_MS)}")
+        _metadata_enable_wal(conn)
+        conn.execute("PRAGMA foreign_keys = ON")
     except sqlite3.Error as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if _is_sqlite_busy_error(e):
+            raise RuntimeError(f"transactional metadata DB is busy: {e}") from e
         raise RuntimeError(
             "incompatible transactional metadata: "
             f"SQLite metadata is unreadable or schema-incompatible: {e}"
         ) from e
-
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 

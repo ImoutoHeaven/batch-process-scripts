@@ -1,8 +1,11 @@
 import importlib.util
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -210,6 +213,84 @@ class TestSqliteMetadataBackend(unittest.TestCase):
         self.assertGreater(store["schema_version"], 0)
         self.assertEqual(os.path.abspath(self.output_root), store["output_root"])
         self.assertEqual("local", store["mode"])
+
+    def test_metadata_connect_enables_wal_and_extended_busy_timeout(self):
+        backend = self.m._open_metadata_backend_for_new_run(
+            SimpleNamespace(metadata_db=None),
+            self.output_root,
+        )
+        conn = backend["conn"]
+        try:
+            journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        finally:
+            conn.close()
+
+        self.assertEqual("wal", str(journal_mode).lower())
+        self.assertGreaterEqual(int(busy_timeout), 30000)
+
+    def test_metadata_connect_waits_to_enable_wal_for_locked_legacy_db(self):
+        db_path = os.path.join(
+            self.output_root,
+            ".advdecompress_work",
+            "metadata.sqlite",
+        )
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+        bootstrap = sqlite3.connect(db_path)
+        try:
+            self.m._metadata_init_schema(bootstrap)
+            self.m._metadata_bootstrap_store(
+                bootstrap,
+                output_base=self.output_root,
+                mode="local",
+            )
+            journal_mode = bootstrap.execute("PRAGMA journal_mode").fetchone()[0]
+        finally:
+            bootstrap.close()
+
+        self.assertEqual("delete", str(journal_mode).lower())
+
+        blocker = sqlite3.connect(db_path)
+        blocker.execute("BEGIN IMMEDIATE")
+        blocker.execute("UPDATE metadata_store SET output_root = output_root")
+
+        finished = threading.Event()
+        outcome = {}
+
+        def connector():
+            started = time.monotonic()
+            try:
+                conn = self.m._metadata_connect(db_path, create_if_missing=False)
+                try:
+                    outcome["journal_mode"] = conn.execute("PRAGMA journal_mode").fetchone()[0]
+                finally:
+                    conn.close()
+                outcome["elapsed"] = time.monotonic() - started
+            except Exception as exc:
+                outcome["error"] = exc
+                outcome["elapsed"] = time.monotonic() - started
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=connector, name="metadata-wal-enable")
+        thread.start()
+        try:
+            time.sleep(6.0)
+            self.assertNotIn(
+                "error",
+                outcome,
+                "connector must not fail fast while the legacy metadata DB write lock is held",
+            )
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+        thread.join(timeout=10)
+        self.assertTrue(finished.is_set(), "connector did not finish after lock release")
+        self.assertNotIn("error", outcome)
+        self.assertGreaterEqual(outcome.get("elapsed", 0.0), 6.0)
+        self.assertEqual("wal", str(outcome["journal_mode"]).lower())
 
     def test_archive_discovery_and_state_update_round_trip_through_sqlite(self):
         backend = self.m._open_metadata_backend_for_new_run(
@@ -525,6 +606,76 @@ class TestSqliteMetadataBackend(unittest.TestCase):
 
         self.assertEqual("extracting", archive["state"])
         self.assertEqual("txn-cache-failure", archive["last_txn_id"])
+        self.assertEqual(1, archive["attempts"])
+
+    def test_persist_archive_tracking_waits_out_short_sqlite_write_lock(self):
+        manifest = self.m._create_dataset_manifest(
+            input_root=self.input_root,
+            output_root=self.output_root,
+            discovered_archives=self.discovered_archives,
+            command_fingerprint=self.command_fingerprint,
+        )
+        self.assertIsInstance(manifest, dict)
+
+        db_path = os.path.join(
+            self.output_root,
+            ".advdecompress_work",
+            "metadata.sqlite",
+        )
+        archive_path = self.discovered_archives[0]["archive_path"]
+        blocker = self.m._metadata_connect(db_path, create_if_missing=False)
+        blocker.execute("BEGIN IMMEDIATE")
+        blocker.execute(
+            "UPDATE archives SET state = state WHERE archive_path = ?",
+            (archive_path,),
+        )
+
+        finished = threading.Event()
+        outcome = {}
+
+        def writer():
+            try:
+                self.m._persist_archive_tracking(
+                    self.output_root,
+                    archive_path,
+                    metadata_db_path=db_path,
+                    state="extracting",
+                    last_txn_id="txn-lock-wait",
+                    attempts_increment=1,
+                    final_disposition="unknown",
+                    error=None,
+                )
+                outcome["ok"] = True
+            except Exception as exc:
+                outcome["error"] = exc
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=writer, name="metadata-lock-wait")
+        thread.start()
+        try:
+            time.sleep(6.0)
+            self.assertFalse(
+                finished.is_set(),
+                "writer should still be waiting on sqlite busy_timeout before lock release",
+            )
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+        thread.join(timeout=10)
+        self.assertTrue(finished.is_set(), "writer did not finish after lock release")
+        self.assertNotIn("error", outcome)
+        self.assertTrue(outcome.get("ok"))
+
+        conn = self.m._metadata_connect(db_path, create_if_missing=False)
+        try:
+            archive = self.m._metadata_load_archive(conn, archive_path)
+        finally:
+            conn.close()
+
+        self.assertEqual("extracting", archive["state"])
+        self.assertEqual("txn-lock-wait", archive["last_txn_id"])
         self.assertEqual(1, archive["attempts"])
 
     def test_update_dataset_manifest_archive_keeps_sqlite_authoritative_when_manifest_cache_save_fails(
