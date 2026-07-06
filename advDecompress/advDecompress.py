@@ -3984,6 +3984,36 @@ def _fsync_dir(path, debug=False):
         return _FsyncDirResult(False, f"{type(e).__name__}:{e}")
 
 
+def _windows_retryable_replace_error(error):
+    if os.name != "nt":
+        return False
+    if not isinstance(error, OSError):
+        return False
+
+    winerror = getattr(error, "winerror", None)
+    if winerror in (5, 32):
+        return True
+
+    return error.errno in (errno.EACCES, errno.EPERM)
+
+
+def _replace_with_windows_retry(src, dst, *, debug=False, max_retries=8):
+    delay_s = 0.05
+    for attempt in range(max_retries + 1):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as e:
+            if not _windows_retryable_replace_error(e) or attempt >= max_retries:
+                raise
+            if debug:
+                print(
+                    f"  DEBUG: os.replace transient failure ({e}); retry {attempt + 1}/{max_retries}"
+                )
+            time.sleep(delay_s)
+            delay_s = min(delay_s * 2.0, 0.5)
+
+
 def atomic_write_json(path, data, debug=False):
     parent = os.path.dirname(path)
     safe_makedirs(parent, debug=debug)
@@ -3997,7 +4027,7 @@ def atomic_write_json(path, data, debug=False):
         f.flush()
         os.fsync(f.fileno())
 
-    os.replace(safe_tmp, safe_final)
+    _replace_with_windows_retry(safe_tmp, safe_final, debug=debug)
     _fsync_dir(parent, debug=debug)
 
 
@@ -9587,12 +9617,12 @@ def get_archive_base_name(filepath):
         # Split SFX volumes: strip .exe.NNN
         base = re.sub(r"\.exe\.\d+$", "", filename, flags=re.IGNORECASE)
         base = re.sub(r"\.part\d+$", "", base, flags=re.IGNORECASE)
-        return base
+        return _sanitize_windows_generated_name(base)
     elif filename_lower.endswith(".exe"):
         # For SFX files, remove .exe and part indicators
         base = re.sub(r"\.exe$", "", filename, flags=re.IGNORECASE)
         base = re.sub(r"\.part\d+$", "", base, flags=re.IGNORECASE)
-        return base
+        return _sanitize_windows_generated_name(base)
 
     elif filename_lower.endswith(
         (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar")
@@ -9607,38 +9637,52 @@ def get_archive_base_name(filepath):
             ".tar",
         ):
             if filename_lower.endswith(suffix):
-                return filename[: -len(suffix)]
+                return _sanitize_windows_generated_name(filename[: -len(suffix)])
 
     elif filename_lower.endswith(".rar"):
         if re.search(r"\.part\d+\.rar$", filename_lower):
             # Multi-part RAR: remove .partN.rar
-            return re.sub(r"\.part\d+\.rar$", "", filename, flags=re.IGNORECASE)
+            return _sanitize_windows_generated_name(
+                re.sub(r"\.part\d+\.rar$", "", filename, flags=re.IGNORECASE)
+            )
         else:
             # Single RAR: remove .rar
-            return re.sub(r"\.rar$", "", filename, flags=re.IGNORECASE)
+            return _sanitize_windows_generated_name(
+                re.sub(r"\.rar$", "", filename, flags=re.IGNORECASE)
+            )
 
     elif filename_lower.endswith(".7z"):
         # Single 7z: remove .7z
-        return re.sub(r"\.7z$", "", filename, flags=re.IGNORECASE)
+        return _sanitize_windows_generated_name(
+            re.sub(r"\.7z$", "", filename, flags=re.IGNORECASE)
+        )
 
     elif re.search(r"\.7z\.\d+$", filename_lower):
         # Multi-part 7z: remove .7z.NNN
-        return re.sub(r"\.7z\.\d+$", "", filename, flags=re.IGNORECASE)
+        return _sanitize_windows_generated_name(
+            re.sub(r"\.7z\.\d+$", "", filename, flags=re.IGNORECASE)
+        )
 
     elif filename_lower.endswith(".zip"):
         # ZIP: remove .zip
-        return re.sub(r"\.zip$", "", filename, flags=re.IGNORECASE)
+        return _sanitize_windows_generated_name(
+            re.sub(r"\.zip$", "", filename, flags=re.IGNORECASE)
+        )
 
     elif re.search(r"\.z\d+$", filename_lower):
         # ZIP volumes: remove .zNN
-        return re.sub(r"\.z\d+$", "", filename, flags=re.IGNORECASE)
+        return _sanitize_windows_generated_name(
+            re.sub(r"\.z\d+$", "", filename, flags=re.IGNORECASE)
+        )
 
     elif re.search(r"\.r\d+$", filename_lower):
         # RAR4 volumes: remove .rNN
-        return re.sub(r"\.r\d+$", "", filename, flags=re.IGNORECASE)
+        return _sanitize_windows_generated_name(
+            re.sub(r"\.r\d+$", "", filename, flags=re.IGNORECASE)
+        )
 
     # Fallback
-    return os.path.splitext(filename)[0]
+    return _sanitize_windows_generated_name(os.path.splitext(filename)[0])
 
 
 def count_items_in_dir(directory):
@@ -9674,6 +9718,15 @@ def ensure_unique_name(target_path, unique_suffix):
     return result
 
 
+def _sanitize_windows_generated_name(name, fallback="archive"):
+    text = str(name or "")
+    if os.name != "nt" and not is_windows():
+        return text
+
+    sanitized = text.rstrip(" .")
+    return sanitized or fallback
+
+
 def get_deepest_folder_name(file_content_info, tmp_dir, archive_base_name):
     """
     确定deepest_folder_name
@@ -9694,10 +9747,13 @@ def get_deepest_folder_name(file_content_info, tmp_dir, archive_base_name):
 
     if parent_normalized == tmp_dir_normalized:
         # 父文件夹就是tmp文件夹，使用archive_base_name
-        return archive_base_name
+        return _sanitize_windows_generated_name(archive_base_name)
     else:
         # 使用父文件夹名称
-        return os.path.basename(parent_folder_path)
+        return _sanitize_windows_generated_name(
+            os.path.basename(parent_folder_path),
+            fallback=_sanitize_windows_generated_name(archive_base_name),
+        )
 
 
 def remove_ascii_non_meaningful_chars(text):
@@ -10134,18 +10190,11 @@ def apply_file_content_with_folder_policy(
             safe_move(src_path, dst_path, VERBOSE)
 
         # 4. 确定deepest_folder_name
-        # 如果父文件夹就是tmp文件夹，则认为父文件夹名称是archive_name
-        # 如果父文件夹不是tmp文件夹，则使用file_content的父文件夹名称
-        if file_content["parent_folder_path"] == tmp_dir:
-            deepest_folder_name = archive_name
-            if VERBOSE:
-                print(
-                    f"  DEBUG: file_content的父文件夹是tmp目录，使用归档名称: {deepest_folder_name}"
-                )
-        else:
-            deepest_folder_name = file_content["parent_folder_name"]
-            if VERBOSE:
-                print(f"  DEBUG: 使用file_content的父文件夹名称: {deepest_folder_name}")
+        deepest_folder_name = get_deepest_folder_name(
+            file_content, tmp_dir, archive_name
+        )
+        if VERBOSE:
+            print(f"  DEBUG: 确定的deepest_folder_name: {deepest_folder_name}")
 
         # 5. 创建最终输出目录（使用deepest_folder_name）
         final_archive_dir = os.path.join(output_dir, deepest_folder_name)

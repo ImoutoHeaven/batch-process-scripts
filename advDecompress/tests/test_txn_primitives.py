@@ -942,6 +942,31 @@ class TestTxnPrimitives(unittest.TestCase):
             with open(path, "r", encoding="utf-8") as f:
                 self.assertEqual({"round": 3}, json.load(f))
 
+    def test_atomic_write_json_retries_transient_windows_access_denied(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "txn.json")
+            attempts = []
+            real_replace = self.m.os.replace
+
+            def flaky_replace(src, dst):
+                attempts.append((src, dst))
+                if len(attempts) < 3:
+                    err = PermissionError(13, "Access is denied")
+                    err.winerror = 5
+                    raise err
+                return real_replace(src, dst)
+
+            with (
+                mock.patch.object(self.m.os, "name", "nt"),
+                mock.patch.object(self.m.os, "replace", side_effect=flaky_replace),
+                mock.patch.object(self.m.time, "sleep", return_value=None),
+            ):
+                self.m.atomic_write_json(path, {"round": 1}, debug=False)
+
+            self.assertEqual(3, len(attempts))
+            with open(path, "r", encoding="utf-8") as f:
+                self.assertEqual({"round": 1}, json.load(f))
+
     def test_patch_cmd_paths_uses_external_path_normalization_only(self):
         with tempfile.TemporaryDirectory() as td:
             archive_path = os.path.join(td, "archive.zip")
@@ -15538,6 +15563,21 @@ class TestTxnPrimitives(unittest.TestCase):
         for archive_name, expected in cases.items():
             with self.subTest(archive_name=archive_name):
                 self.assertEqual(expected, self.m.get_archive_base_name(archive_name))
+
+    def test_get_archive_base_name_strips_windows_trailing_dots_and_spaces(self):
+        cases = {
+            "name...zip": "name",
+            "name .zip": "name",
+            "....zip": "archive",
+        }
+
+        with (
+            mock.patch.object(self.m.os, "name", "nt"),
+            mock.patch.object(self.m, "is_windows", return_value=True),
+        ):
+            for archive_name, expected in cases.items():
+                with self.subTest(archive_name=archive_name):
+                    self.assertEqual(expected, self.m.get_archive_base_name(archive_name))
 
     def test_is_archive_single_or_volume_recognizes_tar_family_as_single(self):
         names = [
