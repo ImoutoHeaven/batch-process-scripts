@@ -14,7 +14,7 @@ import tempfile
 import threading
 import tarfile
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
@@ -937,6 +937,7 @@ def discover_archives(args) -> List[ArchiveGroup]:
                 continue
             groups.extend(_group_directory(files, args))
 
+    groups = [_normalize_single_group(group) for group in groups]
     return [group for group in groups if _group_allowed(group, args)]
 
 
@@ -960,6 +961,15 @@ def _archive_type(path: Path) -> Optional[str]:
     if header[:6] == _SEVEN_Z_SIGNATURE:
         return "7z"
     return None
+
+
+def _normalize_single_group(group: ArchiveGroup) -> ArchiveGroup:
+    if group.multi or group.entry is None or group.kind not in ("7z", "rar", "zip"):
+        return group
+    archive_type = _archive_type(group.entry)
+    if archive_type is None or archive_type == group.kind:
+        return group
+    return replace(group, kind=archive_type, format=archive_type)
 
 
 def _size_limit(value) -> int:
@@ -1089,8 +1099,6 @@ def _extra_has_unicode_path(extra: bytes) -> bool:
 
 
 def _traditional_zip(path: Path) -> bool:
-    if path.suffix.casefold() != ".zip":
-        return False
     try:
         with zipfile.ZipFile(path) as archive:
             infos = archive.infolist()
@@ -1341,8 +1349,10 @@ def _record_password(passwords, value: str) -> None:
 def _extract_7z(path: Path, destination: Path, password: Optional[str], zip_codepage=None) -> None:
     command = [_seven_zip(), "x", _windows_short_path(path), "-o" + _windows_short_path(destination), "-y"]
     command.append(f"-p{_password_value(password)}" if password is not None else "-pDUMMYPASSWORD")
-    if zip_codepage not in (None, "", "UTF-8", "utf-8", 65001, "65001"):
-        command.append(f"-mcp={zip_codepage}")
+    if zip_codepage is not None:
+        command.append("-tzip")
+        if zip_codepage not in ("", "UTF-8", "utf-8", 65001, "65001"):
+            command.append(f"-mcp={zip_codepage}")
     result = _command_result(command)
     if result.returncode != 0:
         detail = (_output_text(result.stderr) or _output_text(result.stdout)).strip()

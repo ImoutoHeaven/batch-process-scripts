@@ -53,6 +53,53 @@ def args(**overrides):
 
 
 class ArchiveIoTests(unittest.TestCase):
+    def test_single_archive_headers_correct_kind_before_skip_and_keep_names(self):
+        cases = (
+            ("seven.rar", b"\x37\x7a\xbc\xaf\x27\x1c", "7z"),
+            ("rar.7z", b"Rar!\x1a\x07\x01", "rar"),
+            ("zip.rar", b"PK\x03\x04\x00\x00\x00\x00", "zip"),
+        )
+        for name, header, kind in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                archive = root / name
+                archive.write_bytes(header)
+
+                groups = discover_archives(args(path=root))
+                self.assertEqual(len(groups), 1)
+                group = groups[0]
+                self.assertEqual((group.kind, group.format, group.multi), (kind, kind, False))
+                self.assertEqual(group.entry, archive)
+                self.assertEqual(group.volumes, (archive,))
+                self.assertEqual(group.stem, name.rsplit(".", 1)[0])
+                self.assertEqual(
+                    discover_archives(args(path=root, **{"skip_" + kind: True})),
+                    [],
+                )
+
+    def test_single_header_normalization_leaves_multi_sfx_and_unknown_groups(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            unknown = root / "unknown.7z"
+            unknown.write_bytes(b"not an archive")
+            multi = root / "bundle.7z.001"
+            multi.write_bytes(b"Rar!\x1a\x07\x01")
+            sfx = root / "runner.exe"
+            sfx.write_bytes(b"MZ" + b"\0" * 1000 + b"Rar!")
+
+            groups = discover_archives(args(path=root))
+            self.assertEqual(
+                {
+                    (group.entry.name, group.kind, group.format, group.multi)
+                    for group in groups
+                },
+                {
+                    (unknown.name, "7z", "7z", False),
+                    (multi.name, "7z", "7z", True),
+                    (sfx.name, "exe", "sfx-rar", False),
+                },
+            )
+
     def test_discovery_groups_volumes_and_preserves_literal_names(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -104,6 +151,64 @@ class ArchiveIoTests(unittest.TestCase):
                 action, codepage, reason = inspect_zip_policy(group, args())
             self.assertEqual((action, codepage), ("skip", None))
             self.assertIn("confidence", reason)
+
+    def test_actual_zip_policy_applies_to_renamed_zip(self):
+        with tempfile.TemporaryDirectory() as temp:
+            archive = Path(temp) / "legacy.rar"
+            with zipfile.ZipFile(archive, "w") as zf:
+                zf.writestr("plain.txt", "ok")
+            group = discover_archives(args(path=archive))[0]
+            self.assertEqual((group.kind, group.format), ("zip", "zip"))
+
+            action, codepage, reason = inspect_zip_policy(
+                group, args(traditional_zip_policy="asis")
+            )
+            self.assertEqual((action, codepage), ("skip", None))
+            self.assertIn("asis", reason)
+
+            action, codepage, reason = inspect_zip_policy(
+                group, args(traditional_zip_policy="decode-936")
+            )
+            self.assertEqual((action, codepage), ("extract", 936))
+            self.assertIn("manual", reason)
+
+            with mock.patch(
+                "advDecompress_lite.archive_io._zip_detect",
+                return_value=(None, "confidence below minimum"),
+            ):
+                action, codepage, reason = inspect_zip_policy(group, args())
+            self.assertEqual((action, codepage), ("skip", None))
+            self.assertIn("confidence", reason)
+
+    def test_corrected_single_kind_selects_extractor_backend(self):
+        cases = (
+            ("seven.rar", b"\x37\x7a\xbc\xaf\x27\x1c", "7z", "_extract_7z"),
+            ("rar.7z", b"Rar!\x1a\x07\x01", "rar", "_extract_rar"),
+        )
+        for name, header, kind, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                archive = root / name
+                archive.write_bytes(header)
+                group = discover_archives(args(path=archive))[0]
+                destination = root / "out"
+
+                def populate(_path, target, *_args):
+                    target.mkdir(parents=True, exist_ok=True)
+                    (target / "payload.txt").write_text("ok", encoding="utf-8")
+
+                with mock.patch(
+                    "advDecompress_lite.archive_io._extract_7z", side_effect=populate
+                ) as extract_7z, mock.patch(
+                    "advDecompress_lite.archive_io._extract_rar", side_effect=populate
+                ) as extract_rar:
+                    extract_archive(
+                        group,
+                        destination,
+                        args(enable_rar=True),
+                        PasswordCandidates(args()),
+                    )
+                self.assertEqual((extract_7z.called, extract_rar.called), (expected == "_extract_7z", expected == "_extract_rar"))
 
     def test_sfx_rar_parts_and_optional_elf_sfx(self):
         with tempfile.TemporaryDirectory() as temp:

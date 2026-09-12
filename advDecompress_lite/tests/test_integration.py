@@ -193,6 +193,42 @@ class CommandLineIntegration(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout)
                 self.assertEqual((output / source.name).read_bytes(), source.read_bytes())
 
+    @unittest.skipUnless(RAR, "rar is required for real renamed archive checks")
+    def test_real_renamed_single_archives_use_header_format_with_both_backends(self):
+        cases = (
+            ("7z", "rar"),
+            ("zip", "rar"),
+            ("zip", "7z"),
+            ("rar", "7z"),
+            ("rar", "zip"),
+        )
+        for archive_kind, wrong_suffix in cases:
+            with self.subTest(archive_kind=archive_kind, wrong_suffix=wrong_suffix):
+                source = self.root / (archive_kind + "-as-" + wrong_suffix + ".txt")
+                source.write_bytes((archive_kind + " content").encode("ascii"))
+                archive = self.root / (archive_kind + ".original." + archive_kind)
+                if archive_kind == "7z":
+                    self.make_7z(archive, source)
+                elif archive_kind == "rar":
+                    self.make_rar(archive, source)
+                else:
+                    with zipfile.ZipFile(archive, "w") as stream:
+                        stream.write(source, source.name)
+                renamed = archive.with_suffix("." + wrong_suffix)
+                archive.rename(renamed)
+
+                for use_rar in (False, True):
+                    with self.subTest(use_rar=use_rar):
+                        output = self.root / (archive_kind + "-out-" + wrong_suffix + "-" + str(use_rar))
+                        options = ["-v"] + (["-er"] if use_rar else [])
+                        result = self.run_cli(renamed, output, *options)
+                        self.assertEqual(result.returncode, 0, result.stdout)
+                        self.assertIn("kind=" + archive_kind, result.stdout)
+                        self.assertEqual(
+                            (output / source.name).read_bytes(), source.read_bytes()
+                        )
+                        self.assertTrue(renamed.exists())
+
     @unittest.skipUnless(RAR, "rar is required to create real multipart RAR fixtures")
     def test_rar_multipart_sfx_groups_and_extracts_complete_payload(self):
         source = self.root / "sfx-data.bin"
