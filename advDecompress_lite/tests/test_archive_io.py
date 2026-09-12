@@ -24,6 +24,7 @@ from advDecompress_lite.archive_io import (
     parse_file_size,
     _looks_like_tar,
     _embedded_seven_zip_state,
+    _extra_has_valid_unicode_path,
 )
 
 
@@ -50,6 +51,42 @@ def args(**overrides):
         values["skip_" + kind + "_multi"] = False
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+def _unicode_path_extra(raw_name, unicode_name, *, version=1, crc=None, payload=None, size=None):
+    payload = unicode_name.encode("utf-8") if payload is None else payload
+    crc = binascii.crc32(raw_name) & 0xFFFFFFFF if crc is None else crc
+    size = len(payload) + 5 if size is None else size
+    return struct.pack("<HHBI", 0x7075, size, version, crc) + payload
+
+
+def _replace_zip_name(path, placeholder, replacement):
+    if len(placeholder) != len(replacement) or path.read_bytes().count(placeholder) != 2:
+        raise AssertionError("ZIP fixture name replacement must hit local and central headers")
+    path.write_bytes(path.read_bytes().replace(placeholder, replacement))
+
+
+def _make_mixed_zip(path, legacy_raw, *, modern_kind=None, legacy_extra=b""):
+    legacy_placeholder = b"L" * len(legacy_raw)
+    modern_name = "新名.txt"
+    modern_placeholder = None
+    modern_raw = None
+    with zipfile.ZipFile(path, "w") as archive:
+        legacy = zipfile.ZipInfo(legacy_placeholder.decode("ascii"))
+        legacy.extra = legacy_extra
+        archive.writestr(legacy, b"legacy")
+        if modern_kind == "utf8":
+            archive.writestr(modern_name, b"modern")
+        elif modern_kind == "unicode":
+            modern_raw = modern_name.encode("utf-8")
+            modern_placeholder = b"M" * len(modern_raw)
+            modern = zipfile.ZipInfo(modern_placeholder.decode("ascii"))
+            modern.extra = _unicode_path_extra(modern_raw, modern_name)
+            archive.writestr(modern, b"modern")
+    _replace_zip_name(path, legacy_placeholder, legacy_raw)
+    if modern_placeholder is not None:
+        _replace_zip_name(path, modern_placeholder, modern_raw)
+    return path
 
 
 class ArchiveIoTests(unittest.TestCase):
@@ -151,6 +188,120 @@ class ArchiveIoTests(unittest.TestCase):
                 action, codepage, reason = inspect_zip_policy(group, args())
             self.assertEqual((action, codepage), ("skip", None))
             self.assertIn("confidence", reason)
+
+    def test_mixed_utf8_and_unicode_path_entries_keep_legacy_policy_and_sample(self):
+        legacy_raw = b"\x93\xfa\x96{.txt"
+        for modern_kind in ("utf8", "unicode"):
+            with self.subTest(modern_kind=modern_kind), tempfile.TemporaryDirectory() as temp:
+                archive = _make_mixed_zip(
+                    Path(temp) / (modern_kind + ".zip"),
+                    legacy_raw,
+                    modern_kind=modern_kind,
+                )
+                group = ArchiveGroup(archive, (archive,), "mixed", "zip", False, "zip")
+                detector = mock.Mock(
+                    return_value={"encoding": "cp932", "confidence": 1.0}
+                )
+                with mock.patch.dict(sys.modules, {"chardet": mock.Mock(detect=detector)}):
+                    action, codepage, reason = inspect_zip_policy(group, args())
+                self.assertEqual((action, codepage), ("extract", "932"))
+                self.assertIn("automatic", reason)
+                detector.assert_called_once_with(legacy_raw)
+                self.assertNotIn("新名.txt".encode("utf-8"), detector.call_args.args[0])
+
+                self.assertEqual(
+                    inspect_zip_policy(group, args(traditional_zip_policy="asis"))[:2],
+                    ("skip", None),
+                )
+                self.assertEqual(
+                    inspect_zip_policy(
+                        group,
+                        args(
+                            traditional_zip_policy="move",
+                            traditional_zip_to=Path(temp) / "traditional",
+                        ),
+                    )[:2],
+                    ("move", None),
+                )
+                self.assertEqual(
+                    inspect_zip_policy(group, args(traditional_zip_policy="decode-932"))[:2],
+                    ("extract", 932),
+                )
+
+    def test_mixed_strict_auto_uses_detector_at_full_confidence(self):
+        legacy_raw = b"\x93\xfa\x96{.txt"
+        for confidence, expected_action, expected_codepage in (
+            (1.0, "extract", "932"),
+            (0.99, "skip", None),
+        ):
+            with self.subTest(confidence=confidence), tempfile.TemporaryDirectory() as temp:
+                archive = _make_mixed_zip(Path(temp) / "mixed.zip", legacy_raw, modern_kind="utf8")
+                group = ArchiveGroup(archive, (archive,), "mixed", "zip", False, "zip")
+                detector = mock.Mock(
+                    return_value={"encoding": "cp932", "confidence": confidence}
+                )
+                with mock.patch.dict(sys.modules, {"chardet": mock.Mock(detect=detector)}):
+                    action, codepage, reason = inspect_zip_policy(
+                        group, args(traditional_zip_decode_confidence=100)
+                    )
+                self.assertEqual((action, codepage), (expected_action, expected_codepage))
+                detector.assert_called_once_with(legacy_raw)
+                if confidence < 1.0:
+                    self.assertIn("below minimum", reason)
+
+    def test_invalid_unicode_path_metadata_remains_legacy(self):
+        legacy_raw = b"\x93\xfa\x96{.txt"
+        valid_name = "日本.txt"
+        cases = {
+            "stale-crc": _unicode_path_extra(
+                legacy_raw,
+                valid_name,
+                crc=(binascii.crc32(legacy_raw) ^ 1) & 0xFFFFFFFF,
+            ),
+            "version-2": _unicode_path_extra(legacy_raw, valid_name, version=2),
+            "invalid-utf8": _unicode_path_extra(
+                legacy_raw, valid_name, payload=b"\xff"
+            ),
+        }
+        for label, extra in cases.items():
+            with self.subTest(metadata=label), tempfile.TemporaryDirectory() as temp:
+                archive = _make_mixed_zip(
+                    Path(temp) / (label + ".zip"),
+                    legacy_raw,
+                    legacy_extra=extra,
+                )
+                group = ArchiveGroup(archive, (archive,), "legacy", "zip", False, "zip")
+                self.assertEqual(
+                    inspect_zip_policy(group, args(traditional_zip_policy="asis"))[:2],
+                    ("skip", None),
+                )
+                detector = mock.Mock(
+                    return_value={"encoding": "cp932", "confidence": 1.0}
+                )
+                with mock.patch.dict(sys.modules, {"chardet": mock.Mock(detect=detector)}):
+                    action, codepage, _reason = inspect_zip_policy(group, args())
+                self.assertEqual((action, codepage), ("extract", "932"))
+                detector.assert_called_once_with(legacy_raw)
+
+    def test_unicode_path_metadata_bounds_are_required(self):
+        raw = b"\x93\xfa\x96{.txt"
+        truncated = _unicode_path_extra(raw, "日本.txt", payload=b"\xff", size=99)
+        self.assertFalse(_extra_has_valid_unicode_path(truncated, raw))
+
+    def test_ascii_legacy_plus_modern_names_stays_native(self):
+        with tempfile.TemporaryDirectory() as temp:
+            archive = _make_mixed_zip(
+                Path(temp) / "modern.zip",
+                b"README.txt",
+                modern_kind="utf8",
+            )
+            group = ArchiveGroup(archive, (archive,), "modern", "zip", False, "zip")
+            action, codepage, reason = inspect_zip_policy(
+                group, args(traditional_zip_policy="asis")
+            )
+            self.assertEqual((action, codepage, reason), ("extract", None, "not_traditional_zip"))
+            action, codepage, reason = inspect_zip_policy(group, args())
+            self.assertEqual((action, codepage, reason), ("extract", None, "not_traditional_zip"))
 
     def test_actual_zip_policy_applies_to_renamed_zip(self):
         with tempfile.TemporaryDirectory() as temp:

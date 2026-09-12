@@ -1088,23 +1088,74 @@ def fix_extensions(args) -> List[Tuple[Path, Path]]:
     return renamed
 
 
-def _extra_has_unicode_path(extra: bytes) -> bool:
+def _zip_raw_filename(info: zipfile.ZipInfo) -> bytes:
+    raw = getattr(info, "orig_filename", info.filename)
+    return raw.encode("cp437", "surrogateescape") if isinstance(raw, str) else bytes(raw)
+
+
+def _extra_has_valid_unicode_path(extra: bytes, raw_filename: bytes) -> bool:
     offset = 0
-    while offset + 4 <= len(extra or b""):
-        field, size = int.from_bytes(extra[offset : offset + 2], "little"), int.from_bytes(extra[offset + 2 : offset + 4], "little")
-        if field == 0x7075:
-            return True
-        offset += 4 + size
+    data = extra or b""
+    while offset + 4 <= len(data):
+        field, size = struct.unpack_from("<HH", data, offset)
+        end = offset + 4 + size
+        if end > len(data):
+            break
+        if field == 0x7075 and size >= 5:
+            version = data[offset + 4]
+            expected_crc = struct.unpack_from("<I", data, offset + 5)[0]
+            payload = data[offset + 9 : end]
+            if (
+                version == 1
+                and expected_crc == binascii.crc32(raw_filename) & 0xFFFFFFFF
+            ):
+                try:
+                    payload.decode("utf-8")
+                except UnicodeDecodeError:
+                    pass
+                else:
+                    return True
+        offset = end
     return False
+
+
+def _zip_entry_metadata(path: Path) -> List[Tuple[bool, bytes, zipfile.ZipInfo]]:
+    """Return classification and central-directory metadata for each member."""
+    with zipfile.ZipFile(path) as archive:
+        result: List[Tuple[bool, bytes, zipfile.ZipInfo]] = []
+        for info in archive.infolist():
+            if info.flag_bits & 0x800:
+                result.append((True, b"", info))
+                continue
+            raw = _zip_raw_filename(info)
+            result.append(
+                (
+                    _extra_has_valid_unicode_path(info.extra, raw),
+                    raw,
+                    info,
+                )
+            )
+        return result
+
+
+def _zip_entry_classification(path: Path) -> List[Tuple[bool, bytes]]:
+    """Return ``(modern, raw_name)`` for each ZIP member."""
+    return [
+        (modern, raw)
+        for modern, raw, _info in _zip_entry_metadata(path)
+    ]
 
 
 def _traditional_zip(path: Path) -> bool:
     try:
-        with zipfile.ZipFile(path) as archive:
-            infos = archive.infolist()
-            return bool(infos) and all(not info.flag_bits & 0x800 and not _extra_has_unicode_path(info.extra) for info in infos)
+        entries = _zip_entry_classification(path)
     except (OSError, zipfile.BadZipFile):
         return False
+    legacy = [raw for modern, raw in entries if not modern]
+    return bool(legacy) and (
+        all(not modern for modern, _raw in entries)
+        or any(not raw.isascii() for raw in legacy)
+    )
 
 
 def _confidence(value) -> float:
@@ -1196,15 +1247,9 @@ def _encoding_codepage(encoding: Optional[str]) -> Optional[str]:
 
 def _zip_detect(path: Path, args) -> Tuple[Optional[str], str]:
     try:
-        with zipfile.ZipFile(path) as archive:
-            raw_names = []
-            for info in archive.infolist():
-                if info.flag_bits & 0x800:
-                    continue
-                raw = getattr(info, "orig_filename", info.filename)
-                if isinstance(raw, str):
-                    raw = raw.encode("cp437", "surrogateescape")
-                raw_names.append(raw)
+        raw_names = [
+            raw for modern, raw in _zip_entry_classification(path) if not modern
+        ]
     except (OSError, zipfile.BadZipFile) as exc:
         return None, f"traditional ZIP inspection failed: {exc}"
     if not raw_names:
@@ -1276,7 +1321,7 @@ def _windows_short_path(path: Path) -> str:
         return str(path.resolve())
 
 
-def _command_result(command: Sequence[str]) -> subprocess.CompletedProcess:
+def _command_result(command: Sequence[object]) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
             list(command),
@@ -1296,6 +1341,122 @@ def _seven_zip() -> str:
     if not command:
         raise RuntimeError("required extractor is unavailable: 7z")
     return command
+
+
+def _zip_python_encoding(codepage) -> str:
+    value = str(codepage)
+    if value.casefold() in {"utf-8", "utf8", "65001"}:
+        return "utf-8"
+    if value == "20932":
+        encoding = "euc_jp"
+    elif value == "20866":
+        encoding = "koi8_r"
+    elif value.isdigit() and 28591 <= int(value) <= 28606:
+        encoding = "iso-8859-{}".format(int(value) - 28590)
+    else:
+        encoding = "cp" + value
+    try:
+        codecs.lookup(encoding)
+    except LookupError as exc:
+        raise RuntimeError(
+            "unsupported ZIP codepage for POSIX filename normalization: {}".format(codepage)
+        ) from exc
+    return encoding
+
+
+def _prepare_zip_for_extraction(
+    path: Path,
+    destination: Path,
+    zip_codepage,
+    zip_volumes: Optional[Sequence[Path]] = None,
+) -> Tuple[Path, Optional[Path]]:
+    if os.name == "nt" or zip_codepage is None:
+        return path, None
+
+    entries = _zip_entry_metadata(path)
+    if not any(
+        not modern
+        and not raw.isascii()
+        for modern, raw, _info in entries
+    ):
+        return path, None
+    encoding = _zip_python_encoding(zip_codepage)
+    expected = []
+    renames = []
+    for modern, raw, info in entries:
+        if modern:
+            decoded = info.filename
+        else:
+            try:
+                decoded = raw.decode(encoding)
+            except UnicodeDecodeError as exc:
+                raise RuntimeError(
+                    "ZIP filename cannot be decoded with codepage {}: {}".format(
+                        zip_codepage, exc
+                    )
+                ) from exc
+            if decoded.encode("utf-8") != raw:
+                renames.append((raw, decoded))
+        expected.append((decoded, info.CRC, info.file_size))
+    if not renames:
+        return path, None
+
+    # ponytail: one native rn batch has an ARG_MAX ceiling; split into deepest-first
+    # batches if larger archives matter, and reject ambiguous alias/collision rewrites via metadata checks.
+    renames.sort(key=lambda pair: len(pair[0]), reverse=True)
+    stage = Path(tempfile.mkdtemp(prefix="advdecompress-zip-", dir=str(destination.parent)))
+    try:
+        volumes = [Path(volume) for volume in (zip_volumes or ())]
+        if path not in volumes:
+            volumes.insert(0, path)
+        for volume in volumes:
+            shutil.copy2(volume, stage / volume.name)
+        working = stage / path.name
+        command = [_seven_zip(), "rn", _windows_short_path(working), "-tzip", "-spd", "--"]
+        for old, new in renames:
+            command.extend((old, new.encode("utf-8")))
+        result = _command_result(command)
+        if result.returncode != 0:
+            detail = (_output_text(result.stderr) or _output_text(result.stdout)).strip()
+            raise RuntimeError(
+                "ZIP filename normalization failed for {}: exit {}: {}".format(
+                    path, result.returncode, detail[:300]
+                )
+            )
+
+        actual = _zip_entry_metadata(working)
+        requested = {old for old, _new in renames}
+        if any(
+            not modern and raw in requested
+            for modern, raw, _info in actual
+        ):
+            raise RuntimeError(
+                "ZIP filename normalization left a requested legacy name unchanged: {}".format(
+                    path
+                )
+            )
+        actual_signature = [
+            (info.filename, info.CRC, info.file_size)
+            for _modern, _raw, info in actual
+        ]
+        if actual_signature != expected:
+            raise RuntimeError(
+                "ZIP filename normalization changed member names, CRCs, or sizes: {}".format(path)
+            )
+        for index, (modern, _raw, info) in enumerate(entries):
+            if modern:
+                current_modern, _current_raw, current = actual[index]
+                if (
+                    not current_modern
+                    or current.flag_bits != info.flag_bits
+                ):
+                    raise RuntimeError(
+                        "ZIP filename normalization changed a modern member: {}".format(path)
+                    )
+        return working, stage
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
 
 
 def _password_value(password: str) -> str:
@@ -1346,17 +1507,30 @@ def _record_password(passwords, value: str) -> None:
         passwords.record_success(value)
 
 
-def _extract_7z(path: Path, destination: Path, password: Optional[str], zip_codepage=None) -> None:
-    command = [_seven_zip(), "x", _windows_short_path(path), "-o" + _windows_short_path(destination), "-y"]
-    command.append(f"-p{_password_value(password)}" if password is not None else "-pDUMMYPASSWORD")
-    if zip_codepage is not None:
-        command.append("-tzip")
-        if zip_codepage not in ("", "UTF-8", "utf-8", 65001, "65001"):
-            command.append(f"-mcp={zip_codepage}")
-    result = _command_result(command)
-    if result.returncode != 0:
-        detail = (_output_text(result.stderr) or _output_text(result.stdout)).strip()
-        raise RuntimeError(f"archive extraction failed for {path}: exit {result.returncode}: {detail[:300]}")
+def _extract_7z(
+    path: Path,
+    destination: Path,
+    password: Optional[str],
+    zip_codepage=None,
+    zip_volumes: Optional[Sequence[Path]] = None,
+) -> None:
+    prepared_path, cleanup = _prepare_zip_for_extraction(
+        path, destination, zip_codepage, zip_volumes
+    )
+    try:
+        command = [_seven_zip(), "x", _windows_short_path(prepared_path), "-o" + _windows_short_path(destination), "-y"]
+        command.append(f"-p{_password_value(password)}" if password is not None else "-pDUMMYPASSWORD")
+        if zip_codepage is not None:
+            command.append("-tzip")
+            if zip_codepage not in ("", "UTF-8", "utf-8", 65001, "65001"):
+                command.append(f"-mcp={zip_codepage}")
+        result = _command_result(command)
+        if result.returncode != 0:
+            detail = (_output_text(result.stderr) or _output_text(result.stdout)).strip()
+            raise RuntimeError(f"archive extraction failed for {path}: exit {result.returncode}: {detail[:300]}")
+    finally:
+        if cleanup is not None:
+            shutil.rmtree(cleanup, ignore_errors=True)
 
 
 def _extract_rar(path: Path, destination: Path, password: Optional[str]) -> None:
@@ -1445,5 +1619,11 @@ def extract_archive(
     ):
         _extract_rar(group.entry, destination, password)
     else:
-        _extract_7z(group.entry, destination, password, zip_codepage if group.kind == "zip" else None)
+        _extract_7z(
+            group.entry,
+            destination,
+            password,
+            zip_codepage if group.kind == "zip" else None,
+            group.volumes if group.kind == "zip" else None,
+        )
     _ensure_nonempty(destination)

@@ -21,6 +21,42 @@ RAR = shutil.which("rar")
 RAR_SFX = Path(RAR).parent / "default.sfx" if RAR else None
 
 
+def _write_mixed_zip(path):
+    legacy_dir = "フォルダ/".encode("cp932")
+    legacy_child = legacy_dir + "日本.txt".encode("cp932")
+    dir_placeholder = b"D" * (len(legacy_dir) - 1) + b"/"
+    child_placeholder = b"C" * len(legacy_child)
+    with zipfile.ZipFile(str(path), "w") as stream:
+        directory = zipfile.ZipInfo(dir_placeholder.decode("ascii"))
+        directory.external_attr = (0o40775 << 16) | 0x10
+        stream.writestr(directory, b"")
+        child = zipfile.ZipInfo(child_placeholder.decode("ascii"))
+        stream.writestr(child, b"legacy content")
+        stream.writestr("新名.txt", b"modern content")
+    data = path.read_bytes()
+    for placeholder, replacement in (
+        (dir_placeholder, legacy_dir),
+        (child_placeholder, legacy_child),
+    ):
+        if data.count(placeholder) != 2:
+            raise AssertionError("ZIP fixture name replacement must hit local and central headers")
+        data = data.replace(placeholder, replacement)
+    path.write_bytes(data)
+
+
+def _write_alias_mixed_zip(path):
+    legacy_raw = b"\xc3\xa9.txt"
+    placeholder = b"L" * len(legacy_raw)
+    with zipfile.ZipFile(str(path), "w") as stream:
+        info = zipfile.ZipInfo(placeholder.decode("ascii"))
+        stream.writestr(info, b"legacy content")
+        stream.writestr("é.txt", b"modern content")
+    data = path.read_bytes()
+    if data.count(placeholder) != 2:
+        raise AssertionError("ZIP fixture name replacement must hit local and central headers")
+    path.write_bytes(data.replace(placeholder, legacy_raw))
+
+
 @unittest.skipUnless(SEVEN_ZIP, "7z is required for real extraction checks")
 class CommandLineIntegration(unittest.TestCase):
     def setUp(self):
@@ -95,6 +131,52 @@ class CommandLineIntegration(unittest.TestCase):
                 self.assertEqual((output / "inner" / "payload.txt").read_bytes(), payload)
                 self.assertTrue(archive.exists())
                 self.assertFalse(list(output.rglob("*.tar")))
+
+    def test_mixed_zip_manual_codepage_preserves_names_and_asis_keeps_source(self):
+        archive = self.root / "mixed.zip"
+        _write_mixed_zip(archive)
+        output = self.root / "manual-output"
+        result = self.run_cli(archive, output, "-dp", "direct", "-tzp", "decode-932")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual((output / "フォルダ" / "日本.txt").read_bytes(), b"legacy content")
+        self.assertEqual((output / "新名.txt").read_bytes(), b"modern content")
+        self.assertTrue(archive.exists())
+
+        asis_output = self.root / "asis-output"
+        result = self.run_cli(
+            archive,
+            asis_output,
+            "-dp",
+            "direct",
+            "-tzp",
+            "asis",
+            "-sp",
+            "delete",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("traditional_zip_asis", result.stdout)
+        self.assertTrue(archive.exists())
+        self.assertFalse(asis_output.exists())
+
+    @unittest.skipUnless(os.name != "nt", "native rn compatibility is POSIX-specific")
+    def test_mixed_zip_alias_mismatch_fails_before_source_delete(self):
+        archive = self.root / "alias.zip"
+        _write_alias_mixed_zip(archive)
+        original = archive.read_bytes()
+        output = self.root / "alias-output"
+        result = self.run_cli(
+            archive,
+            output,
+            "-dp",
+            "direct",
+            "-tzp",
+            "decode-1252",
+            "-sp",
+            "delete",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(archive.read_bytes(), original)
+        self.assertFalse(list(output.rglob("*")))
 
     def test_password_candidates_preserve_whitespace(self):
         password = " space-sensitive password "
