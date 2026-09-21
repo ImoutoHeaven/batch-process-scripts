@@ -132,6 +132,37 @@ class CommandLineIntegration(unittest.TestCase):
                 self.assertTrue(archive.exists())
                 self.assertFalse(list(output.rglob("*.tar")))
 
+    @unittest.skipUnless(os.name == "nt", "Windows readonly directory behavior")
+    def test_readonly_extracted_directory_is_cleaned(self):
+        archive = self.root / "readonly-directory.zip"
+        output = self.root / "readonly-output"
+        with zipfile.ZipFile(str(archive), "w") as stream:
+            for name, attributes in (("shell/", 0x10), ("shell/readonly/", 0x11)):
+                info = zipfile.ZipInfo(name)
+                info.create_system = 0
+                info.external_attr = attributes
+                stream.writestr(info, b"")
+            stream.writestr("shell/readonly/payload.txt", b"payload")
+
+        try:
+            result = self.run_cli(
+                archive, output, "-dp", "only-file-content"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(
+                next(output.rglob("payload.txt")).read_bytes(), b"payload"
+            )
+            self.assertNotIn("could not clean temporary directory", result.stdout)
+            self.assertFalse((output / ".advdecompress_lite_tmp").exists())
+        finally:
+            workspace = output / ".advdecompress_lite_tmp"
+            if workspace.exists():
+                for path in sorted(
+                    workspace.rglob("*"), key=lambda item: len(item.parts), reverse=True
+                ):
+                    path.chmod(0o700)
+                shutil.rmtree(workspace, ignore_errors=True)
+
     def test_mixed_zip_manual_codepage_preserves_names_and_asis_keeps_source(self):
         archive = self.root / "mixed.zip"
         _write_mixed_zip(archive)

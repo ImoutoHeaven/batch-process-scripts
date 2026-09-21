@@ -8,6 +8,7 @@ import contextlib
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -471,6 +472,21 @@ def _remove_empty_workspace_root(output_base: Path) -> None:
         pass
 
 
+def _remove_readonly(function, path, error_info) -> None:
+    error = error_info[1]
+    if os.name != "nt" or getattr(error, "winerror", None) != 5:
+        raise error
+    metadata = os.stat(path, follow_symlinks=False)
+    attributes = metadata.st_file_attributes
+    if (
+        not attributes & stat.FILE_ATTRIBUTE_READONLY
+        or attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        raise error
+    os.chmod(path, stat.S_IWRITE)
+    function(path)
+
+
 def _tree_has_entries(root: Path) -> bool:
     try:
         next(root.iterdir())
@@ -806,7 +822,7 @@ def _process_group(
     finally:
         if workspace is not None:
             try:
-                shutil.rmtree(str(workspace))
+                shutil.rmtree(str(workspace), onerror=_remove_readonly)
             except FileNotFoundError:
                 pass
             except OSError as exc:
