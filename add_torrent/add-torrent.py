@@ -103,7 +103,7 @@ def connect_to_qbittorrent(address):
             )
             print(f"登录响应: {login_response.text} (状态码: {login_response.status_code})")
             
-            if login_response.text == "Ok." or login_response.status_code == 200:
+            if login_response.status_code == 204 or (login_response.status_code == 200 and login_response.text.strip() == "Ok."):
                 print("身份验证成功")
                 # 再次尝试获取版本以确认
                 version_check = session.get(f"{address}/api/v2/app/version")
@@ -159,13 +159,22 @@ def add_torrents(session, address, torrent_files_info, base_save_path, skip_hash
             
             response = session.post(f"{address}/api/v2/torrents/add", files=files, data=data)
             
-            if response.status_code == 200 and response.text == "Ok.":
+            added = response.status_code == 200 and response.text.strip() == "Ok."
+            if response.status_code == 200 and not added:
+                try:
+                    result = response.json()
+                    added = (isinstance(result, dict) and result.get('success_count') == 1
+                             and result.get('failure_count') == 0 and result.get('pending_count') == 0)
+                except ValueError:
+                    pass
+
+            if added:
                 success_count += 1
                 progress_bar.set_postfix(成功=success_count, 失败=fail_count)
             else:
                 fail_count += 1
                 progress_bar.set_postfix(成功=success_count, 失败=fail_count)
-                print(f"\n添加 {torrent_file} 失败。响应: {response.text}")
+                print(f"\n添加 {torrent_file} 失败。状态码: {response.status_code}，响应: {response.text}")
             
             # 小延迟，避免API过载
             time.sleep(0.1)
